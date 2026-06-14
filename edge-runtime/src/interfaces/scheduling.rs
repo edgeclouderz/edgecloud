@@ -1,14 +1,13 @@
 //! `edge:scheduling` — delayed and repeating task execution.
 
+#[derive(Default)]
 pub struct Scheduler {
     next_id: std::sync::atomic::AtomicU64,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self {
-            next_id: std::sync::atomic::AtomicU64::new(1),
-        }
+        Self::default()
     }
 
     pub fn schedule_once(&self, delay_ms: u64, _payload: Vec<u8>) -> String {

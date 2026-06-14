@@ -13,11 +13,17 @@ pub struct KvStore {
     data: RwLock<HashMap<String, KvEntry>>,
 }
 
-impl KvStore {
-    pub fn new() -> Self {
+impl Default for KvStore {
+    fn default() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
         }
+    }
+}
+
+impl KvStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {

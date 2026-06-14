@@ -17,6 +17,7 @@ use crate::interfaces::{
 pub struct RuntimeState {
     pub http_client: http_client::HttpClient,
     pub kv_store: kv_store::KvStore,
+    #[doc(hidden)]
     pub cache: cache::Cache,
     pub observe: observe::Observer,
     pub time: time::Clock,
@@ -26,8 +27,8 @@ pub struct RuntimeState {
     pub http_server: http_server::HttpServer,
 }
 
-impl RuntimeState {
-    pub fn new() -> Self {
+impl Default for RuntimeState {
+    fn default() -> Self {
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: kv_store::KvStore::new(),
@@ -46,8 +47,8 @@ impl HttpClientHost for RuntimeState {
     fn fetch(&mut self, req: Request) -> Result<Response, String> {
         let method = req.method.as_str();
         let url = req.url.as_str();
-        let headers: Vec<(String, String)> = req.headers.iter().cloned().collect();
-        let body = req.body.as_ref().map(|b| b.as_slice());
+        let headers: Vec<(String, String)> = req.headers.to_vec();
+        let body = req.body.as_deref();
 
         let resp = self.http_client.fetch(method, url, &headers, body)?;
         Ok(Response {

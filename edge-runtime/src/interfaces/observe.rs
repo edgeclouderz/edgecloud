@@ -1,5 +1,6 @@
 //! `edge:observe` — metrics and logging.
 
+#[derive(Default)]
 pub struct Observer {}
 
 impl Observer {

@@ -1,10 +1,11 @@
 //! `edge:process` — environment variables, command-line args, and exit.
 
+#[derive(Default)]
 pub struct Process;
 
 impl Process {
     pub fn new() -> Self {
-        Self
+        Self {}
     }
 
     pub fn get_env(&self, key: &str) -> Option<String> {

@@ -8,6 +8,7 @@ pub struct CacheEntry {
     expires_at: Option<u64>,
 }
 
+#[allow(clippy::new_without_default)]
 pub struct Cache {
     lru: Mutex<lru::LruCache<String, CacheEntry>>,
 }

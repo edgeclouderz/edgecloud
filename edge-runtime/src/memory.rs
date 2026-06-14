@@ -35,7 +35,7 @@ pub fn allocate<T>(memory: &Memory, caller: &mut Caller<'_, T>, size: i32) -> Re
 
     let current_len = memory.data(&*caller).len();
     let new_len = current_len.saturating_add(size as usize);
-    let pages = ((new_len + 65535) / 65536) as u64;
+    let pages = (new_len as u64).div_ceil(65536);
     memory.grow(caller, pages)?;
     Ok(current_len as i32)
 }

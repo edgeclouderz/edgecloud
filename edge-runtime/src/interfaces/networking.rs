@@ -1,10 +1,11 @@
 //! `edge:networking` — TCP/UDP/DNS.
 
+#[derive(Default)]
 pub struct Network;
 
 impl Network {
     pub fn new() -> Self {
-        Self
+        Self {}
     }
 
     pub fn resolve(&self, hostname: &str) -> Vec<String> {

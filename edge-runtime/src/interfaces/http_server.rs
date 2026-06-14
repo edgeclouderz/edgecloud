@@ -12,17 +12,16 @@ pub struct IncomingRequest {
     pub body: Vec<u8>,
 }
 
+#[derive(Default)]
 pub struct HttpServer {
     port: Option<u16>,
+    #[allow(dead_code)]
     next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpServer {
     pub fn new() -> Self {
-        Self {
-            port: None,
-            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        }
+        Self::default()
     }
 
     pub fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
