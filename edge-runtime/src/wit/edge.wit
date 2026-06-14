@@ -1,0 +1,90 @@
+package edge:cloud@0.1.0;
+
+interface http-client {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+  }
+
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  fetch: func(req: request) -> result<response, string>;
+}
+
+interface kv-store {
+  get: func(key: string) -> result<option<list<u8>>, string>;
+  set: func(key: string, value: list<u8>, ttl-secs: option<u32>) -> result<(), string>;
+  delete: func(key: string) -> result<(), string>;
+  list-keys: func(prefix: string) -> result<list<string>, string>;
+}
+
+interface cache {
+  get: func(key: string) -> result<option<list<u8>>, string>;
+  set: func(key: string, value: list<u8>, ttl-secs: option<u32>) -> result<(), string>;
+  delete: func(key: string) -> result<(), string>;
+  clear: func() -> result<(), string>;
+  size: func() -> result<u32, string>;
+}
+
+interface observe {
+  increment-counter: func(name: string, labels: list<tuple<string, string>>) -> result<(), string>;
+  record-gauge: func(name: string, value: f64, labels: list<tuple<string, string>>) -> result<(), string>;
+  record-histogram: func(name: string, value: f64, labels: list<tuple<string, string>>) -> result<(), string>;
+  emit-log: func(level: string, message: string) -> result<(), string>;
+}
+
+interface time {
+  now: func() -> u64;
+  sleep: func(duration-ms: u64) -> result<(), string>;
+  resolution: func() -> u64;
+}
+
+interface scheduling {
+  schedule-once: func(delay-ms: u64, payload: list<u8>) -> result<string, string>;
+  schedule-repeating: func(interval-ms: u64, payload: list<u8>) -> result<string, string>;
+  cancel-scheduled: func(id: string) -> result<(), string>;
+}
+
+interface process {
+  get-env: func(key: string) -> result<option<string>, string>;
+  get-all-env: func() -> result<list<tuple<string, string>>, string>;
+  get-args: func() -> result<list<string>, string>;
+  exit: func(code: u32) -> never;
+}
+
+interface networking {
+  resolve: func(hostname: string) -> result<list<string>, string>;
+}
+
+interface http-server {
+  record incoming-request {
+    id: u64,
+    method: string,
+    path: string,
+    query: option<string>,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  start: func(port: u16, host: option<string>) -> result<(), string>;
+  poll: func() -> result<option<incoming-request>, string>;
+  respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<(), string>;
+}
+
+world edge-runtime {
+  export http-client;
+  export networking;
+  export kv-store;
+  export cache;
+  export observe;
+  export time;
+  export scheduling;
+  export process;
+  export http-server;
+}
