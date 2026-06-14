@@ -4,11 +4,19 @@ stages:
   - check
   - build
 
+variables:
+  CARGO_TARGET_DIR: ${CI_PROJECT_DIR}/target
+
 rustfmt:
   stage: check
   script:
     - rustup component add rustfmt
     - cargo fmt --check --manifest-path edge-runtime/Cargo.toml
+  cache:
+    key: cargo-registry
+    paths:
+      - ~/.cargo/registry/index/
+      - ~/.cargo/registry/cache/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -18,6 +26,10 @@ clippy:
   script:
     - rustup component add clippy
     - cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
+  cache:
+    key: cargo-target-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -27,6 +39,10 @@ build:
   script:
     - cargo build --manifest-path edge-runtime/Cargo.toml
     - cargo build --manifest-path edge-runtime/Cargo.toml --release
+  cache:
+    key: cargo-target-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
