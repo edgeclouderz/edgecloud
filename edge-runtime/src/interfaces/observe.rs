@@ -1,13 +1,31 @@
 //! `edge:observe` — metrics and logging.
 
-/// Emit a log message at the given level.
-pub fn emit_log(level: &str, message: &str) -> Result<(), String> {
-    match level {
-        "error" => tracing::error!(message),
-        "warn" => tracing::warn!(message),
-        "info" => tracing::info!(message),
-        "debug" => tracing::debug!(message),
-        _ => tracing::trace!(message),
+pub struct Observer {}
+
+impl Observer {
+    pub fn new() -> Self {
+        Self {}
     }
-    Ok(())
+
+    pub fn increment_counter(&self, name: &str, _labels: &[(String, String)]) {
+        tracing::debug!(counter = name, "counter incremented");
+    }
+
+    pub fn record_gauge(&self, name: &str, value: f64, _labels: &[(String, String)]) {
+        tracing::debug!(gauge = name, value = value, "gauge recorded");
+    }
+
+    pub fn record_histogram(&self, name: &str, value: f64, _labels: &[(String, String)]) {
+        tracing::debug!(histogram = name, value = value, "histogram recorded");
+    }
+
+    pub fn emit_log(&self, level: &str, message: &str) {
+        match level {
+            "error" => tracing::error!(message),
+            "warn" => tracing::warn!(message),
+            "info" => tracing::info!(message),
+            "debug" => tracing::debug!(message),
+            _ => tracing::trace!(message),
+        }
+    }
 }

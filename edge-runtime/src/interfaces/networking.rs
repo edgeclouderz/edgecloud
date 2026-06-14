@@ -1,12 +1,17 @@
 //! `edge:networking` — TCP/UDP/DNS.
 
-use std::net::SocketAddr;
+pub struct Network;
 
-/// Resolve a hostname to a list of IP addresses.
-pub fn resolve(hostname: &str) -> Result<Vec<String>, String> {
-    let addr_format = format!("{}:443", hostname);
-    match addr_format.parse::<SocketAddr>() {
-        Ok(addr) => Ok(vec![addr.ip().to_string()]),
-        Err(_) => Ok(vec![]),
+impl Network {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn resolve(&self, hostname: &str) -> Vec<String> {
+        let addr_format = format!("{}:443", hostname);
+        match addr_format.parse::<std::net::SocketAddr>() {
+            Ok(addr) => vec![addr.ip().to_string()],
+            Err(_) => vec![],
+        }
     }
 }

@@ -1,12 +1,10 @@
 //! `edge:kv-store` — durable key-value persistence.
-//!
-//! Backed by an in-memory HashMap for the MVP.
 
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-struct KvEntry {
+pub struct KvEntry {
     value: Vec<u8>,
     expires_at: Option<u64>,
 }
@@ -22,7 +20,7 @@ impl KvStore {
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let data = self.data.read().unwrap();
         match data.get(key) {
             Some(entry) => {
@@ -33,17 +31,17 @@ impl KvStore {
                         .as_secs();
                     if now > expires_at {
                         drop(data);
-                        self.delete(key)?;
-                        return Ok(None);
+                        self.delete(key);
+                        return None;
                     }
                 }
-                Ok(Some(entry.value.clone()))
+                Some(entry.value.clone())
             }
-            None => Ok(None),
+            None => None,
         }
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: Option<u32>) -> Result<(), String> {
+    pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: Option<u32>) {
         let expires_at = ttl_secs.map(|s| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -53,17 +51,15 @@ impl KvStore {
         });
         let mut data = self.data.write().unwrap();
         data.insert(key, KvEntry { value, expires_at });
-        Ok(())
     }
 
-    pub fn delete(&self, key: &str) -> Result<(), String> {
+    pub fn delete(&self, key: &str) {
         let mut data = self.data.write().unwrap();
         data.remove(key);
-        Ok(())
     }
 
-    pub fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
+    pub fn list_keys(&self, prefix: &str) -> Vec<String> {
         let data = self.data.read().unwrap();
-        Ok(data.keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+        data.keys().filter(|k| k.starts_with(prefix)).cloned().collect()
     }
 }
