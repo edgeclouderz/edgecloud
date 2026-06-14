@@ -3,24 +3,20 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "cache")]
-use lru::LruCache;
-
-#[cfg(feature = "cache")]
-struct CacheEntry {
+pub struct CacheEntry {
     value: Vec<u8>,
     expires_at: Option<u64>,
 }
 
-#[cfg(feature = "cache")]
 pub struct Cache {
-    lru: Mutex<LruCache<String, CacheEntry>>,
+    lru: Mutex<lru::LruCache<String, CacheEntry>>,
 }
 
-#[cfg(feature = "cache")]
 impl Cache {
     pub fn new(max_entries: u32) -> Self {
-        let lru = LruCache::new(std::num::NonZeroUsize::new(max_entries as usize).unwrap());
+        let lru = lru::LruCache::new(
+            std::num::NonZeroUsize::new(max_entries as usize).unwrap(),
+        );
         Self {
             lru: Mutex::new(lru),
         }

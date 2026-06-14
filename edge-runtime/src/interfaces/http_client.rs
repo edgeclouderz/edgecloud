@@ -1,17 +1,12 @@
 //! `edge:http-client` — outbound HTTP requests.
 
-#[cfg(feature = "http-client")]
-use reqwest::blocking::Client;
-
-#[cfg(feature = "http-client")]
 pub struct HttpClient {
-    client: Client,
+    client: reqwest::blocking::Client,
 }
 
-#[cfg(feature = "http-client")]
 impl HttpClient {
     pub fn new() -> Self {
-        let client = Client::builder()
+        let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client creation failed");
@@ -57,7 +52,6 @@ impl HttpClient {
     }
 }
 
-#[cfg(feature = "http-client")]
 #[derive(serde::Serialize)]
 pub struct HttpResponse {
     pub status: u16,
