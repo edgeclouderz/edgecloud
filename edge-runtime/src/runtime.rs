@@ -24,6 +24,7 @@ pub struct RuntimeState {
     pub process: process::Process,
     pub networking: networking::NetworkingState,
     pub http_server: http_server::HttpServer,
+    pub limits: wasmtime::StoreLimits,
 }
 
 impl RuntimeState {
@@ -38,6 +39,7 @@ impl RuntimeState {
             process: process::Process::new(),
             networking: networking::NetworkingState::new(),
             http_server: http_server::HttpServer::new(),
+            limits: crate::limits::new_memory_limits(1024), // default 1GB
         }
     }
 }
@@ -139,6 +141,9 @@ impl SchedulingHost for RuntimeState {
     fn cancel_scheduled(&mut self, id: String) {
         let _ = self.scheduling.cancel(&id);
     }
+    fn poll_scheduled(&mut self) -> Option<(String, Vec<u8>)> {
+        self.scheduling.poll_scheduled()
+    }
 }
 
 impl ProcessHost for RuntimeState {
@@ -164,8 +169,7 @@ impl NetworkingHost for RuntimeState {
 
 impl HttpServerHost for RuntimeState {
     fn start(&mut self, port: u16, host: Option<String>) {
-        let rt = tokio::runtime::Handle::current();
-        let _ = rt.block_on(self.http_server.start(port, host));
+        let _ = self.http_server.start(port, host);
     }
     fn poll(&mut self) -> Option<crate::edge::cloud::http_server::IncomingRequest> {
         let rt = tokio::runtime::Handle::current();
