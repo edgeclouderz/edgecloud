@@ -24,6 +24,11 @@ interface kv-store {
   set: func(key: string, value: list<u8>, ttl-secs: option<u32>);
   delete: func(key: string);
   list-keys: func(prefix: string) -> list<string>;
+  get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+  set-many: func(items: list<tuple<string, list<u8>, option<u32>>>);
+  delete-many: func(keys: list<string>);
+  exists: func(key: string) -> bool;
+  clear: func();
 }
 
 interface cache {
