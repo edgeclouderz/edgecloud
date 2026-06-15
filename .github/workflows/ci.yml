@@ -42,10 +42,6 @@ jobs:
           case ${{ matrix.tool }} in
             rustfmt) rustup component add rustfmt ;;
             clippy) rustup component add clippy ;;
-            audit)
-              curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz | tar -xz -C $HOME/.cargo/bin
-              chmod +x $HOME/.cargo/bin/cargo-audit
-              ;;
           esac
 
       - name: Cache cargo registry
@@ -69,9 +65,10 @@ jobs:
       - name: Run ${{ matrix.tool }}
         run: |
           if [ "${{ matrix.tool }}" = "audit" ]; then
+            cargo install cargo-audit --locked
             cargo audit --manifest-path edge-runtime/Cargo.toml || true
           else
-            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml
+            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml --locked
           fi
 
   test:
