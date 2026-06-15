@@ -20,6 +20,9 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 lru = { version = "0.12", optional = true }
 parking_lot = "0.12"
 
+# DNS resolution for edge:networking
+trust-dns-resolver = { version = "0.23", features = ["tokio"], optional = true }
+
 # Metrics
 metrics = { version = "0.24", optional = true }
 
@@ -50,4 +53,4 @@ time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
 http-server = ["dep:tokio"]
-networking = []
+networking = ["dep:trust-dns-resolver", "dep:tokio"]
