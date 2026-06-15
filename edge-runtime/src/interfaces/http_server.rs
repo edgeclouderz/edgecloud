@@ -1,8 +1,6 @@
-//! `edge:http-server` — inbound HTTP serving.
+//! `edge:http-server` — inbound HTTP serving (stub).
 
-use crate::metering::RequestMeter;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct IncomingRequest {
@@ -14,59 +12,30 @@ pub struct IncomingRequest {
     pub body: Vec<u8>,
 }
 
+#[derive(Default)]
 pub struct HttpServer {
     port: Option<u16>,
-    tx: Arc<RwLock<Option<mpsc::Sender<IncomingRequest>>>>,
-    rx: Arc<RwLock<Option<mpsc::Receiver<IncomingRequest>>>>,
-    pub meter: Option<Arc<RequestMeter>>,
     #[allow(dead_code)]
     next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpServer {
     pub fn new() -> Self {
-        Self {
-            port: None,
-            tx: Arc::new(RwLock::new(None)),
-            rx: Arc::new(RwLock::new(None)),
-            meter: None,
-            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        }
+        Self::default()
     }
 
-    pub async fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
+    pub fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
         let addr = format!("{}:{}", host.as_deref().unwrap_or("0.0.0.0"), port);
-        let _listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
-
         self.port = Some(port);
-        let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
-        *self.tx.write().await = Some(tx);
-        *self.rx.write().await = Some(rx);
-
-        tracing::info!(addr = %addr, "http-server listening");
+        tracing::info!(addr = %addr, "http-server start (stub)");
         Ok(())
     }
 
-    pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
-        let mut rx = self.rx.write().await;
-        if let Some(rx) = rx.as_mut() {
-            match rx.try_recv() {
-                Ok(request) => {
-                    if let Some(ref meter) = self.meter {
-                        meter.record_request();
-                    }
-                    Ok(Some(request))
-                }
-                Err(_) => Ok(None),
-            }
-        } else {
-            Err("http-server not started".to_string())
-        }
+    pub fn poll(&mut self) -> Option<IncomingRequest> {
+        None
     }
 
-    pub async fn respond(
+    pub fn respond(
         &self,
         _req_id: u64,
         _status: u16,

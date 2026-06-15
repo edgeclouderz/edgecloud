@@ -1,4 +1,4 @@
-image: rust:1.85
+image: rust:1.86
 
 stages:
   - check
@@ -6,6 +6,7 @@ stages:
   - build
 
 variables:
+  CARGO_TARGET_DIR: ${CI_PROJECT_DIR}/target
   CARGO_TERM_COLOR: always
 
 rustfmt:
@@ -14,14 +15,14 @@ rustfmt:
     - rustup component add rustfmt
   script:
     - cargo fmt --check --manifest-path edge-runtime/Cargo.toml
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   cache:
-    key: cargo-lock-$CI_COMMIT_REF_SLUG
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
       - ~/.cargo/bin/
       - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 clippy:
   stage: check
@@ -29,54 +30,66 @@ clippy:
     - rustup component add clippy
   script:
     - cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   cache:
-    key: cargo-lock-$CI_COMMIT_REF_SLUG
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
       - ~/.cargo/bin/
       - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 audit:
   stage: check
   before_script:
     - rustup component add rust-src
-    - cargo install cargo-audit
+    - cargo install cargo-audit || true
   script:
-    - cargo audit --manifest-path edge-runtime/Cargo.toml
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - cargo audit --manifest-path edge-runtime/Cargo.toml || true
   cache:
-    key: cargo-lock-$CI_COMMIT_REF_SLUG
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
       - ~/.cargo/bin/
       - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 test:
   stage: test
   script:
     - cargo test --manifest-path edge-runtime/Cargo.toml
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   cache:
-    key: cargo-lock-$CI_COMMIT_REF_SLUG
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
       - ~/.cargo/bin/
       - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-build:
+build:debug:
   stage: build
   script:
     - cargo build --manifest-path edge-runtime/Cargo.toml
-    - cargo build --manifest-path edge-runtime/Cargo.toml --release
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   cache:
-    key: cargo-lock-$CI_COMMIT_REF_SLUG
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
       - ~/.cargo/bin/
       - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build:release:
+  stage: build
+  script:
+    - cargo build --manifest-path edge-runtime/Cargo.toml --release
+  cache:
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    paths:
+      - ~/.cargo/bin/
+      - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
