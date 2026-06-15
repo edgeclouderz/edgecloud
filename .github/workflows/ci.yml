@@ -26,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Debug — list repo contents
+        run: ls -la && ls -la edge-runtime/ 2>&1 || echo "edge-runtime not found"
+
       - name: Install ${{ matrix.tool }}
         run: |
           case ${{ matrix.tool }} in
@@ -67,6 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Debug — list repo contents
+        run: ls -la && ls -la edge-runtime/ 2>&1 || echo "edge-runtime not found"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
