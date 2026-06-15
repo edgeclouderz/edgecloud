@@ -198,6 +198,7 @@ impl Supervisor {
         let (port, handle) = if let Some(inst) = instance {
             // Extract port, handle, and sender while locked.
             let mut inst = inst.lock().await;
+            inst.status = AppInstanceStatus::Stopping;
             let port = inst.port;
             let handle = inst.handle.clone();
             let tx = inst.shutdown_tx.take();
@@ -222,7 +223,18 @@ impl Supervisor {
         // Propagate any panic from the app task.
         if let Some(handle) = handle {
             handle.abort();
-            // Arc<JoinHandle> is dropped here — abort() has already terminated the task.
+            // try_unwrap extracts the JoinHandle from the Arc; if there are other
+            // Arcs (shouldn't happen here), fall back to not awaiting.
+            match std::sync::Arc::try_unwrap(handle) {
+                Ok(join_handle) => {
+                    if let Err(panic_info) = join_handle.await {
+                        std::panic::panic_any(panic_info);
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("could not unwrap JoinHandle — multiple refs");
+                }
+            }
         }
 
         tracing::info!(app_name, "app stopped");
@@ -346,6 +358,13 @@ impl Supervisor {
             instance
                 .get_typed_func::<(), ()>(&mut store, "handle")?
                 .call(&mut store, ())?;
+        }
+
+        // Check if the guest called process.exit — the flag is set by the host call
+        // before the wasmtime trap is raised, so we see it here on a successful return.
+        if let Some(code) = store.data().exit_requested() {
+            tracing::info!(code, "guest called process.exit");
+            return Ok(false);
         }
 
         // Component returned normally — it wants to keep running.

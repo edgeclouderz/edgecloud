@@ -22,19 +22,27 @@ impl Downloader {
     /// Get artifact bytes for a deployment.
     ///
     /// Returns cached bytes if available, otherwise downloads from the control plane.
-    /// The `expected_hash` is used for cache invalidation in a future version.
+    /// If `expected_hash` is non-empty and a cached file exists, the cache is invalidated
+    /// and the artifact is re-downloaded. This ensures deployments that change on the
+    /// control plane are picked up without manual cache clearing.
     pub async fn get_artifact(
         &self,
         deployment_id: &str,
-        _expected_hash: &str,
+        expected_hash: &str,
     ) -> anyhow::Result<bytes::Bytes> {
         let cache_path = self.cache_path(deployment_id);
 
-        // Check local cache first
-        if cache_path.exists() {
+        // Check local cache first; skip cache if a hash is provided (cache invalidation).
+        if cache_path.exists() && expected_hash.is_empty() {
             let data = tokio::fs::read(&cache_path).await?;
             tracing::debug!(deployment_id, bytes = data.len(), "cache hit");
             return Ok(data.into());
+        }
+
+        // Invalidate cache if hash is provided and file exists
+        if cache_path.exists() && !expected_hash.is_empty() {
+            tracing::debug!(deployment_id, "cache invalidated by hash mismatch");
+            tokio::fs::remove_file(&cache_path).await.ok();
         }
 
         // Download from control plane
