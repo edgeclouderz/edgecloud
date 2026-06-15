@@ -17,7 +17,7 @@ rustfmt:
   script:
     - cargo fmt --check --manifest-path edge-runtime/Cargo.toml
   cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
       - .cargo/bin/
       - .cargo/registry/index/
@@ -34,7 +34,7 @@ clippy:
   script:
     - cargo clippy --manifest-path edge-runtime/Cargo.toml -- -D warnings
   cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
       - .cargo/bin/
       - .cargo/registry/index/
@@ -52,7 +52,7 @@ audit:
   script:
     - cargo audit --manifest-path edge-runtime/Cargo.toml || true
   cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
       - .cargo/bin/
       - .cargo/registry/index/
@@ -67,7 +67,7 @@ test:
   script:
     - cargo test --manifest-path edge-runtime/Cargo.toml
   cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
       - .cargo/bin/
       - .cargo/registry/index/
@@ -82,7 +82,7 @@ build:release:
   script:
     - cargo build --manifest-path edge-runtime/Cargo.toml --release
   cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
       - .cargo/bin/
       - .cargo/registry/index/
