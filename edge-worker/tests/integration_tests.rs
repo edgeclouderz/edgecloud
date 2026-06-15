@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
+use testcontainers::ContainerRequest;
+use testcontainers::ImageExt;
 use testcontainers_modules::nats::Nats;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
@@ -37,6 +40,9 @@ fn test_component_bytes() -> &'static [u8] {
 /// Timeout for subscribing to heartbeats.
 const HEARTBEAT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait for the full test harness to start (container + NATS connection).
+const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+
 // ---------------------------------------------------------------------------
 // Test Harness
 // ---------------------------------------------------------------------------
@@ -55,7 +61,17 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Start NATS, spin up a mock HTTP server, create a Supervisor.
+    ///
+    /// Fails fast: if NATS container doesn't start within 45s, returns an error
+    /// instead of hanging indefinitely.
     pub async fn new() -> anyhow::Result<Self> {
+        timeout(HARNESS_STARTUP_TIMEOUT, Self::new_inner())
+            .await
+            .context("harness startup timed out")?
+    }
+
+    /// Inner constructor — actual setup logic. Wrapped by a timeout in `new()`.
+    async fn new_inner() -> anyhow::Result<Self> {
         let (_nats_container, nats_url) = nats_container().await;
         let mock_server = MockServer::start().await;
 
@@ -106,8 +122,17 @@ impl TestHarness {
 // ---------------------------------------------------------------------------
 
 /// Start a NATS container and return (container, url).
+///
+/// Uses a simple duration-based wait instead of the built-in stderr matching,
+/// which can be unreliable in CI where NATS log messages may appear out of order.
+/// A hard startup_timeout bounds the total wait so the test fails fast on error.
 async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container = Nats::default().start().await.expect("start NATS container");
+    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
+        .with_startup_timeout(std::time::Duration::from_secs(30))
+        .with_ready_conditions(vec![WaitFor::Duration { length: std::time::Duration::from_secs(5) }])
+        .start()
+        .await
+        .expect("start NATS container");
     let host = container.get_host().await.expect("get host");
     let port = container.get_host_port_ipv4(4222).await.expect("get NATS port");
     (container, format!("{}:{}", host, port))
@@ -240,6 +265,13 @@ async fn test_app_lifecycle() {
 
 #[tokio::test]
 async fn test_heartbeat_published() {
+    timeout(HARNESS_STARTUP_TIMEOUT, test_heartbeat_published_inner())
+        .await
+        .expect("test_heartbeat_published timed out")
+        .expect("test_heartbeat_published failed");
+}
+
+async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     let (container, nats_url) = nats_container().await;
     std::mem::forget(container); // keep alive for test; dropped when test fn returns
 
@@ -254,7 +286,7 @@ async fn test_heartbeat_published() {
         starting_port: 18_000,
     };
 
-    let engine = edge_runtime::create_engine().expect("create engine");
+    let engine = edge_runtime::create_engine().context("create engine")?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
@@ -265,7 +297,7 @@ async fn test_heartbeat_published() {
         config.port_cooldown_secs,
     )));
 
-    let nats = Arc::new(NatsClientImpl::connect(&nats_url).await.expect("connect nats"))
+    let nats = Arc::new(NatsClientImpl::connect(&nats_url).await.context("connect nats")?)
         as Arc<dyn NatsClientTrait>;
 
     let supervisor = Arc::new(Supervisor {
@@ -282,7 +314,7 @@ async fn test_heartbeat_published() {
         .nats
         .publish_heartbeat(&supervisor.config.region, &heartbeat)
         .await
-        .expect("publish heartbeat");
+        .context("publish heartbeat")?;
 
     // Subscribe and receive it
     let received = timeout(
@@ -290,11 +322,12 @@ async fn test_heartbeat_published() {
         subscribe_heartbeats(&nats_url, "test-region"),
     )
     .await
-    .expect("heartbeat should arrive within 5s")
-    .expect("subscribe_heartbeats");
+    .context("heartbeat subscription timed out")?
+    .context("subscribe_heartbeats")?;
 
     assert_eq!(received.worker_id, "test-worker");
     assert_eq!(received.region, "test-region");
+    Ok(())
 }
 
 #[tokio::test]
