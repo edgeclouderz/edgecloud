@@ -15,11 +15,12 @@ impl Clock {
             .as_nanos() as u64
     }
 
-    /// Sleep — delegates to the scheduling subsystem's thread pool so it does not
-    /// block the tokio main thread.
+    /// Sleep — uses tokio's timer so it integrates with the async runtime.
+    /// Note: this still blocks the calling thread (inherent to sync sleep).
     pub fn sleep(&self, duration_ms: u64) -> Result<(), String> {
+        let rt = tokio::runtime::Handle::current();
         let duration = std::time::Duration::from_millis(duration_ms);
-        std::thread::sleep(duration);
+        rt.block_on(tokio::time::sleep(duration));
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 //! `edge:http-client` — outbound HTTP requests.
 
 pub struct HttpClient {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl Default for HttpClient {
@@ -12,14 +13,31 @@ impl Default for HttpClient {
 
 impl HttpClient {
     pub fn new() -> Self {
-        let client = reqwest::blocking::Client::builder()
+        Self::new_with_handle(tokio::runtime::Handle::current())
+    }
+
+    pub fn new_with_handle(handle: tokio::runtime::Handle) -> Self {
+        let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client creation failed");
-        Self { client }
+        Self {
+            client,
+            runtime_handle: handle,
+        }
     }
 
     pub fn fetch(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, String> {
+        self.runtime_handle.block_on(self.fetch_async(method, url, headers, body))
+    }
+
+    pub async fn fetch_async(
         &self,
         method: &str,
         url: &str,
@@ -40,7 +58,7 @@ impl HttpClient {
             req = req.body(b.to_vec());
         }
 
-        let response = req.send().map_err(|e| format!("request failed: {}", e))?;
+        let response = req.send().await.map_err(|e| format!("request failed: {}", e))?;
 
         let status = response.status().as_u16();
         let headers: std::collections::HashMap<_, _> = response
@@ -50,6 +68,7 @@ impl HttpClient {
             .collect();
         let body = response
             .bytes()
+            .await
             .map_err(|e| format!("failed to read body: {}", e))?;
 
         Ok(HttpResponse {

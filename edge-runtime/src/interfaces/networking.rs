@@ -8,20 +8,28 @@ use trust_dns_resolver::TokioAsyncResolver;
 #[cfg(feature = "networking")]
 pub struct NetworkingState {
     resolver: TokioAsyncResolver,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 #[cfg(feature = "networking")]
 impl NetworkingState {
     pub fn new() -> Self {
+        Self::new_with_handle(tokio::runtime::Handle::current())
+    }
+
+    pub fn new_with_handle(handle: tokio::runtime::Handle) -> Self {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-        Self { resolver }
+        Self {
+            resolver,
+            runtime_handle: handle,
+        }
     }
 
     /// Resolve a hostname to a list of IP addresses.
     pub fn resolve(&self, hostname: &str) -> Result<Vec<String>, String> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.resolve_async(hostname))
+        self.runtime_handle
+            .block_on(self.resolve_async(hostname))
     }
 
     async fn resolve_async(&self, hostname: &str) -> Result<Vec<String>, String> {
