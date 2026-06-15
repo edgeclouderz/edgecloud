@@ -57,20 +57,14 @@ impl KvStore {
     }
 
     /// Get a non-expired entry from the data map. Caller must hold the read lock.
-    fn get_entry(
-        &self,
-        data: &HashMap<String, KvEntry>,
-        key: &str,
-    ) -> Option<KvEntry> {
+    fn get_entry(&self, data: &HashMap<String, KvEntry>, key: &str) -> Option<KvEntry> {
         data.get(key).cloned().filter(|e| !e.is_expired())
     }
 
     /// Remove expired entries from the map. Caller must hold the write lock.
     fn cleanup_expired(data: &mut HashMap<String, KvEntry>) {
         let now = Self::now_secs();
-        data.retain(|_, entry| {
-            entry.expires_at.map(|e| e > now).unwrap_or(true)
-        });
+        data.retain(|_, entry| entry.expires_at.map(|e| e > now).unwrap_or(true));
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
@@ -83,12 +77,7 @@ impl KvStore {
         Ok(None)
     }
 
-    pub fn set(
-        &self,
-        key: String,
-        value: Vec<u8>,
-        ttl_secs: Option<u32>,
-    ) -> Result<(), String> {
+    pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: Option<u32>) -> Result<(), String> {
         let expires_at = ttl_secs.map(Self::ttl_to_abs);
         let mut data = self.data.write().unwrap();
         data.insert(key, KvEntry { value, expires_at });
@@ -118,8 +107,7 @@ impl KvStore {
     /// is `Some(value)` if the key exists and is not expired, or `None` otherwise.
     pub fn get_many(&self, keys: &[String]) -> Vec<Option<Vec<u8>>> {
         let mut data = self.data.write().unwrap();
-        keys
-            .iter()
+        keys.iter()
             .map(|k| {
                 if let Some(entry) = self.get_entry(&data, k) {
                     Some(entry.value)
@@ -132,14 +120,17 @@ impl KvStore {
     }
 
     /// Set multiple key-value pairs atomically. Each item is (key, value, ttl_secs).
-    pub fn set_many(
-        &self,
-        items: &[(String, Vec<u8>, Option<u32>)],
-    ) -> Result<(), String> {
+    pub fn set_many(&self, items: &[(String, Vec<u8>, Option<u32>)]) -> Result<(), String> {
         let mut data = self.data.write().unwrap();
         for (key, value, ttl_secs) in items {
             let expires_at = ttl_secs.map(Self::ttl_to_abs);
-            data.insert(key.clone(), KvEntry { value: value.clone(), expires_at });
+            data.insert(
+                key.clone(),
+                KvEntry {
+                    value: value.clone(),
+                    expires_at,
+                },
+            );
         }
         if data.len() % KV_TTL_CLEANUP_BATCH_SIZE < items.len() {
             Self::cleanup_expired(&mut data);
@@ -175,12 +166,13 @@ mod tests {
 
     fn store_with_data() -> KvStore {
         let store = KvStore::new();
-        store.set_many(&[
-            ("key1".into(), b"val1".to_vec(), None),
-            ("key2".into(), b"val2".to_vec(), None),
-            ("key3".into(), b"val3".to_vec(), None),
-        ])
-        .unwrap();
+        store
+            .set_many(&[
+                ("key1".into(), b"val1".to_vec(), None),
+                ("key2".into(), b"val2".to_vec(), None),
+                ("key3".into(), b"val3".to_vec(), None),
+            ])
+            .unwrap();
         store
     }
 
@@ -264,7 +256,11 @@ mod tests {
         let result = store.get_many(&["a".into(), "b".into(), "c".into()]);
         assert_eq!(
             result,
-            vec![Some(b"1".to_vec()), Some(b"2".to_vec()), Some(b"3".to_vec())]
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"3".to_vec())
+            ]
         );
     }
 
@@ -295,7 +291,9 @@ mod tests {
         let store = KvStore::new();
         // Set with a TTL of 1 second — should expire immediately since we're not
         // actually advancing time in tests. The store cleanup runs on next write.
-        store.set("short".into(), b"temp".to_vec(), Some(1)).unwrap();
+        store
+            .set("short".into(), b"temp".to_vec(), Some(1))
+            .unwrap();
         // Without time travel, the key should still be there (cleanup not triggered yet).
         assert!(store.exists("short"));
     }
