@@ -60,6 +60,8 @@ impl HttpClient {
                 }
                 Err(FetchError { message }) => {
                     // Don't retry on permanent errors.
+                    // Note: reqwest Error::is_timeout() would be ideal but its constructors
+                    // are private, so we check the error message string for "timeout".
                     if attempt >= max_retries || message.contains("timeout") {
                         return HttpResponse {
                             status: 0,
@@ -195,5 +197,20 @@ mod tests {
         let err_msg = resp.error.unwrap_or_default();
         // Any error is acceptable here — just verify error field is populated.
         assert!(!err_msg.is_empty(), "error field should be populated");
+    }
+
+    #[test]
+    fn test_successful_response_error_field_is_none() {
+        let client = HttpClient::new();
+        // httpbin.org/get returns a valid JSON response with status 200.
+        // On success, error field must be None.
+        let resp = client.fetch("GET", "https://httpbin.org/get", &[], None, Some(5000));
+        assert!(
+            resp.error.is_none(),
+            "error field should be None on success, got: {:?}",
+            resp.error
+        );
+        assert_eq!(resp.status, 200);
+        assert!(!resp.body.is_empty());
     }
 }
