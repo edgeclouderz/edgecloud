@@ -112,9 +112,10 @@ impl HttpClientHost for RuntimeState {
         let url = req.url.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let body = req.body.as_deref();
-        let resp = self
-            .http_client
-            .fetch(method, url, &headers, body, req.timeout_ms);
+        let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
+        let resp =
+            self.http_client
+                .fetch(method, url, &headers, body, req.timeout_ms, trace_context);
         Some(Response {
             status: resp.status,
             headers: resp.headers.into_iter().collect(),
@@ -182,8 +183,8 @@ impl ObserveHost for RuntimeState {
     fn record_histogram(&mut self, name: String, value: f64, labels: Vec<(String, String)>) {
         self.observe.record_histogram(&name, value, &labels);
     }
-    fn emit_log(&mut self, level: String, message: String) {
-        self.observe.emit_log(&level, &message);
+    fn emit_log(&mut self, level: String, message: String, labels: Vec<(String, String)>) {
+        self.observe.emit_log(&level, &message, &labels);
     }
 }
 
@@ -253,6 +254,12 @@ impl HttpServerHost for RuntimeState {
                 query: req.query,
                 headers: req.headers,
                 body: req.body,
+                trace: req
+                    .trace
+                    .map(|tc| crate::edge::cloud::http_server::TraceContext {
+                        traceparent: tc.traceparent,
+                        tracestate: tc.tracestate,
+                    }),
             })
     }
     fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
