@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct ScheduledTask {
     pub id: String,
     pub payload: Vec<u8>,
@@ -14,61 +15,73 @@ pub struct ScheduledTask {
 
 pub struct Scheduler {
     tasks: Arc<Mutex<HashMap<String, ScheduledTask>>>,
+    /// Queue of due tasks ready for the guest to poll.
+    due_queue: Arc<Mutex<Vec<ScheduledTask>>>,
+    #[allow(dead_code)]
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl Scheduler {
+    /// Create a new Scheduler using the current tokio runtime handle.
     pub fn new() -> Self {
+        Self::new_with_handle(tokio::runtime::Handle::current())
+    }
+
+    /// Create a Scheduler with an explicit runtime handle.
+    pub fn new_with_handle(handle: tokio::runtime::Handle) -> Self {
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
+        let due_queue = Arc::new(Mutex::new(Vec::new()));
         let tasks_clone = tasks.clone();
+        let due_queue_clone = due_queue.clone();
 
-        // Spawn a background worker that fires due tasks.
-        // Task execution (wasm payload invocation) is left to the caller —
-        // this worker only tracks scheduling state and removes completed one-shots.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("scheduling: failed to spawn runtime");
-
-            rt.block_on(async {
-                loop {
-                    // Sleep until the next task is due (or a generous interval if none).
-                    let sleep_ms = {
-                        let tasks = tasks_clone.lock().unwrap();
-                        let next = tasks.values().map(|t| t.next_at).min();
-                        match next {
-                            Some(next_at) => {
-                                let remaining = next_at.saturating_duration_since(Instant::now());
-                                remaining.as_millis().max(100) as u64
-                            }
-                            None => 10_000,
+        // Spawn a background worker that fires due tasks and pushes them to due_queue.
+        handle.spawn(async move {
+            loop {
+                // Sleep until the next task is due (or a generous interval if none).
+                let sleep_ms = {
+                    let tasks = tasks_clone.lock().unwrap();
+                    let next = tasks.values().map(|t| t.next_at).min();
+                    match next {
+                        Some(next_at) => {
+                            let remaining = next_at.saturating_duration_since(Instant::now());
+                            remaining.as_millis().max(100) as u64
                         }
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        None => 10_000,
+                    }
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
-                    // Collect due tasks.
-                    let now = Instant::now();
-                    let mut tasks = tasks_clone.lock().unwrap();
-                    let due: Vec<(String, ScheduledTask)> =
-                        tasks.drain().filter(|(_, t)| t.next_at <= now).collect();
+                // Collect due tasks.
+                let now = Instant::now();
+                let mut tasks = tasks_clone.lock().unwrap();
+                let due: Vec<(String, ScheduledTask)> =
+                    tasks.drain().filter(|(_, t)| t.next_at <= now).collect();
 
-                    for (id, mut task) in due {
-                        if let Some(interval_ms) = task.interval_ms {
-                            // Repeating: reinsert with next deadline.
-                            task.next_at =
-                                Instant::now() + std::time::Duration::from_millis(interval_ms);
-                            tracing::debug!(task_id = %id, interval_ms, "repeating task due");
-                            tasks.insert(id, task);
-                        } else {
-                            // One-shot: removed, execution is caller responsibility.
-                            tracing::debug!(task_id = %id, "one-shot task fired");
-                        }
+                drop(tasks);
+
+                for (id, mut task) in due {
+                    if let Some(interval_ms) = task.interval_ms {
+                        // Repeating: reinsert with next deadline, push payload to queue.
+                        task.next_at =
+                            Instant::now() + std::time::Duration::from_millis(interval_ms);
+                        tracing::debug!(task_id = %id, interval_ms, "repeating task due");
+                        due_queue_clone.lock().unwrap().push(task.clone());
+                        let mut tasks = tasks_clone.lock().unwrap();
+                        tasks.insert(id, task);
+                    } else {
+                        // One-shot: push to queue for guest polling.
+                        tracing::debug!(task_id = %id, "one-shot task due");
+                        due_queue_clone.lock().unwrap().push(task);
                     }
                 }
-            });
+            }
         });
 
-        Self { tasks }
+        Self {
+            tasks,
+            due_queue,
+            runtime_handle: handle,
+        }
     }
 
     pub fn schedule_once(&self, delay_ms: u64, payload: Vec<u8>) -> Result<String, String> {
@@ -98,13 +111,23 @@ impl Scheduler {
     }
 
     pub fn cancel(&self, id: &str) -> Result<(), String> {
+        // Remove from tasks HashMap.
         let removed = self.tasks.lock().unwrap().remove(id).is_some();
+        // Also remove from due_queue if present.
         if removed {
+            let mut queue = self.due_queue.lock().unwrap();
+            queue.retain(|t| t.id != id);
             tracing::debug!(task_id = %id, "cancelled task");
             Ok(())
         } else {
             Err(format!("task not found: {}", id))
         }
+    }
+
+    /// Poll for the next due task. Returns (id, payload) if a task is ready.
+    pub fn poll_scheduled(&self) -> Option<(String, Vec<u8>)> {
+        let mut queue = self.due_queue.lock().unwrap();
+        queue.pop().map(|t| (t.id, t.payload))
     }
 }
 

@@ -49,6 +49,7 @@ interface scheduling {
   schedule-once: func(delay-ms: u64, payload: list<u8>) -> string;
   schedule-repeating: func(interval-ms: u64, payload: list<u8>) -> string;
   cancel-scheduled: func(id: string);
+  poll-scheduled: func() -> option<tuple<string, list<u8>>>;
 }
 
 interface process {
