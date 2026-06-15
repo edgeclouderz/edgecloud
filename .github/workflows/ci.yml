@@ -17,11 +17,14 @@ jobs:
       matrix:
         include:
           - tool: rustfmt
-            command: fmt --check
+            command: fmt
+            args: --check
           - tool: clippy
-            command: clippy -- -D warnings
+            command: clippy
+            args: -- -D warnings
           - tool: audit
             command: audit
+            args: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -62,9 +65,9 @@ jobs:
       - name: Run ${{ matrix.tool }}
         run: |
           if [ "${{ matrix.tool }}" = "audit" ]; then
-            cargo audit --manifest-path edge-runtime/Cargo.toml || true
+            cargo audit --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }} || true
           else
-            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml
+            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }}
           fi
 
   test:
