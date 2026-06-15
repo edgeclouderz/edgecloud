@@ -29,9 +29,6 @@ metrics = { version = "0.24", optional = true }
 # HTTP parsing for http-server
 httparse = { version = "1.10", optional = true }
 
-# HTTP parsing for http-server
-httparse = { version = "1.10", optional = true }
-
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
