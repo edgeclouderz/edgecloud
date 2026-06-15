@@ -26,6 +26,9 @@ trust-dns-resolver = { version = "0.23", features = ["tokio"], optional = true }
 # Metrics
 metrics = { version = "0.24", optional = true }
 
+# HTTP parsing for http-server
+httparse = { version = "1.10", optional = true }
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
@@ -52,5 +55,5 @@ observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
-http-server = ["dep:tokio"]
+http-server = ["dep:tokio", "dep:httparse"]
 networking = ["dep:trust-dns-resolver", "dep:tokio"]
