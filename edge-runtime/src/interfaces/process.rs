@@ -42,7 +42,10 @@ impl Process {
     }
 
     pub fn get_all_env(&self) -> Vec<(String, String)> {
-        self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn get_args(&self) -> Vec<String> {
