@@ -10,7 +10,8 @@ use crate::state::State;
 /// List all deployments for the app.
 #[cfg(feature = "network")]
 pub fn run(path: &Path) -> Result<()> {
-    let state = State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
+    let state =
+        State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
@@ -19,7 +20,7 @@ pub fn run(path: &Path) -> Result<()> {
     if deployments.is_empty() {
         println!("No deployments found.");
     } else {
-        println!("{:<12} {:<10} {:<20} {}", "ID", "STATUS", "CREATED", "URL");
+        println!("{:<12} {:<10} {:<20} URL", "ID", "STATUS", "CREATED");
         println!("{}", "-".repeat(60));
         for d in deployments {
             println!(
