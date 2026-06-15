@@ -58,14 +58,14 @@ impl HttpClient {
                     }
                     return resp;
                 }
-                Err(e) => {
+                Err(FetchError { message }) => {
                     // Don't retry on permanent errors.
-                    if attempt >= max_retries || e.contains("request timeout") {
+                    if attempt >= max_retries || message.contains("timeout") {
                         return HttpResponse {
                             status: 0,
                             headers: HashMap::new(),
                             body: Vec::new(),
-                            error: Some(e),
+                            error: Some(message),
                         };
                     }
                     attempt += 1;
@@ -83,9 +83,10 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<&[u8]>,
         timeout: Duration,
-    ) -> Result<HttpResponse, String> {
+    ) -> Result<HttpResponse, FetchError> {
+        // Validate method first.
         let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|e| format!("invalid method: {}", e))?;
+            .map_err(|e| FetchError { message: format!("invalid method: {}", e) })?;
 
         let mut req = self.client.request(method, url);
 
@@ -100,7 +101,7 @@ impl HttpClient {
         // Apply per-request timeout via request builder.
         req = req.timeout(timeout);
 
-        let response = req.send().map_err(|e| format!("request failed: {}", e))?;
+        let response = req.send().map_err(|e| FetchError { message: e.to_string() })?;
 
         let status = response.status().as_u16();
         let response_headers: HashMap<_, _> = response
@@ -108,9 +109,7 @@ impl HttpClient {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = response
-            .bytes()
-            .map_err(|e| format!("failed to read body: {}", e))?;
+        let body = response.bytes().map_err(|e| FetchError { message: e.to_string() })?;
 
         Ok(HttpResponse {
             status,
@@ -142,6 +141,12 @@ fn global_client() -> Arc<reqwest::blocking::Client> {
     .clone()
 }
 
+/// Error type for fetch operations — wraps a human-readable message.
+#[derive(Debug, Clone)]
+struct FetchError {
+    message: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status: u16,
@@ -170,5 +175,25 @@ mod tests {
         let c2 = global_client();
         // Arc should point to the same allocation.
         assert!(std::sync::Arc::ptr_eq(&c1, &c2));
+    }
+
+    #[test]
+    fn test_error_field_populated_on_network_failure() {
+        let client = HttpClient::new();
+        // Unreachable address — should fail fast without hanging.
+        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(500));
+        assert!(resp.error.is_some(), "error field should be populated on network failure");
+        assert_eq!(resp.status, 0);
+    }
+
+    #[test]
+    fn test_timeout_ms_short_timeout() {
+        let client = HttpClient::new();
+        // Unreachable address with a very short timeout.
+        // Should return a timeout- or connection-related error.
+        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(1));
+        let err_msg = resp.error.unwrap_or_default();
+        // Any error is acceptable here — just verify error field is populated.
+        assert!(!err_msg.is_empty(), "error field should be populated");
     }
 }
