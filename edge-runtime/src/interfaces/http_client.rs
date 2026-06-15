@@ -1,8 +1,8 @@
 //! `edge:http-client` — outbound HTTP requests.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashMap;
 
 /// Default per-request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -87,8 +87,9 @@ impl HttpClient {
         timeout: Duration,
     ) -> Result<HttpResponse, FetchError> {
         // Validate method first.
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|e| FetchError { message: format!("invalid method: {}", e) })?;
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| FetchError {
+            message: format!("invalid method: {}", e),
+        })?;
 
         let mut req = self.client.request(method, url);
 
@@ -103,7 +104,9 @@ impl HttpClient {
         // Apply per-request timeout via request builder.
         req = req.timeout(timeout);
 
-        let response = req.send().map_err(|e| FetchError { message: e.to_string() })?;
+        let response = req.send().map_err(|e| FetchError {
+            message: e.to_string(),
+        })?;
 
         let status = response.status().as_u16();
         let response_headers: HashMap<_, _> = response
@@ -111,7 +114,9 @@ impl HttpClient {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = response.bytes().map_err(|e| FetchError { message: e.to_string() })?;
+        let body = response.bytes().map_err(|e| FetchError {
+            message: e.to_string(),
+        })?;
 
         Ok(HttpResponse {
             status,
@@ -184,7 +189,10 @@ mod tests {
         let client = HttpClient::new();
         // Unreachable address — should fail fast without hanging.
         let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(500));
-        assert!(resp.error.is_some(), "error field should be populated on network failure");
+        assert!(
+            resp.error.is_some(),
+            "error field should be populated on network failure"
+        );
         assert_eq!(resp.status, 0);
     }
 
