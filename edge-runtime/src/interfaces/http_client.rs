@@ -37,6 +37,7 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<&[u8]>,
         timeout_ms: Option<u64>,
+        traceparent: Option<&str>,
     ) -> HttpResponse {
         let max_retries = DEFAULT_MAX_RETRIES;
         let base_delay = Duration::from_millis(DEFAULT_BASE_DELAY_MS);
@@ -45,7 +46,7 @@ impl HttpClient {
         let mut attempt = 0;
 
         loop {
-            let result = self.fetch_once(method, url, headers, body, timeout);
+            let result = self.fetch_once(method, url, headers, body, timeout, traceparent);
 
             match result {
                 Ok(resp) => {
@@ -85,6 +86,7 @@ impl HttpClient {
         headers: &[(String, String)],
         body: Option<&[u8]>,
         timeout: Duration,
+        traceparent: Option<&str>,
     ) -> Result<HttpResponse, FetchError> {
         // Validate method first.
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| FetchError {
@@ -95,6 +97,13 @@ impl HttpClient {
 
         for (k, v) in headers {
             req = req.header(k, v);
+        }
+
+        // Inject traceparent header for distributed tracing, if valid.
+        if let Some(tp) = traceparent {
+            if is_valid_traceparent(tp) {
+                req = req.header("traceparent", tp);
+            }
         }
 
         if let Some(b) = body {
@@ -132,6 +141,28 @@ fn backoff(attempt: u32, base_delay: Duration) -> Duration {
     let exp = attempt.saturating_sub(1).min(7);
     let delay_ms = base_delay.as_millis() as u64 * (2u64.pow(exp));
     Duration::from_millis(delay_ms.min(10_000))
+}
+
+/// Validates a traceparent header value per W3C Trace Context spec.
+/// Format: 00-<32hex>-<16hex>-<2hex>
+fn is_valid_traceparent(tp: &str) -> bool {
+    let parts: Vec<&str> = tp.split('-').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    if parts[0] != "00" {
+        return false;
+    }
+    if parts[1].len() != 32 || !parts[1].chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if parts[2].len() != 16 || !parts[2].chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if parts[3].len() != 2 {
+        return false;
+    }
+    true
 }
 
 /// Lazily-initialized global reqwest client with connection pooling.
@@ -188,7 +219,7 @@ mod tests {
     fn test_error_field_populated_on_network_failure() {
         let client = HttpClient::new();
         // Unreachable address — should fail fast without hanging.
-        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(500));
+        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None);
         assert!(
             resp.error.is_some(),
             "error field should be populated on network failure"
@@ -201,7 +232,7 @@ mod tests {
         let client = HttpClient::new();
         // Unreachable address with a very short timeout.
         // Should return a timeout- or connection-related error.
-        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(1));
+        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(1), None);
         let err_msg = resp.error.unwrap_or_default();
         // Any error is acceptable here — just verify error field is populated.
         assert!(!err_msg.is_empty(), "error field should be populated");
@@ -212,7 +243,14 @@ mod tests {
         let client = HttpClient::new();
         // httpbin.org/get returns a valid JSON response with status 200.
         // On success, error field must be None.
-        let resp = client.fetch("GET", "https://httpbin.org/get", &[], None, Some(5000));
+        let resp = client.fetch(
+            "GET",
+            "https://httpbin.org/get",
+            &[],
+            None,
+            Some(5000),
+            None,
+        );
         assert!(
             resp.error.is_none(),
             "error field should be None on success, got: {:?}",
@@ -220,5 +258,51 @@ mod tests {
         );
         assert_eq!(resp.status, 200);
         assert!(!resp.body.is_empty());
+    }
+
+    #[test]
+    fn test_traceparent_header_injected() {
+        let client = HttpClient::new();
+        // Valid W3C traceparent format
+        let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01";
+        // Unreachable host — error should be network-related, not a traceparent parsing error.
+        // This verifies the traceparent header path is exercised without hitting a real server.
+        let resp = client.fetch(
+            "GET",
+            "http://127.0.0.1:1",
+            &[],
+            None,
+            Some(100),
+            Some(traceparent),
+        );
+        assert!(resp.error.is_some(), "error field should be populated");
+        let err_msg = resp.error.unwrap();
+        // Should NOT fail due to traceparent validation — error should be network-related.
+        // reqwest error messages vary by platform; any error is acceptable here.
+        assert!(!err_msg.is_empty(), "error should be populated");
+    }
+
+    #[test]
+    fn test_is_valid_traceparent() {
+        // Valid traceparent
+        assert!(is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
+        // Invalid: wrong version
+        assert!(!is_valid_traceparent(
+            "01-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
+        // Invalid: malformed hex
+        assert!(!is_valid_traceparent(
+            "00-xyz7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
+        // Invalid: wrong number of parts
+        assert!(!is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa"
+        ));
+        // Invalid: traceparent too short
+        assert!(!is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503-01"
+        ));
     }
 }

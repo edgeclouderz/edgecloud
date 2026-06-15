@@ -35,6 +35,14 @@ pub struct IncomingRequest {
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub trace: Option<TraceContext>,
+}
+
+/// W3C Trace Context parsed from inbound request headers.
+#[derive(Debug, Clone, Default)]
+pub struct TraceContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
 }
 
 pub struct HttpServer {
@@ -329,6 +337,20 @@ impl HttpServer {
             })
             .collect();
 
+        // Parse W3C Trace Context headers.
+        let traceparent = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
+            .map(|(_, v)| v.clone());
+        let tracestate = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("tracestate"))
+            .map(|(_, v)| v.clone());
+        let trace = traceparent.map(|traceparent| TraceContext {
+            traceparent,
+            tracestate,
+        });
+
         // Determine body length from Content-Length.
         let body_len = headers
             .iter()
@@ -376,6 +398,7 @@ impl HttpServer {
             query,
             headers,
             body,
+            trace,
         }))
     }
 
