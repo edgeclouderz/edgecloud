@@ -25,6 +25,10 @@ trust-dns-resolver = { version = "0.23", features = ["tokio"], optional = true }
 
 # Metrics
 metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.13", optional = true }
+
+# HTTP parsing for http-server
+httparse = { version = "1.10", optional = true }
 
 # HTTP parsing for http-server
 httparse = { version = "1.10", optional = true }
@@ -51,7 +55,7 @@ default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", 
 http-client = ["dep:reqwest", "reqwest/blocking"]
 kv-store = []
 cache = ["dep:lru"]
-observe = ["dep:metrics"]
+observe = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
