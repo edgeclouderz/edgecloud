@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{timeout, Duration};
 
 /// Parts of an HTTP response sent back to the connection handler.
 pub struct HttpResponse {
@@ -29,6 +30,7 @@ pub struct IncomingRequest {
 pub struct HttpServer {
     port: Option<u16>,
     /// Persisted TCP listener — must outlive the accept loop.
+    #[allow(dead_code)]
     listener: Arc<tokio::net::TcpListener>,
     /// Sends incoming parsed requests toward `poll`.
     tx: Arc<RwLock<Option<mpsc::Sender<IncomingRequest>>>>,
@@ -47,46 +49,73 @@ pub struct HttpServer {
     /// Keep accept loop task alive so it doesn't get dropped.
     #[allow(dead_code)]
     accept_task: Option<tokio::task::JoinHandle<()>>,
+    /// Buffer size for reading HTTP requests (default 8KB).
+    buffer_size: usize,
+    /// Connection read timeout in seconds (default 30s).
+    connection_timeout_secs: u64,
 }
 
 impl HttpServer {
     pub fn new() -> Self {
-        // Create a dummy std TcpListener and convert to async — this is a placeholder;
-        // the real listener is bound in start() which overwrites this field.
-        let std_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        std_listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
         Self {
             port: None,
-            listener: Arc::new(listener),
+            listener: Arc::new({
+                let std_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+                std_listener.set_nonblocking(true).unwrap();
+                tokio::net::TcpListener::from_std(std_listener).unwrap()
+            }),
             tx: Arc::new(RwLock::new(None)),
             rx: Arc::new(Mutex::new(None)),
             responses: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
+            buffer_size: 8192,
+            connection_timeout_secs: 30,
         }
     }
 
+    /// Set the read buffer size for incoming HTTP requests.
+    pub fn with_buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
+
+    /// Set the connection read timeout in seconds.
+    pub fn with_connection_timeout(mut self, secs: u64) -> Self {
+        self.connection_timeout_secs = secs;
+        self
+    }
+
     /// Start the HTTP server on the given port, spawning the TCP accept loop.
-    pub async fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
+    /// This is synchronous — it spawns the async accept loop onto the current runtime
+    /// and returns immediately without blocking.
+    pub fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
+        let rt = tokio::runtime::Handle::current();
         let addr = format!("{}:{}", host.as_deref().unwrap_or("0.0.0.0"), port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
-        self.listener = Arc::new(listener);
-        self.port = Some(port);
 
-        let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
-        *self.tx.write().await = Some(tx.clone());
-        *self.rx.lock().unwrap() = Some(rx);
-
+        // Clone shared state for the async accept loop.
         let next_id = self.next_id.clone();
         let responses = self.responses.clone();
         let meter = self.meter.clone();
-        let listener = self.listener.clone();
+        let buffer_size = self.buffer_size;
+        let connection_timeout_secs = self.connection_timeout_secs;
 
-        let handle = tokio::spawn(async move {
+        // Set up channel for delivering incoming requests.
+        let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
+        let tx_clone = tx.clone();
+
+        // Spawn the async bind + accept loop onto the runtime.
+        rt.spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(err = %e, "failed to bind {}", addr);
+                    return;
+                }
+            };
+            tracing::info!(addr = %addr, "http-server listening");
+
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -94,9 +123,17 @@ impl HttpServer {
                         let (ch_tx, ch_rx) = tokio::sync::oneshot::channel();
                         responses.lock().unwrap().insert(id, ch_tx);
 
-                        let tx = tx.clone();
+                        let tx = tx_clone.clone();
                         let meter = meter.clone();
-                        tokio::spawn(Self::handle_connection(id, stream, tx, ch_rx, meter));
+                        tokio::spawn(Self::handle_connection(
+                            id,
+                            stream,
+                            tx,
+                            ch_rx,
+                            meter,
+                            buffer_size,
+                            connection_timeout_secs,
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(err = %e, "accept error");
@@ -105,8 +142,10 @@ impl HttpServer {
             }
         });
 
-        self.accept_task = Some(handle);
-        tracing::info!(addr = %addr, "http-server listening");
+        // Store channel endpoints synchronously.
+        self.port = Some(port);
+        self.tx = Arc::new(RwLock::new(Some(tx)));
+        self.rx = Arc::new(Mutex::new(Some(rx)));
         Ok(())
     }
 
@@ -118,14 +157,22 @@ impl HttpServer {
         tx: mpsc::Sender<IncomingRequest>,
         ch_rx: tokio::sync::oneshot::Receiver<HttpResponse>,
         meter: Option<Arc<RequestMeter>>,
+        buffer_size: usize,
+        connection_timeout_secs: u64,
     ) {
-        // Read the HTTP request from the socket.
-        let mut buf = [0u8; 8192];
-        let n = match stream.read(&mut buf).await {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(e) => {
+        // Read the HTTP request from the socket with a timeout.
+        let mut buf = vec![0u8; buffer_size];
+        let timeout_duration = Duration::from_secs(connection_timeout_secs);
+
+        let n = match timeout(timeout_duration, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 tracing::warn!(err = %e, "read error");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(req_id = %id, "connection read timeout");
                 return;
             }
         };
