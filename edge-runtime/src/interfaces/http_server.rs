@@ -3,10 +3,11 @@
 use crate::metering::RequestMeter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{timeout_at, Instant};
 
 /// Default maximum concurrent connections.
@@ -41,14 +42,11 @@ pub struct HttpServer {
     /// Sends incoming parsed requests toward `poll`.
     tx: Arc<RwLock<Option<mpsc::Sender<IncomingRequest>>>>,
     /// Receives incoming parsed requests in `poll`.
-    rx: Arc<std::sync::Mutex<Option<mpsc::Receiver<IncomingRequest>>>>,
+    rx: Arc<TokioMutex<Option<mpsc::Receiver<IncomingRequest>>>>,
     /// Maps request-id -> response sender, so `respond` can route data
     /// back to the correct connection handler.
-    responses: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>,
-        >,
-    >,
+    responses:
+        Arc<StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>>>,
     /// Request counter — must be shared with the accept loop.
     next_id: Arc<AtomicU64>,
     pub meter: Option<Arc<RequestMeter>>,
@@ -59,7 +57,7 @@ pub struct HttpServer {
 
     /// Shutdown signal sender. When dropped or explicitly triggered, the accept
     /// loop exits cleanly.
-    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    shutdown_tx: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
     /// Limits concurrent connections.
     conn_limit: Arc<Semaphore>,
     max_connections: usize,
@@ -72,12 +70,12 @@ impl HttpServer {
         Self {
             port: None,
             tx: Arc::new(RwLock::new(None)),
-            rx: Arc::new(Mutex::new(None)),
-            responses: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            rx: Arc::new(TokioMutex::new(None)),
+            responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
-            shutdown_tx: Arc::new(Mutex::new(None)),
+            shutdown_tx: Arc::new(StdMutex::new(None)),
             conn_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
@@ -89,12 +87,12 @@ impl HttpServer {
         Self {
             port: None,
             tx: Arc::new(RwLock::new(None)),
-            rx: Arc::new(Mutex::new(None)),
-            responses: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            rx: Arc::new(TokioMutex::new(None)),
+            responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
-            shutdown_tx: Arc::new(Mutex::new(None)),
+            shutdown_tx: Arc::new(StdMutex::new(None)),
             conn_limit: Arc::new(Semaphore::new(max_connections)),
             max_connections,
             conn_timeout: Duration::from_secs(conn_timeout_secs),
@@ -117,7 +115,7 @@ impl HttpServer {
 
         let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
         *self.tx.write().await = Some(tx.clone());
-        *self.rx.lock().unwrap() = Some(rx);
+        *self.rx.lock().await = Some(rx);
 
         // Create a fresh shutdown channel for this accept loop.
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -415,7 +413,7 @@ impl HttpServer {
 
     /// Poll for an incoming request (delivered by the accept loop).
     pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
-        let mut rx = self.rx.lock().unwrap();
+        let mut rx = self.rx.lock().await;
         if let Some(rx) = rx.as_mut() {
             match rx.recv().await {
                 Some(req) => Ok(Some(req)),

@@ -17,29 +17,22 @@ jobs:
       matrix:
         include:
           - tool: rustfmt
-            command: fmt --check
+            command: fmt
+            args: --check
           - tool: clippy
-            command: clippy -- -D warnings
+            command: clippy
+            args: -- -D warnings
           - tool: audit
             command: audit
+            args: ""
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Fix git state
         run: |
           git reset --hard
-          rm -rf edge-runtime/
-          git submodule update --init --recursive --force
-
-      - name: Debug
-        run: |
-          echo "=== ls -la edge-runtime/ ==="
-          ls -la edge-runtime/
-          echo "=== find edge-runtime/ -maxdepth 2 ==="
-          find edge-runtime/ -maxdepth 2
+          git submodule update --init --force
 
       - name: Install ${{ matrix.tool }}
         run: |
@@ -47,8 +40,7 @@ jobs:
             rustfmt) rustup component add rustfmt ;;
             clippy) rustup component add clippy ;;
             audit)
-              curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.18.3/cargo-audit-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C $HOME/.cargo/bin
-              chmod +x $HOME/.cargo/bin/cargo-audit
+              cargo install cargo-audit
               ;;
           esac
 
@@ -73,30 +65,20 @@ jobs:
       - name: Run ${{ matrix.tool }}
         run: |
           if [ "${{ matrix.tool }}" = "audit" ]; then
-            cargo audit --manifest-path edge-runtime/Cargo.toml || true
+            cargo audit --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }} || true
           else
-            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml
+            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }}
           fi
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Fix git state
         run: |
           git reset --hard
-          rm -rf edge-runtime/
-          git submodule update --init --recursive --force
-
-      - name: Debug
-        run: |
-          echo "=== ls -la edge-runtime/ ==="
-          ls -la edge-runtime/
-          echo "=== find edge-runtime/ -maxdepth 2 ==="
-          find edge-runtime/ -maxdepth 2
+          git submodule update --init --force
 
       - name: Cache cargo registry
         uses: actions/cache@v4
