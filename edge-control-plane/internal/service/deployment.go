@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -15,6 +16,18 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 )
+
+// IsValidAppName returns true if the app name is safe for use in paths.
+// Rejects empty strings and strings containing path traversal characters.
+func IsValidAppName(name string) bool {
+	if name == "" {
+		return false
+	}
+	return !strings.ContainsAny(name, "/\\..")
+}
+
+// MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
+const MaxArtifactSize = 100 * 1024 * 1024
 
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
@@ -49,6 +62,11 @@ func NewDeploymentService(
 
 // Deploy creates a new deployment and stores the artifact.
 func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader) (*domain.Deployment, error) {
+	// Validate appName to prevent path traversal (defense-in-depth)
+	if !IsValidAppName(appName) {
+		return nil, fmt.Errorf("invalid app name")
+	}
+
 	// Check quota
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {
@@ -63,10 +81,13 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("max deployments (%d) reached", quota.MaxDeployments)
 	}
 
-	// Read artifact and compute hash
-	data, err := io.ReadAll(r)
+	// Read artifact and compute hash (bounded to prevent memory exhaustion)
+	data, err := io.ReadAll(io.LimitReader(r, MaxArtifactSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading artifact: %w", err)
+	}
+	if int64(len(data)) > MaxArtifactSize {
+		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
 	}
 	hash := sha256.Sum256(data)
 
@@ -91,8 +112,15 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	return deployment, nil
 }
 
-func (s *DeploymentService) GetDeployment(ctx context.Context, id string) (*domain.Deployment, error) {
-	return s.deploymentRepo.GetByID(ctx, id)
+func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id string) (*domain.Deployment, error) {
+	deployment, err := s.deploymentRepo.GetByID(ctx, id)
+	if err != nil || deployment == nil {
+		return nil, err
+	}
+	if deployment.TenantID != tenantID {
+		return nil, nil // not found for this tenant
+	}
+	return deployment, nil
 }
 
 func (s *DeploymentService) ListDeployments(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
@@ -117,7 +145,10 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	}
 
 	// Publish task update
-	envs, _ := s.appEnvRepo.List(ctx, tenantID, appName)
+	envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
+	if err != nil {
+		return fmt.Errorf("listing env vars: %w", err)
+	}
 	envMap := make(map[string]string)
 	for _, e := range envs {
 		envMap[e.EnvKey] = e.EnvValue
@@ -136,7 +167,9 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 			},
 		},
 	}
-	_ = s.publisher.PublishTaskUpdate("global", msg) // region would come from worker selection
+	if err := s.publisher.PublishTaskUpdate("global", msg); err != nil {
+		return fmt.Errorf("publishing task update: %w", err)
+	}
 
 	return nil
 }
@@ -150,5 +183,13 @@ func (s *DeploymentService) GetActiveDeployment(ctx context.Context, tenantID, a
 }
 
 func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
+	// Verify deployment belongs to this tenant
+	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
+	if err != nil || deployment == nil {
+		return nil, fmt.Errorf("deployment not found")
+	}
+	if deployment.TenantID != tenantID || deployment.AppName != appName {
+		return nil, fmt.Errorf("deployment not found")
+	}
 	return s.artifactStore.Open(tenantID, appName, deploymentID)
 }

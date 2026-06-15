@@ -101,7 +101,9 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Plan != "" {
 		tenant.Plan = req.Plan
 	}
-	tenant.AllowlistedDestinations = req.AllowlistedDestinations
+	if len(req.AllowlistedDestinations) > 0 {
+		tenant.AllowlistedDestinations = req.AllowlistedDestinations
+	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)

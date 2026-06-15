@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -63,7 +64,11 @@ func Load(path string) (*Config, error) {
 		cfg.Database.Host = v
 	}
 	if v := os.Getenv("DATABASE_PORT"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.Database.Port)
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("DATABASE_PORT must be a valid integer: %w", err)
+		}
+		cfg.Database.Port = port
 	}
 	if v := os.Getenv("DATABASE_USER"); v != "" {
 		cfg.Database.User = v
@@ -84,7 +89,11 @@ func Load(path string) (*Config, error) {
 		cfg.App.Host = v
 	}
 	if v := os.Getenv("APP_PORT"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.App.Port)
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("APP_PORT must be a valid integer: %w", err)
+		}
+		cfg.App.Port = port
 	}
 	if v := os.Getenv("APP_ENV"); v != "" {
 		cfg.App.Env = v

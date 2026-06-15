@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"strings"
 
@@ -56,7 +57,9 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		}
 
 		// Update last used
-		_ = m.apiKeyRepo.UpdateLastUsed(r.Context(), apiKey.ID)
+		if err := m.apiKeyRepo.UpdateLastUsed(r.Context(), apiKey.ID); err != nil {
+			log.Printf("warning: failed to update last_used for api key %s: %v", apiKey.ID, err)
+		}
 
 		// Inject into context
 		ctx := context.WithValue(r.Context(), TenantIDKey, apiKey.TenantID)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
@@ -52,9 +53,10 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
 	deploymentID := r.PathValue("deploymentID")
 
-	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), deploymentID)
+	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
 	if err != nil {
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
@@ -65,6 +67,7 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(deployment)
 }
 
@@ -111,14 +114,8 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 }
 
 func containsPathTraversal(s string) bool {
-	return len(s) > 2 && (s == ".." || contains(s, "..") || contains(s, "/"))
-}
-
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+	if s == "" {
+		return true
 	}
-	return false
+	return strings.ContainsAny(s, "/\\") || strings.Contains(s, "..")
 }
