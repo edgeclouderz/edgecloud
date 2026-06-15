@@ -3,9 +3,9 @@
 use crate::metering::RequestMeter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 
 /// Parts of an HTTP response sent back to the connection handler.
 pub struct HttpResponse {
@@ -33,14 +33,11 @@ pub struct HttpServer {
     /// Sends incoming parsed requests toward `poll`.
     tx: Arc<RwLock<Option<mpsc::Sender<IncomingRequest>>>>,
     /// Receives incoming parsed requests in `poll`.
-    rx: Arc<std::sync::Mutex<Option<mpsc::Receiver<IncomingRequest>>>>,
+    rx: Arc<TokioMutex<Option<mpsc::Receiver<IncomingRequest>>>>,
     /// Maps request-id -> response sender, so `respond` can route data
     /// back to the correct connection handler.
-    responses: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>,
-        >,
-    >,
+    responses:
+        Arc<StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>>>,
     /// Request counter — must be shared with the accept loop.
     next_id: Arc<AtomicU64>,
     pub meter: Option<Arc<RequestMeter>>,
@@ -60,8 +57,8 @@ impl HttpServer {
             port: None,
             listener: Arc::new(listener),
             tx: Arc::new(RwLock::new(None)),
-            rx: Arc::new(Mutex::new(None)),
-            responses: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            rx: Arc::new(TokioMutex::new(None)),
+            responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
@@ -79,7 +76,7 @@ impl HttpServer {
 
         let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
         *self.tx.write().await = Some(tx.clone());
-        *self.rx.lock().unwrap() = Some(rx);
+        *self.rx.lock().await = Some(rx);
 
         let next_id = self.next_id.clone();
         let responses = self.responses.clone();
@@ -241,7 +238,7 @@ impl HttpServer {
 
     /// Poll for an incoming request (delivered by the accept loop).
     pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
-        let mut rx = self.rx.lock().unwrap();
+        let mut rx = self.rx.lock().await;
         if let Some(rx) = rx.as_mut() {
             match rx.recv().await {
                 Some(req) => Ok(Some(req)),
