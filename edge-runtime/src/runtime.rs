@@ -137,6 +137,21 @@ impl KvStoreHost for RuntimeState {
     fn list_keys(&mut self, prefix: String) -> Vec<String> {
         self.kv_store.list_keys(&prefix).ok().unwrap_or_default()
     }
+    fn get_many(&mut self, keys: Vec<String>) -> Vec<Option<Vec<u8>>> {
+        self.kv_store.get_many(&keys)
+    }
+    fn set_many(&mut self, items: Vec<(String, Vec<u8>, Option<u32>)>) {
+        let _ = self.kv_store.set_many(&items);
+    }
+    fn delete_many(&mut self, keys: Vec<String>) {
+        let _ = self.kv_store.delete_many(&keys);
+    }
+    fn exists(&mut self, key: String) -> bool {
+        self.kv_store.exists(&key)
+    }
+    fn clear(&mut self) {
+        self.kv_store.clear();
+    }
 }
 
 impl CacheHost for RuntimeState {
