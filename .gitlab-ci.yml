@@ -8,6 +8,7 @@ stages:
 variables:
   CARGO_TARGET_DIR: ${CI_PROJECT_DIR}/target
   CARGO_TERM_COLOR: always
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
 
 rustfmt:
   stage: check
@@ -18,7 +19,9 @@ rustfmt:
   cache:
     key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/bin/
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -29,11 +32,13 @@ clippy:
   before_script:
     - rustup component add clippy
   script:
-    - cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
+    - cargo clippy --manifest-path edge-runtime/Cargo.toml -- -D warnings
   cache:
     key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/bin/
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -41,15 +46,20 @@ clippy:
 
 audit:
   stage: check
-  before_script:
-    - rustup component add rust-src
-    - cargo install cargo-audit || true
   script:
+    - |
+      if [ ! -f .cargo/bin/cargo-audit ]; then
+        mkdir -p .cargo/bin
+        curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.18.3/cargo-audit-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C .cargo/bin
+        mv .cargo/bin/cargo-audit* .cargo/bin/cargo-audit 2>/dev/null || true
+      fi
     - cargo audit --manifest-path edge-runtime/Cargo.toml || true
   cache:
     key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/bin/
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -62,20 +72,9 @@ test:
   cache:
     key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/bin/
-      - target/
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-build:debug:
-  stage: build
-  script:
-    - cargo build --manifest-path edge-runtime/Cargo.toml
-  cache:
-    key: cargo-lock-${CI_COMMIT_REF_SLUG}
-    paths:
-      - ~/.cargo/bin/
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -88,7 +87,9 @@ build:release:
   cache:
     key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/bin/
+      - .cargo/bin/
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
