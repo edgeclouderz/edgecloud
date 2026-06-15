@@ -64,7 +64,7 @@ audit:
 test:
   stage: test
   script:
-    - cargo test --manifest-path edge-runtime/Cargo.toml --release
+    - cargo test --manifest-path edge-runtime/Cargo.toml
   cache:
     key: cargo-lock-${CI_DEFAULT_BRANCH}
     paths:
