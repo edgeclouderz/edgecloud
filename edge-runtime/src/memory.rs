@@ -1,7 +1,7 @@
 //! Memory access helpers for crossing the wasm boundary.
 
-use wasmtime::{Caller, Memory, Val};
 use anyhow::Result;
+use wasmtime::{Caller, Memory, Val};
 
 /// Read a UTF-8 string from wasm linear memory.
 pub fn read_string<T>(memory: &Memory, caller: &Caller<'_, T>, ptr: i32, len: i32) -> String {
@@ -35,7 +35,7 @@ pub fn allocate<T>(memory: &Memory, caller: &mut Caller<'_, T>, size: i32) -> Re
 
     let current_len = memory.data(&*caller).len();
     let new_len = current_len.saturating_add(size as usize);
-    let pages = ((new_len + 65535) / 65536) as u64;
+    let pages = (new_len as u64).div_ceil(65536);
     memory.grow(caller, pages)?;
     Ok(current_len as i32)
 }
@@ -62,7 +62,11 @@ pub fn read_bytes<T>(memory: &Memory, caller: &Caller<'_, T>, ptr: i32, len: i32
 }
 
 /// Write raw bytes to wasm linear memory, returning (ptr, len).
-pub fn write_bytes<T>(memory: &Memory, caller: &mut Caller<'_, T>, bytes: &[u8]) -> Result<(i32, i32)> {
+pub fn write_bytes<T>(
+    memory: &Memory,
+    caller: &mut Caller<'_, T>,
+    bytes: &[u8],
+) -> Result<(i32, i32)> {
     let ptr = allocate(memory, caller, bytes.len() as i32)?;
     memory.write(caller, ptr as usize, bytes)?;
     Ok((ptr as i32, bytes.len() as i32))
