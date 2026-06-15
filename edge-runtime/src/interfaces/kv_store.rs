@@ -123,6 +123,12 @@ impl KvStorePersistence {
             .map_err(|e| KvStoreError::Serialization(e.to_string()))?;
 
         let tmp_path = self.path.with_extension("json.tmp");
+        // Ensure the parent directory exists before writing.
+        if let Some(parent) = tmp_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                KvStoreError::Io(format!("failed to create store directory: {}", e))
+            })?;
+        }
         tokio::fs::write(&tmp_path, json.as_bytes())
             .await
             .map_err(|e| KvStoreError::Io(e.to_string()))?;
@@ -226,10 +232,12 @@ impl KvStore {
         // If no runtime is active, silently skip the flush (tests without persistence).
     }
 
+    /// Called by `flush_if_persistent` only when `persistence` is `Some`.
     async fn flush_impl(&self) -> Result<(), KvStoreError> {
-        if let Some(ref p) = self.persistence {
-            p.flush(&self.data).await?;
-        }
+        // SAFETY: flush_if_persistent returns early when persistence.is_none(),
+        // so this is only invoked when persistence is Some.
+        let p = self.persistence.as_ref().unwrap();
+        p.flush(&self.data).await?;
         Ok(())
     }
 
