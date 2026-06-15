@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use futures::StreamExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::Nats;
@@ -33,49 +34,97 @@ fn test_component_bytes() -> &'static [u8] {
     include_bytes!("fixtures/test-handle.wasm")
 }
 
-/// Build a test Supervisor with real NATS and a mock Downloader.
-async fn build_test_supervisor(nats_url: &str) -> Supervisor {
-    let config = Config {
-        worker_id: "test-worker".to_string(),
-        region: "test-region".to_string(),
-        nats_url: nats_url.to_string(),
-        control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
-        heartbeat_interval_secs: 30,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-    };
+/// Timeout for subscribing to heartbeats.
+const HEARTBEAT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let engine = edge_runtime::create_engine().expect("create engine");
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
+// ---------------------------------------------------------------------------
+// Test Harness
+// ---------------------------------------------------------------------------
 
-    let nats = Arc::new(NatsClientImpl::connect(nats_url).await.expect("connect nats"))
-        as Arc<dyn NatsClientTrait>;
+/// Collects all test infrastructure: NATS container, mock HTTP server, and a
+/// Supervisor wired up with real NATS and a mock Downloader.
+///
+/// The struct owns the NATS container so it is dropped (and cleaned up) when
+/// the test ends.
+pub struct TestHarness {
+    pub nats_url: String,
+    pub mock_server: MockServer,
+    pub supervisor: Arc<Supervisor>,
+    _nats_container: testcontainers::ContainerAsync<Nats>,
+}
 
-    Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
+impl TestHarness {
+    /// Start NATS, spin up a mock HTTP server, create a Supervisor.
+    pub async fn new() -> anyhow::Result<Self> {
+        let (_nats_container, nats_url) = nats_container().await;
+        let mock_server = MockServer::start().await;
+
+        let config = Config {
+            worker_id: "test-worker".to_string(),
+            region: "test-region".to_string(),
+            nats_url: nats_url.clone(),
+            control_plane_url: mock_server.uri(),
+            cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
+            heartbeat_interval_secs: 30,
+            port_cooldown_secs: 60,
+            starting_port: 18_000,
+        };
+
+        let engine = edge_runtime::create_engine()?;
+        let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+        let downloader = Arc::new(Downloader::new(
+            config.control_plane_url.clone(),
+            config.cache_dir.clone(),
+        ));
+        let port_pool = Arc::new(TokioMutex::new(PortPool::new(
+            config.starting_port,
+            config.port_cooldown_secs,
+        )));
+
+        let nats = Arc::new(NatsClientImpl::connect(&nats_url).await?)
+            as Arc<dyn NatsClientTrait>;
+
+        let supervisor = Arc::new(Supervisor {
+            config,
+            state,
+            downloader,
+            port_pool,
+            nats,
+        });
+
+        Ok(Self {
+            nats_url,
+            mock_server,
+            supervisor,
+            _nats_container,
+        })
     }
 }
 
-/// Helper: subscribe to heartbeats and collect the first one.
-async fn subscribe_heartbeats(nats_url: &str, region: &str) -> HeartbeatMessage {
-    let client = async_nats::connect(nats_url).await.expect("connect nats");
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Start a NATS container and return (container, url).
+async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
+    let container = Nats::default().start().await.expect("start NATS container");
+    let host = container.get_host().await.expect("get host");
+    let port = container.get_host_port_ipv4(4222).await.expect("get NATS port");
+    (container, format!("{}:{}", host, port))
+}
+
+/// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
+async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<HeartbeatMessage> {
+    let client = async_nats::connect(nats_url).await?;
     let subject = format!("edgecloud.heartbeats.{}", region);
-    let mut sub = client.subscribe(subject).await.expect("subscribe");
-    let msg = sub.next().await.expect("no heartbeat");
-    serde_json::from_slice(&msg.payload).expect("parse heartbeat")
+    let mut sub = client.subscribe(subject).await?;
+    let msg = timeout(HEARTBEAT_SUBSCRIBE_TIMEOUT, sub.next())
+        .await
+        .context("heartbeat subscription timed out")?
+        .context("no heartbeat message received")?;
+    let heartbeat =
+        serde_json::from_slice::<HeartbeatMessage>(&msg.payload).context("parse heartbeat")?;
+    Ok(heartbeat)
 }
 
 /// Helper: wait for an app to appear in state with Running status.
@@ -99,7 +148,11 @@ async fn wait_for_app_running(
 }
 
 /// Helper: wait for an app to disappear from state.
-async fn wait_for_app_gone(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
+async fn wait_for_app_gone(
+    supervisor: &Supervisor,
+    app_name: &str,
+    timeout_secs: u64,
+) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
@@ -115,68 +168,18 @@ async fn wait_for_app_gone(supervisor: &Supervisor, app_name: &str, timeout_secs
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Start a NATS container and return the URL string.
-async fn nats_container() -> String {
-    let container = Nats::default()
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container.get_host_port_ipv4(4222).await.expect("get NATS port");
-    let url = format!("{}:{}", host, port);
-    // Keep container alive for the test — it's dropped at the end of the test.
-    // We rely on Drop to clean up the container.
-    std::mem::forget(container);
-    url
-}
-
 #[tokio::test]
 async fn test_app_lifecycle() {
-    // Setup: start NATS and mock HTTP server
-    let nats_url = nats_container().await;
+    let harness = TestHarness::new().await.expect("create test harness");
 
-    let mock_server = MockServer::start().await;
+    // Wire up the mock HTTP server to serve the test component.
     Mock::given(method("GET"))
         .and(path("/api/internal/download/d_deploy_001"))
         .respond_with(
             ResponseTemplate::new(200).set_body_bytes(test_component_bytes()),
         )
-        .mount(&mock_server)
+        .mount(&harness.mock_server)
         .await;
-
-    let config = Config {
-        worker_id: "test-worker".to_string(),
-        region: "test-region".to_string(),
-        nats_url: nats_url.clone(),
-        control_plane_url: mock_server.uri(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
-        heartbeat_interval_secs: 30,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-    };
-
-    let engine = edge_runtime::create_engine().expect("create engine");
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-
-    let nats =
-        Arc::new(NatsClientImpl::connect(&nats_url).await.expect("connect nats"))
-            as Arc<dyn NatsClientTrait>;
-
-    let supervisor = Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-    });
 
     // Step 1: send TaskMessage to start an app
     let spec = AppSpec {
@@ -192,20 +195,21 @@ async fn test_app_lifecycle() {
         apps: HashMap::from([("test-app".to_string(), spec)]),
     };
 
-    supervisor
+    harness
+        .supervisor
         .handle_task_message(msg)
         .await
         .expect("handle_task_message");
 
     // Step 2: app should be Running
-    let running = wait_for_app_running(&supervisor, "test-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "test-app", 10).await;
     assert!(
         running,
         "app should be Running within 10s (check NATS connectivity and component compilation)"
     );
 
     // Step 3: heartbeat should include the app
-    let heartbeat = supervisor.build_heartbeat().await;
+    let heartbeat = harness.supervisor.build_heartbeat().await;
     assert!(
         heartbeat.apps.contains_key("test-app"),
         "heartbeat should contain test-app"
@@ -223,60 +227,27 @@ async fn test_app_lifecycle() {
         tenant_id: "t_test".to_string(),
         apps: HashMap::new(),
     };
-    supervisor
+    harness
+        .supervisor
         .handle_task_message(stop_msg)
         .await
         .expect("handle_task_message");
 
     // Step 5: app should be removed from state
-    let gone = wait_for_app_gone(&supervisor, "test-app", 10).await;
+    let gone = wait_for_app_gone(&harness.supervisor, "test-app", 10).await;
     assert!(gone, "app should be removed from state after stop");
 }
 
 #[tokio::test]
 async fn test_heartbeat_published() {
-    let nats_url = nats_container().await;
-
-    let supervisor = build_test_supervisor(&nats_url).await;
-
-    // Build and publish a heartbeat manually
-    let heartbeat = supervisor.build_heartbeat().await;
-    supervisor
-        .nats
-        .publish_heartbeat(&supervisor.config.region, &heartbeat)
-        .await
-        .expect("publish heartbeat");
-
-    // Subscribe and receive it
-    let received = timeout(
-        Duration::from_secs(5),
-        subscribe_heartbeats(&nats_url, "test-region"),
-    )
-    .await
-    .expect("heartbeat should arrive within 5s");
-
-    assert_eq!(received.worker_id, "test-worker");
-    assert_eq!(received.region, "test-region");
-}
-
-#[tokio::test]
-async fn test_stop_all_apps() {
-    let nats_url = nats_container().await;
-
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/internal/download/d_deploy_001"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(test_component_bytes()),
-        )
-        .mount(&mock_server)
-        .await;
+    let (container, nats_url) = nats_container().await;
+    std::mem::forget(container); // keep alive for test; dropped when test fn returns
 
     let config = Config {
         worker_id: "test-worker".to_string(),
         region: "test-region".to_string(),
         nats_url: nats_url.clone(),
-        control_plane_url: mock_server.uri(),
+        control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
         heartbeat_interval_secs: 30,
         port_cooldown_secs: 60,
@@ -294,9 +265,8 @@ async fn test_stop_all_apps() {
         config.port_cooldown_secs,
     )));
 
-    let nats =
-        Arc::new(NatsClientImpl::connect(&nats_url).await.expect("connect nats"))
-            as Arc<dyn NatsClientTrait>;
+    let nats = Arc::new(NatsClientImpl::connect(&nats_url).await.expect("connect nats"))
+        as Arc<dyn NatsClientTrait>;
 
     let supervisor = Arc::new(Supervisor {
         config,
@@ -305,6 +275,40 @@ async fn test_stop_all_apps() {
         port_pool,
         nats,
     });
+
+    // Build and publish a heartbeat manually
+    let heartbeat = supervisor.build_heartbeat().await;
+    supervisor
+        .nats
+        .publish_heartbeat(&supervisor.config.region, &heartbeat)
+        .await
+        .expect("publish heartbeat");
+
+    // Subscribe and receive it
+    let received = timeout(
+        Duration::from_secs(5),
+        subscribe_heartbeats(&nats_url, "test-region"),
+    )
+    .await
+    .expect("heartbeat should arrive within 5s")
+    .expect("subscribe_heartbeats");
+
+    assert_eq!(received.worker_id, "test-worker");
+    assert_eq!(received.region, "test-region");
+}
+
+#[tokio::test]
+async fn test_stop_all_apps() {
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // Wire up the mock HTTP server to serve the test component.
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_deploy_001"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(test_component_bytes()),
+        )
+        .mount(&harness.mock_server)
+        .await;
 
     // Start two apps
     for i in 0..2 {
@@ -319,20 +323,30 @@ async fn test_stop_all_apps() {
             tenant_id: "t_test".to_string(),
             apps: HashMap::from([(format!("app-{}", i), spec)]),
         };
-        supervisor
+        harness
+            .supervisor
             .handle_task_message(msg)
             .await
             .expect("handle_task_message");
     }
 
-    // Both should be running
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let state = supervisor.state.read().await;
+    // Wait for both apps to be running (not a fixed sleep)
+    for i in 0..2 {
+        let running =
+            wait_for_app_running(&harness.supervisor, &format!("app-{}", i), 10).await;
+        assert!(
+            running,
+            "app-{} should be running within 10s",
+            i
+        );
+    }
+
+    let state = harness.supervisor.state.read().await;
     assert_eq!(state.apps.len(), 2, "two apps should be running");
 
     // stop_all_apps
-    supervisor.stop_all_apps().await;
+    harness.supervisor.stop_all_apps().await;
 
-    let state = supervisor.state.read().await;
+    let state = harness.supervisor.state.read().await;
     assert!(state.apps.is_empty(), "all apps should be stopped");
 }
