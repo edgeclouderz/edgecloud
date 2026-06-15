@@ -13,8 +13,12 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<()>> {
 }
 
 /// Create a linker for WASI Preview 2 components.
+/// WASI P2 and edge:* interfaces are wired via the bindgen-generated add_to_linker.
 pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<RuntimeState>> {
     let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
+    linker.allow_shadowing(true);
+
     EdgeRuntime::add_to_linker(&mut linker, |state: &mut RuntimeState| state)?;
+
     Ok(linker)
 }
