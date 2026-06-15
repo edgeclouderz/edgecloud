@@ -15,6 +15,8 @@ const DEFAULT_MAX_CONNECTIONS: usize = 100;
 const DEFAULT_CONN_TIMEOUT_SECS: u64 = 30;
 /// Maximum header buffer size (16KB).
 const MAX_HEADER_SIZE: usize = 16384;
+/// Maximum request body size (10MB) — prevents memory exhaustion.
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Parts of an HTTP response sent back to the connection handler.
 pub struct HttpResponse {
@@ -243,7 +245,8 @@ impl HttpServer {
             }
         };
 
-        if let Err(e) = Self::write_response(&mut stream, status, &headers, &body, conn_timeout).await {
+        // Use the same deadline for write (does not refresh).
+        if let Err(e) = Self::write_response(&mut stream, status, &headers, &body, deadline).await {
             tracing::warn!(req_id = %id, err = %e, "response write error");
         }
     }
@@ -330,6 +333,12 @@ impl HttpServer {
             .and_then(|(_, v)| v.parse::<usize>().ok())
             .unwrap_or(0);
 
+        // Reject oversized bodies to prevent memory exhaustion.
+        if body_len > MAX_BODY_SIZE {
+            tracing::warn!(req_id = %id, body_len, "request body exceeds max size");
+            return Ok(None);
+        }
+
         // Read body.
         let mut body = Vec::new();
         if body_len > 0 {
@@ -370,9 +379,8 @@ impl HttpServer {
         status: u16,
         headers: &[(String, String)],
         body: &[u8],
-        conn_timeout: Duration,
+        deadline: Instant,
     ) -> Result<(), std::io::Error> {
-        let deadline = Instant::now() + conn_timeout;
         let status_line = format!("HTTP/1.1 {} {}\r\n", status, Self::status_text(status));
         let mut response = status_line.into_bytes();
         for (k, v) in headers {
@@ -437,6 +445,12 @@ impl HttpServer {
         .map_err(|_| "response channel closed".to_string())?;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub fn inject_request(&self, request: IncomingRequest) {
+        // No-op helper for testing — the server doesn't support direct injection.
+        let _ = request;
+    }
 }
 
 impl Drop for HttpServer {
@@ -455,5 +469,63 @@ impl Drop for HttpServer {
 impl Default for HttpServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_text_known_codes() {
+        for (code, expected) in &[
+            (200, "OK"),
+            (201, "Created"),
+            (204, "No Content"),
+            (301, "Moved Permanently"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (500, "Internal Server Error"),
+            (503, "Service Unavailable"),
+        ] {
+            assert_eq!(HttpServer::status_text(*code), *expected);
+        }
+    }
+
+    #[test]
+    fn test_status_text_unknown_code() {
+        assert_eq!(HttpServer::status_text(999), "Unknown");
+    }
+
+    #[test]
+    fn test_server_new_has_defaults() {
+        let server = HttpServer::new();
+        assert!(server.port.is_none());
+        assert_eq!(server.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            server.conn_timeout,
+            Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn test_server_with_limits() {
+        let server = HttpServer::with_limits(50, 10);
+        assert_eq!(server.max_connections, 50);
+        assert_eq!(server.conn_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_server_with_connection_timeout() {
+        let server = HttpServer::new().with_connection_timeout(60);
+        assert_eq!(server.conn_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(DEFAULT_MAX_CONNECTIONS, 100);
+        assert_eq!(DEFAULT_CONN_TIMEOUT_SECS, 30);
+        assert_eq!(MAX_HEADER_SIZE, 16384);
+        assert_eq!(MAX_BODY_SIZE, 10 * 1024 * 1024);
     }
 }
