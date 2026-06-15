@@ -28,19 +28,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore working tree
-        run: git reset --hard
-
-      - name: Debug directory state
+      - name: Fix git state
         run: |
-          echo "=== pwd ==="
-          pwd
+          git reset --hard
+          git submodule update --init --force
+
+      - name: Debug
+        run: |
           echo "=== ls edge-runtime/ ==="
           ls edge-runtime/
-          echo "=== cat edge-runtime/Cargo.toml | head -3 ==="
-          cat edge-runtime/Cargo.toml | head -3
-          echo "=== git rev-parse --show-toplevel ==="
-          git rev-parse --show-toplevel
+          echo "=== ls edge-runtime/src/ ==="
+          ls edge-runtime/src/ 2>&1 || echo "NOT FOUND"
 
       - name: Install ${{ matrix.tool }}
         run: |
@@ -86,17 +84,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore working tree
-        run: git reset --hard
-
-      - name: Debug directory state
+      - name: Fix git state
         run: |
-          echo "=== pwd ==="
-          pwd
+          git reset --hard
+          git submodule update --init --force
+
+      - name: Debug
+        run: |
           echo "=== ls edge-runtime/ ==="
           ls edge-runtime/
-          echo "=== cat edge-runtime/Cargo.toml | head -3 ==="
-          cat edge-runtime/Cargo.toml | head -3
+          echo "=== ls edge-runtime/src/ ==="
+          ls edge-runtime/src/ 2>&1 || echo "NOT FOUND"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
