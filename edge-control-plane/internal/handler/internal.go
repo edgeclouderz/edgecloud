@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
@@ -15,14 +16,15 @@ func NewInternalHandler(deploymentSvc *service.DeploymentService) *InternalHandl
 	return &InternalHandler{deploymentSvc: deploymentSvc}
 }
 
-// Download serves Wasm artifacts to workers.
+// Download serves Wasm artifacts to authenticated workers.
+// TODO: Implement proper JWT validation for worker authentication.
+// Currently allows any caller who knows a deployment ID.
 func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 	deploymentID := r.PathValue("deploymentID")
 
-	// TODO: Validate JWT from worker
-
 	// Get deployment to find tenant and app
-	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), deploymentID)
+	// Note: This endpoint needs proper worker JWT auth before production use
+	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), "", deploymentID)
 	if err != nil || deployment == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -37,18 +39,8 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
-	// Copy artifact to response
-	// buffer size 32KB
-	buf := make([]byte, 32768)
-	for {
-		n, err := artifact.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-		}
-		if err != nil {
-			break
-		}
+	if _, err := io.Copy(w, artifact); err != nil {
+		// client disconnected, nothing we can do
+		return
 	}
 }

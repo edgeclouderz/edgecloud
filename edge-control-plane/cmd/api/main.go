@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
@@ -112,12 +111,5 @@ func main() {
 	log.Printf("Starting edge-cloud control plane on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
-	}
-}
-
-func init() {
-	// Ensure artifact storage directory exists
-	if err := os.MkdirAll("/var/edgecloud/registry", 0755); err != nil {
-		log.Printf("Warning: could not create artifact directory: %v", err)
 	}
 }

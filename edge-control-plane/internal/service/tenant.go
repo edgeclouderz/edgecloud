@@ -64,6 +64,9 @@ func (s *TenantService) GetTenant(ctx context.Context, id string) (*domain.Tenan
 	if err != nil {
 		return nil, err
 	}
+	if quota == nil {
+		return nil, fmt.Errorf("quota not found for tenant")
+	}
 
 	return &domain.TenantWithQuota{Tenant: *tenant, Quota: *quota}, nil
 }
