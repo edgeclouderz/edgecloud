@@ -184,10 +184,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Perform graceful shutdown: signal the heartbeat to stop, stop all apps,
 /// publish a final heartbeat, then exit the process.
-async fn graceful_shutdown(
-    shutdown_tx: Arc<broadcast::Sender<()>>,
-    supervisor: Arc<Supervisor>,
-) {
+async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
     // Signal the heartbeat task to stop.
     let _ = shutdown_tx.send(());
 
