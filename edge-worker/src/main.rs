@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::messages::TaskMessage;
-use crate::nats::NatsClient;
+use crate::nats::NatsClientImpl;
 use crate::port_pool::PortPool;
 use crate::state::WorkerState;
 use crate::supervisor::Supervisor;
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Connect to NATS
-    let nats = Arc::new(NatsClient::connect(&config.nats_url).await?);
+    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn crate::nats::NatsClient>;
     tracing::info!(url = %config.nats_url, "connected to NATS");
 
     // Create the shutdown broadcast channel for the heartbeat task.
