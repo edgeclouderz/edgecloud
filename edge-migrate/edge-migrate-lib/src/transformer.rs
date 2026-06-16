@@ -56,14 +56,12 @@ pub struct Transformer;
 impl Transformer {
     /// Transform the given C source based on detected pattern matches.
     ///
-    /// Processes matches from highest to lowest byte position, splicing in
-    /// WASI replacements. The running_offset tracks how much the output
-    /// has grown due to WASI code being longer than the original code it
-    /// replaces. This offset is added to all subsequent match positions.
-    ///
-    /// The WASI header is prepended first (at output position 0), so all
-    /// match positions in the output are shifted by header_len — regardless
-    /// of whether the first match is at byte 0 or not.
+    /// Processes matches from highest to lowest byte position, building the
+    /// output by: prepending the WASI header, then for each match appending
+    /// (original content in the gap, WASI replacement). The gap is the content
+    /// BETWEEN the current match's end and the PREVIOUS match's end (in
+    /// original source coordinates). After all matches, append any remaining
+    /// original content from byte 0 to the first match's start.
     pub fn transform(source: &str, matches: Vec<PatternMatch>) -> TransformResult {
         let mut transformations_applied = Vec::new();
         let mut manual_review = Vec::new();
@@ -76,17 +74,17 @@ impl Transformer {
         manual_review.extend(not_transformable);
 
         // Sort by start_byte descending — process from end of file backward
-        // so earlier byte positions remain valid as we splice
         let mut sorted = transformable;
         sorted.sort_by_key(|m| Reverse(m.start_byte));
 
         let source_bytes = source.as_bytes();
 
-        // Prepend WASI header — it is always prepended, so all subsequent
-        // splice positions are offset by header_len from the very start.
-        let mut result = WASI_INCLUDES.as_bytes().to_vec();
+        // Build output: WASI header + for each match (gap content + WASI replacement)
+        let mut output = WASI_INCLUDES.as_bytes().to_vec();
 
-        let mut last_end = 0usize;
+        // prev_end tracks the END of the previous match in ORIGINAL coordinates.
+        // Start at source.len() (end of file in original).
+        let mut prev_end = source_bytes.len();
 
         for m in &sorted {
             let wasi_code = Self::generate_wasi_code(m);
@@ -97,15 +95,17 @@ impl Transformer {
             let orig_start = m.start_byte;
             let orig_end = m.end_byte;
 
-            // Copy original content between last_end and orig_start (the gap)
-            if orig_start > last_end {
-                result.extend_from_slice(&source_bytes[last_end..orig_start]);
-            }
+            // Copy original content from orig_end to prev_end (the gap between
+            // this match and the previous one in original coordinates).
+            // This is the content that comes AFTER this match in the original
+            // but BEFORE the previous match was processed.
+            output.extend_from_slice(&source_bytes[orig_end..prev_end]);
 
-            // Insert WASI replacement
-            result.extend_from_slice(wasi_code.as_bytes());
+            // Append WASI replacement
+            output.extend_from_slice(wasi_code.as_bytes());
 
-            last_end = orig_end;
+            // Update: this match's start becomes the boundary for the next iteration
+            prev_end = orig_start;
 
             transformations_applied.push(Transformation {
                 line: m.line,
@@ -118,12 +118,12 @@ impl Transformer {
             });
         }
 
-        // Append remaining original content after the last processed match
-        if last_end < source_bytes.len() {
-            result.extend_from_slice(&source_bytes[last_end..]);
+        // After all matches: append remaining original content from byte 0 to first match start
+        if prev_end > 0 {
+            output.extend_from_slice(&source_bytes[..prev_end]);
         }
 
-        let transformed_source = String::from_utf8(result)
+        let transformed_source = String::from_utf8(output)
             .expect("Transformed source is not valid UTF-8");
 
         TransformResult {
@@ -134,7 +134,6 @@ impl Transformer {
         }
     }
 
-    
     /// Generate WASI C code for a pattern match.
     fn generate_wasi_code(m: &PatternMatch) -> String {
         match m.pattern {
@@ -521,6 +520,12 @@ int main() {
         assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_start_listen"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
+
+        // Original POSIX calls must NOT be present
+        assert!(!result.transformed_source.contains("socket(AF_INET"), "socket(AF_INET still present");
+        assert!(!result.transformed_source.contains("bind(fd, (struct sockaddr*)&addr"), "bind original still present");
+        assert!(!result.transformed_source.contains("listen(fd, 128)"), "listen original still present");
+        assert!(!result.transformed_source.contains("accept(fd, NULL, NULL)"), "accept original still present");
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
         // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
