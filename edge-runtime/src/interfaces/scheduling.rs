@@ -374,3 +374,73 @@ impl Scheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schedule_once_returns_valid_id() {
+        let scheduler = Scheduler::new();
+        let id = scheduler
+            .schedule_once(60_000, b"payload".to_vec())
+            .unwrap();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn test_schedule_repeating_returns_valid_id() {
+        let scheduler = Scheduler::new();
+        let id = scheduler
+            .schedule_repeating(1_000, b"payload".to_vec())
+            .unwrap();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_one_shot_before_fire() {
+        let scheduler = Scheduler::new();
+        let id = scheduler
+            .schedule_once(600_000, b"payload".to_vec())
+            .unwrap();
+        scheduler.cancel(&id).unwrap();
+        let result = scheduler.cancel(&id);
+        assert!(result.is_err()); // already cancelled
+    }
+
+    #[test]
+    fn test_cancel_repeating_before_fire() {
+        let scheduler = Scheduler::new();
+        let id = scheduler
+            .schedule_repeating(1_000, b"payload".to_vec())
+            .unwrap();
+        scheduler.cancel(&id).unwrap();
+        let result = scheduler.cancel(&id);
+        assert!(result.is_err()); // already cancelled
+    }
+
+    #[test]
+    fn test_cancel_unknown_id_returns_err() {
+        let scheduler = Scheduler::new();
+        let result = scheduler.cancel("not-a-real-id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_env_returns_none_when_not_set() {
+        let result = Scheduler::from_env();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_instant_to_secs_roundtrip() {
+        init_time_refs();
+        let instant = Instant::now();
+        let secs = instant_to_secs(&instant);
+        let recovered = secs_to_instant(secs);
+        // Recovered instant should be within 2 seconds of original (clock drift)
+        let drift = instant.saturating_duration_since(recovered);
+        assert!(drift.as_secs() < 2);
+    }
+}
