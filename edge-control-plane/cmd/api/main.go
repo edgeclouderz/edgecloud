@@ -111,8 +111,14 @@ func main() {
 	mux.Handle("/api/", apiWithAuth)
 	mux.Handle("/api/admin/", apiWithOwner)
 
-	// Internal endpoints (worker-facing, would need JWT auth)
-	mux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	// Internal endpoints (worker-facing, JWT auth)
+	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	workerJWTConfig := middleware.WorkerJWTConfig{
+		Secret: cfg.JWT.Secret,
+		Issuer: cfg.JWT.Issuer,
+	}
+	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
 	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
