@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::sync::{oneshot, Semaphore};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 
 /// Enum to hold either a plain TCP stream or a TLS stream.
 /// Allows a single handle_connection to work with both without dyn Trait.
@@ -217,7 +217,7 @@ impl HttpServer {
         let responses = self.responses.clone();
         let meter = self.meter.clone();
         let conn_limit = self.conn_limit.clone();
-                                let conn_handles = self.conn_handles.clone();
+        let conn_handles = self.conn_handles.clone();
         let conn_timeout = self.conn_timeout;
         let max_connections = self.max_connections;
         let tls_config = self.tls_config.clone();
@@ -311,15 +311,25 @@ impl HttpServer {
     /// Initiate graceful shutdown of the accept loop and drain all in-flight
     /// connection handler tasks. Idempotent — subsequent calls after the first
     /// are no-ops.
+    ///
+    /// Each in-flight connection is given up to `drain_timeout` seconds to finish.
+    /// Connections that exceed the timeout are dropped (their tasks continue running
+    /// independently — we simply stop waiting).
     pub async fn shutdown(&self) {
         // Signal the accept loop to stop accepting new connections.
         if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
-        // Drain and await all in-flight connection handler tasks.
+        // Drain all in-flight connection handler tasks with a per-connection timeout.
+        // Each handle is awaited with its own timeout so a single slow connection
+        // cannot block the drain of other connections.
         let handles: Vec<_> = self.conn_handles.lock().unwrap().drain(..).collect();
+        let drain_timeout = Duration::from_secs(5);
         for handle in handles {
-            let _ = handle.await;
+            let _ = timeout(drain_timeout, handle).await;
+            // Note: on timeout, the connection task continues running. This is
+            // acceptable — we give connections a fair window to finish but do not
+            // wait forever for a stuck peer.
         }
     }
 

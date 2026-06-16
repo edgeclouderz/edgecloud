@@ -1,8 +1,8 @@
 //! `edge:observe` — metrics and logging.
 
+use metrics::NoopRecorder;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use metrics::NoopRecorder;
 
 /// Default labels used when none are provided.
 const DEFAULT_LABELS: &[(String, String)] = &[];
