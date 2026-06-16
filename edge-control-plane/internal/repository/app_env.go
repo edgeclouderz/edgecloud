@@ -49,3 +49,8 @@ func (r *AppEnvRepository) Delete(ctx context.Context, tenantID, appName, key st
 	_, err := r.db.ExecContext(ctx, `DELETE FROM app_env WHERE tenant_id = $1 AND app_name = $2 AND env_key = $3`, tenantID, appName, key)
 	return err
 }
+
+func (r *AppEnvRepository) DeleteByApp(ctx context.Context, tenantID, appName string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM app_env WHERE tenant_id = $1 AND app_name = $2`, tenantID, appName)
+	return err
+}

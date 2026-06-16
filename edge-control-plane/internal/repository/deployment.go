@@ -56,3 +56,8 @@ func (r *DeploymentRepository) UpdateStatus(ctx context.Context, id, status stri
 	_, err := r.db.ExecContext(ctx, `UPDATE deployments SET status = $2 WHERE id = $1`, id, status)
 	return err
 }
+
+func (r *DeploymentRepository) DeleteByApp(ctx context.Context, tenantID, appName string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM deployments WHERE tenant_id = $1 AND app_name = $2`, tenantID, appName)
+	return err
+}

@@ -43,6 +43,11 @@ interface cache {
   delete: func(key: string);
   clear: func();
   size: func() -> u32;
+  exists: func(key: string) -> bool;
+  list-keys: func(prefix: string) -> list<string>;
+  get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+  set-many: func(items: list<tuple<string, list<u8>, option<u32>>>);
+  delete-many: func(keys: list<string>);
 }
 
 interface observe {
@@ -68,6 +73,7 @@ interface process {
   get-env: func(key: string) -> option<string>;
   get-all-env: func() -> list<tuple<string, string>>;
   get-args: func() -> list<string>;
+  get-cwd: func() -> result<string, string>;
   exit: func(code: u32);
 }
 
@@ -96,6 +102,7 @@ interface http-server {
   get-assigned-port: func() -> u16;
   poll: func() -> result<option<incoming-request>, string>;
   respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<_, string>;
+  stop: func();
 }
 
 world edge-runtime {

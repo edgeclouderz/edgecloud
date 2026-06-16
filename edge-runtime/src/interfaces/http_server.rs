@@ -310,6 +310,11 @@ impl HttpServer {
         }
     }
 
+    /// Alias for shutdown — used by the WIT stop() call.
+    pub fn stop(&self) {
+        self.shutdown();
+    }
+
     /// Returns the port the server is bound to, if it has been started.
     pub fn get_assigned_port(&self) -> Option<u16> {
         self.port
