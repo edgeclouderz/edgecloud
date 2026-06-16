@@ -12,7 +12,7 @@ import (
 
 // TenantService handles tenant business logic.
 type TenantService struct {
-	db        *sqlx.DB
+	db         *sqlx.DB
 	tenantRepo *repository.TenantRepository
 	quotaRepo  *repository.QuotaRepository
 }
@@ -24,9 +24,9 @@ func NewTenantService(db *sqlx.DB, tenantRepo *repository.TenantRepository, quot
 // CreateTenant creates a new tenant with default quota atomically.
 func (s *TenantService) CreateTenant(ctx context.Context, name, plan string) (*domain.Tenant, error) {
 	tenant := &domain.Tenant{
-		ID:                     "t_" + uuid.New().String(),
-		Name:                   name,
-		Plan:                   plan,
+		ID:                      "t_" + uuid.New().String(),
+		Name:                    name,
+		Plan:                    plan,
 		AllowlistedDestinations: []string{},
 	}
 

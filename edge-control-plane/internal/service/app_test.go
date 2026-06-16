@@ -11,10 +11,10 @@ import (
 
 // mockAppRepo implements appRepoInterface for testing.
 type mockAppRepo struct {
-	createFunc         func(ctx context.Context, app *domain.App) error
-	getFunc            func(ctx context.Context, tenantID, appName string) (*domain.App, error)
-	listFunc           func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
-	atomicDeleteFunc   func(ctx context.Context, tenantID, appName string) (bool, error)
+	createFunc            func(ctx context.Context, app *domain.App) error
+	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	listFunc              func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	atomicDeleteFunc      func(ctx context.Context, tenantID, appName string) (bool, error)
 	insertIfNotExistsFunc func(ctx context.Context, app *domain.App) (bool, error)
 }
 
@@ -53,31 +53,6 @@ func (m *mockAppRepo) InsertIfNotExists(ctx context.Context, app *domain.App) (b
 	return false, nil
 }
 
-// cascadeRepoMock implements cascadeRepoInterface for testing.
-type cascadeRepoMock struct {
-	deleteByAppFunc func(ctx context.Context, tenantID, appName string) error
-}
-
-func (m *cascadeRepoMock) DeleteByApp(ctx context.Context, tenantID, appName string) error {
-	if m.deleteByAppFunc != nil {
-		return m.deleteByAppFunc(ctx, tenantID, appName)
-	}
-	return nil
-}
-
-// mockCascadeRepo wraps cascadeRepoMock to implement cascadeDeleteInterface including WithTx.
-type mockCascadeRepo struct {
-	*cascadeRepoMock
-	withTxFunc func(tx interface{}) *mockCascadeRepo
-}
-
-func (m *mockCascadeRepo) WithTx(tx interface{}) *mockCascadeRepo {
-	if m.withTxFunc != nil {
-		return m.withTxFunc(tx)
-	}
-	return m
-}
-
 // appSvcForTest builds an AppService with mock dependencies.
 // Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
 // Delete is not testable without a real DB connection for repository.Transaction.
@@ -90,12 +65,9 @@ func appSvcForTest(repo appRepoInterface) *AppService {
 func TestAppService_Create_HappyPath(t *testing.T) {
 	createdApp := (*domain.App)(nil)
 	repo := &mockAppRepo{
-		getFunc: func(ctx context.Context, tenantID, appName string) (*domain.App, error) {
-			return nil, nil // doesn't exist
-		},
-		createFunc: func(ctx context.Context, app *domain.App) error {
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
 			createdApp = app
-			return nil
+			return true, nil
 		},
 	}
 	svc := appSvcForTest(repo)
@@ -119,14 +91,14 @@ func TestAppService_Create_HappyPath(t *testing.T) {
 		t.Errorf("app.Description = %v, want %q", app.Description, "my description")
 	}
 	if createdApp == nil {
-		t.Error("repo Create was not called")
+		t.Error("repo InsertIfNotExists was not called")
 	}
 }
 
 func TestAppService_Create_AlreadyExists(t *testing.T) {
 	repo := &mockAppRepo{
-		getFunc: func(ctx context.Context, tenantID, appName string) (*domain.App, error) {
-			return &domain.App{ID: "a_existing", TenantID: tenantID, Name: appName}, nil
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return false, nil // already exists
 		},
 	}
 	svc := appSvcForTest(repo)
@@ -167,11 +139,8 @@ func TestAppService_Create_InvalidName(t *testing.T) {
 
 func TestAppService_Create_DBError(t *testing.T) {
 	repo := &mockAppRepo{
-		getFunc: func(ctx context.Context, tenantID, appName string) (*domain.App, error) {
-			return nil, nil
-		},
-		createFunc: func(ctx context.Context, app *domain.App) error {
-			return errors.New("db error")
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return false, errors.New("db error")
 		},
 	}
 	svc := appSvcForTest(repo)

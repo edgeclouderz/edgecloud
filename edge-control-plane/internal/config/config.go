@@ -10,11 +10,11 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Database DatabaseConfig `yaml:"database"`
-	NATS     NATSConfig     `yaml:"nats"`
-	App      AppConfig      `yaml:"app"`
-	Storage  StorageConfig  `yaml:"storage"`
-	JWT      JWTConfig      `yaml:"jwt"`
+	Database  DatabaseConfig  `yaml:"database"`
+	NATS      NATSConfig      `yaml:"nats"`
+	App       AppConfig       `yaml:"app"`
+	Storage   StorageConfig   `yaml:"storage"`
+	JWT       JWTConfig       `yaml:"jwt"`
 	Migration MigrationConfig `yaml:"migration"`
 }
 

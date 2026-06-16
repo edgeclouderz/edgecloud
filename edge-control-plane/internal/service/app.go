@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -22,11 +23,11 @@ type appRepoInterface interface {
 
 // AppService handles app business logic.
 type AppService struct {
-	db          *sqlx.DB
-	appRepo     appRepoInterface
-	appEnvRepo  *repository.AppEnvRepository
-	activeRepo  *repository.ActiveDeploymentRepository
-	deployRepo  *repository.DeploymentRepository
+	db         *sqlx.DB
+	appRepo    appRepoInterface
+	appEnvRepo *repository.AppEnvRepository
+	activeRepo *repository.ActiveDeploymentRepository
+	deployRepo *repository.DeploymentRepository
 }
 
 func NewAppService(
@@ -53,19 +54,12 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		return nil, fmt.Errorf("invalid app name: %s", appName)
 	}
 
-	existing, err := s.appRepo.Get(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("checking app existence: %w", err)
-	}
-	if existing != nil {
-		return nil, ErrAppAlreadyExists
-	}
-
 	var desc *string
 	if req.Description != "" {
 		desc = &req.Description
 	}
 
+	// Use InsertIfNotExists for an atomic check-and-insert — no TOCTOU race.
 	app := &domain.App{
 		ID:          "a_" + uuid.New().String(),
 		TenantID:    tenantID,
@@ -73,8 +67,12 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		Description: desc,
 		CreatedAt:   time.Now(),
 	}
-	if err := s.appRepo.Create(ctx, app); err != nil {
+	inserted, err := s.appRepo.InsertIfNotExists(ctx, app)
+	if err != nil {
 		return nil, fmt.Errorf("creating app: %w", err)
+	}
+	if !inserted {
+		return nil, ErrAppAlreadyExists
 	}
 	return app, nil
 }
@@ -102,6 +100,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		return ErrAppNotFound
 	}
 
+	// Cascade deletes run in a transaction so they either all succeed or all fail.
 	err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		appEnvRepo := s.appEnvRepo.WithTx(tx)
 		activeRepo := s.activeRepo.WithTx(tx)
@@ -119,7 +118,9 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		return nil
 	})
 	if err != nil {
-		fmt.Printf("warning: cascade delete partially failed after app deletion: %v\n", err)
+		// Log but don't fail — app row already deleted above.
+		// In production, consider a background reconciler to clean orphaned rows.
+		log.Printf("warning: cascade delete partially failed after app deletion: %v", err)
 	}
 	return nil
 }
@@ -138,6 +139,7 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		Description: nil,
 		CreatedAt:   time.Now(),
 	}
+	// InsertIfNotExists uses INSERT ... ON CONFLICT DO NOTHING — inherently idempotent.
 	_, err := s.appRepo.InsertIfNotExists(ctx, app)
 	if err != nil {
 		return fmt.Errorf("creating app: %w", err)
