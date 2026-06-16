@@ -327,10 +327,30 @@ impl HttpServer {
         let drain_timeout = Duration::from_secs(5);
         for handle in handles {
             let _ = timeout(drain_timeout, handle).await;
-            // Note: on timeout, the connection task continues running. This is
-            // acceptable — we give connections a fair window to finish but do not
-            // wait forever for a stuck peer.
         }
+    }
+
+    /// Alias for shutdown — used by the WIT stop() call.
+    /// Spawns shutdown as a background task since WIT cannot call async functions.
+    pub fn stop(&self) {
+        let shutdown_tx = self.shutdown_tx.clone();
+        let conn_handles = self.conn_handles.clone();
+        // We intentionally do NOT await the JoinHandle — fire-and-forget graceful shutdown.
+        std::mem::drop(tokio::spawn(async move {
+            if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let handles: Vec<_> = conn_handles.lock().unwrap().drain(..).collect();
+            let drain_timeout = Duration::from_secs(5);
+            for handle in handles {
+                let _ = tokio::time::timeout(drain_timeout, handle).await;
+            }
+        }));
+    }
+
+    /// Returns the port the server is bound to, if it has been started.
+    pub fn get_assigned_port(&self) -> Option<u16> {
+        self.port
     }
 
     /// Handle one TCP connection: read and parse HTTP, send request to guest,
@@ -606,6 +626,7 @@ impl HttpServer {
     }
 
     /// Poll for an incoming request (delivered by the accept loop).
+    #[allow(clippy::await_holding_lock)]
     pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
         let mut rx = self.rx.lock().await;
         if let Some(rx) = rx.as_mut() {
@@ -841,5 +862,18 @@ mod tests {
         // try_load_tls_config should return None (not panic).
         let result = try_load_tls_config();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_assigned_port_before_start() {
+        let server = HttpServer::new();
+        assert!(server.get_assigned_port().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_is_idempotent() {
+        let server = HttpServer::new();
+        server.shutdown().await;
+        server.shutdown().await;
     }
 }

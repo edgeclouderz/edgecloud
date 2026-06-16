@@ -23,7 +23,7 @@ pub struct Supervisor {
     pub state: Arc<RwLock<WorkerState>>,
     pub downloader: Arc<Downloader>,
     pub port_pool: Arc<Mutex<PortPool>>,
-    pub nats: Arc<NatsClient>,
+    pub nats: Arc<dyn NatsClient>,
 }
 
 impl Supervisor {
@@ -146,7 +146,8 @@ impl Supervisor {
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
         let meter_clone = meter.clone();
-        let env = spec.env.clone();
+        let mut env = spec.env.clone();
+        env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
         let state_clone = self.state.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
