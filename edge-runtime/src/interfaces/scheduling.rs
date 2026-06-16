@@ -72,6 +72,7 @@ struct PersistedTask {
 
 // --- Persistence handle ---
 
+#[derive(Clone)]
 struct SchedulerPersistence {
     path: PathBuf,
 }
@@ -247,9 +248,23 @@ impl Scheduler {
         init_time_refs();
         let schedule_path = path.join(SCHEDULE_FILENAME);
         let persistence = SchedulerPersistence::new(schedule_path);
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| SchedulerError::Io("no Tokio runtime active".into()))?;
-        let loaded = rt.block_on(persistence.load())?;
+
+        // Load persisted state in a dedicated thread with its own runtime.
+        // This avoids calling block_on on the caller's runtime, which panics
+        // if the caller is already running inside a Tokio async context.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let persistence_for_load = persistence.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("scheduling: failed to spawn runtime");
+            let result = rt.block_on(persistence_for_load.load());
+            let _ = tx.send(result);
+        });
+        let loaded = rx
+            .recv()
+            .map_err(|_| SchedulerError::Io("load thread panicked".into()))??;
 
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
         let tasks_clone = tasks.clone();

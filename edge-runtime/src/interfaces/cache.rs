@@ -73,6 +73,7 @@ struct PersistedEntry {
 
 // --- Persistence handle ---
 
+#[derive(Clone)]
 struct CachePersistence {
     path: PathBuf,
 }
@@ -195,9 +196,23 @@ impl Cache {
     pub fn with_persistence(path: &Path, max_entries: u32) -> Result<Self, CacheError> {
         let cache_path = path.join(CACHE_FILENAME);
         let persistence = CachePersistence::new(cache_path);
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| CacheError::Io("no Tokio runtime active".into()))?;
-        let loaded = rt.block_on(persistence.load())?;
+
+        // Load persisted state in a dedicated thread with its own runtime.
+        // This avoids calling block_on on the caller's runtime, which panics
+        // if the caller is already running inside a Tokio async context.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let persistence_for_load = persistence.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("cache: failed to spawn runtime");
+            let result = rt.block_on(persistence_for_load.load());
+            let _ = tx.send(result);
+        });
+        let loaded = rx
+            .recv()
+            .map_err(|_| CacheError::Io("load thread panicked".into()))??;
 
         let lru = lru::LruCache::new(std::num::NonZeroUsize::new(max_entries as usize).unwrap());
         let cache = Self {

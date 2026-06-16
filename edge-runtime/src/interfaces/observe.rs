@@ -2,12 +2,16 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use metrics::NoopRecorder;
 
 /// Default labels used when none are provided.
 const DEFAULT_LABELS: &[(String, String)] = &[];
 
 /// Label pairs for metric metadata.
 type MetricLabels = Vec<(String, String)>;
+
+/// Guard that ensures the global metrics recorder is set exactly once.
+static RECORDER_GUARD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 #[derive(Default)]
 pub struct Observer {
@@ -20,6 +24,13 @@ pub struct Observer {
 
 impl Observer {
     pub fn new() -> Self {
+        // Set a no-op global recorder on first construction.
+        // A real exporter (Prometheus, DataDog, etc.) replaces this in production.
+        // Until then, metrics::counter/gauge/histogram macros are no-ops.
+        let _ = RECORDER_GUARD.get_or_init(|| {
+            metrics::set_global_recorder(&NoopRecorder)
+                .expect("failed to set global metrics recorder");
+        });
         Self {
             counters: RwLock::new(HashMap::new()),
             gauges: RwLock::new(HashMap::new()),

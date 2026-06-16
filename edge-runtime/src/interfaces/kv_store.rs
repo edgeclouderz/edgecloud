@@ -58,6 +58,7 @@ struct PersistedKey {
 }
 
 /// Handles async file I/O for the store.
+#[derive(Clone)]
 struct KvStorePersistence {
     path: PathBuf,
 }
@@ -169,8 +170,23 @@ impl KvStore {
     pub fn with_persistence(path: &Path) -> Result<Self, KvStoreError> {
         let store_path = path.join(STORE_FILENAME);
         let persistence = KvStorePersistence::new(store_path);
-        let rt = tokio::runtime::Handle::current();
-        let data = rt.block_on(persistence.load())?;
+
+        // Load persisted state in a dedicated thread with its own runtime.
+        // This avoids calling block_on on the caller's runtime, which panics
+        // if the caller is already running inside a Tokio async context.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let persistence_for_load = persistence.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("kv-store: failed to spawn runtime");
+            let result = rt.block_on(persistence_for_load.load());
+            let _ = tx.send(result);
+        });
+        let data = rx
+            .recv()
+            .map_err(|_| KvStoreError::Io("load thread panicked".into()))??;
         Ok(Self {
             data: RwLock::new(data),
             op_counter: RwLock::new(0),

@@ -137,6 +137,8 @@ pub struct HttpServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     /// Maximum request body size in bytes.
     max_body_size: u64,
+    /// Active connection handler task handles — drained on shutdown.
+    conn_handles: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HttpServer {
@@ -160,6 +162,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
             tls_config: try_load_tls_config(),
             max_body_size,
+            conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -184,6 +187,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(conn_timeout_secs),
             tls_config: try_load_tls_config(),
             max_body_size,
+            conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -213,6 +217,7 @@ impl HttpServer {
         let responses = self.responses.clone();
         let meter = self.meter.clone();
         let conn_limit = self.conn_limit.clone();
+                                let conn_handles = self.conn_handles.clone();
         let conn_timeout = self.conn_timeout;
         let max_connections = self.max_connections;
         let tls_config = self.tls_config.clone();
@@ -244,7 +249,7 @@ impl HttpServer {
 
                                 // Spawn a task that handles the connection and
                                 // acquires/releases the connection permit.
-                                tokio::spawn(async move {
+                                let handle = tokio::spawn(async move {
                                     let permit = match conn_limit.acquire().await {
                                         Ok(p) => p,
                                         Err(_) => return, // Semaphore closed — shouldn't happen.
@@ -283,6 +288,7 @@ impl HttpServer {
                                     .await;
                                     drop(permit); // release connection slot
                                 });
+                                conn_handles.lock().unwrap().push(handle);
                             }
                             Err(e) => {
                                 tracing::warn!(err = %e, "accept error");
@@ -302,11 +308,18 @@ impl HttpServer {
         Ok(())
     }
 
-    /// Initiate graceful shutdown of the accept loop.
-    /// Idempotent — subsequent calls after the first are no-ops.
+    /// Initiate graceful shutdown of the accept loop and drain all in-flight
+    /// connection handler tasks. Idempotent — subsequent calls after the first
+    /// are no-ops.
     pub async fn shutdown(&self) {
+        // Signal the accept loop to stop accepting new connections.
         if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
+        }
+        // Drain and await all in-flight connection handler tasks.
+        let handles: Vec<_> = self.conn_handles.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 
@@ -685,10 +698,13 @@ fn try_load_tls_config() -> Option<Arc<rustls::ServerConfig>> {
         .ok()
         .flatten()?;
 
-    let cfg = rustls::ServerConfig::builder()
+    let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .ok()?;
+
+    // Advertise HTTP/2 via ALPN so clients can negotiate it over TLS.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     tracing::info!(cert_path = %cert_path, "TLS configured");
     Some(Arc::new(cfg))
