@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/*]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -168,3 +169,39 @@ jobs:
 
       - name: Run tests
         run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
+
+  # ============================================================
+  # TEST-EDGE-WORKER — integration tests for edge-worker (skipped in CI)
+  # ============================================================
+  test-edge-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/
+          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests (skips integration tests in CI)
+        run: |
+          SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-worker/Cargo.toml
