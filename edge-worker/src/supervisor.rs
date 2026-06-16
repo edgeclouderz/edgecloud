@@ -336,12 +336,9 @@ impl Supervisor {
             edge_runtime::RuntimeState::with_env_and_meter(env, Some(Arc::clone(meter)));
 
         // Create a store with per-invocation state
+        // Memory limits (256MB) are enforced via wasmtime's ResourceLimiter mechanism
+        // (Store::limiter with StaticLimiter pattern in edge-runtime's store.rs).
         let mut store = edge_runtime::create_store(engine, 256, runtime_state);
-
-        // Memory limits are enforced via cgroups in production.
-        // The wasmtime Store::limiter API (new_memory_limits) requires a ResourceLimiter
-        // bound to the RuntimeState lifetime, which needs careful integration.
-        // TODO: wire up Store::limiter with proper lifetime handling.
 
         // Instantiate
         let instance = instance_pre.instantiate(&mut store)?;
