@@ -12,13 +12,13 @@ const (
 // MigrationReport is the JSON response returned by POST /api/migrate.
 type MigrationReport struct {
 	Status               MigrationStatus `json:"status"`
-	WasmStored           bool           `json:"wasm_stored"`
-	DeploymentID         *string       `json:"deployment_id,omitempty"`
-	AppName              string        `json:"app_name"`
-	PatternsDetected     []PatternInfo `json:"patterns_detected"`
-	PatternsTransformed  []PatternInfo `json:"patterns_transformed"`
-	PatternsManualReview []PatternInfo `json:"patterns_manual_review"`
-	Errors               []ErrorInfo   `json:"errors"`
+	WasmStored           bool            `json:"wasm_stored"`
+	DeploymentID         *string         `json:"deployment_id,omitempty"`
+	AppName              string          `json:"app_name"`
+	PatternsDetected     []PatternInfo   `json:"patterns_detected"`
+	PatternsTransformed  []PatternInfo   `json:"patterns_transformed"`
+	PatternsManualReview []PatternInfo   `json:"patterns_manual_review"`
+	Errors               []ErrorInfo     `json:"errors"`
 }
 
 // PatternInfo describes a single POSIX pattern detected in the source.

@@ -2,8 +2,8 @@ package handler
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -56,7 +56,8 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 
 	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename, language, string(source))
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusInternalServerError)
+		log.Printf("migration error for tenant=%s filename=%s: %v", tenantID, filename, err)
+		http.Error(w, `{"error": "migration failed"}`, http.StatusInternalServerError)
 		return
 	}
 

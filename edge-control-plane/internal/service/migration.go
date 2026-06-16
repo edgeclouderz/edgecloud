@@ -83,8 +83,13 @@ func (s *MigrationService) Migrate(
 		return nil, fmt.Errorf("reading compiled wasm: %w", err)
 	}
 	hash := sha256.Sum256(wasmData)
-
 	deploymentID := "d_" + uuid.New().String()
+
+	// Save artifact first so we never have a deployment record without an artifact.
+	if err := s.artifactStore.Save(tenantID, appName, deploymentID, bytes.NewReader(wasmData)); err != nil {
+		return nil, fmt.Errorf("saving wasm artifact: %w", err)
+	}
+
 	deployment := &domain.Deployment{
 		ID:        deploymentID,
 		TenantID:  tenantID,
@@ -95,10 +100,6 @@ func (s *MigrationService) Migrate(
 	}
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
 		return nil, fmt.Errorf("creating deployment record: %w", err)
-	}
-
-	if err := s.artifactStore.Save(tenantID, appName, deploymentID, bytes.NewReader(wasmData)); err != nil {
-		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
 
 	report := buildReport(appName, patterns, &deploymentID, true)

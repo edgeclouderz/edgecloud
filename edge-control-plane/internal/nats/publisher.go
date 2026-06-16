@@ -17,9 +17,9 @@ type Publisher interface {
 
 // TaskMessage is published to edgecloud.tasks.<region> when app set changes.
 type TaskMessage struct {
-	Type      string    `json:"type"`
-	Timestamp time.Time `json:"timestamp"`
-	TenantID  string    `json:"tenant_id"`
+	Type      string               `json:"type"`
+	Timestamp time.Time            `json:"timestamp"`
+	TenantID  string               `json:"tenant_id"`
 	Apps      map[string]AppConfig `json:"apps"`
 }
 
@@ -33,11 +33,11 @@ type AppConfig struct {
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.
 type HeartbeatMessage struct {
-	Type      string                        `json:"type"`
-	Timestamp time.Time                     `json:"timestamp"`
-	WorkerID  string                        `json:"worker_id"`
-	Region    string                        `json:"region"`
-	Apps      map[string]domain.AppStatus   `json:"apps"`
+	Type      string                      `json:"type"`
+	Timestamp time.Time                   `json:"timestamp"`
+	WorkerID  string                      `json:"worker_id"`
+	Region    string                      `json:"region"`
+	Apps      map[string]domain.AppStatus `json:"apps"`
 }
 
 // MockPublisher is a no-op publisher for development.
