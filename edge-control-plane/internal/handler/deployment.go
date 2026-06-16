@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -75,7 +76,20 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 
-	deployments, err := h.deploymentSvc.ListDeployments(r.Context(), tenantID, appName)
+	limit := 20
+	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if parsed, err := strconv.Atoi(o); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	deployments, err := h.deploymentSvc.ListDeploymentsPaginated(r.Context(), tenantID, appName, limit, offset)
 	if err != nil {
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
