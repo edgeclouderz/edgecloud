@@ -16,3 +16,8 @@ app:
 
 storage:
   artifact_path: "/var/edgecloud/registry"
+
+jwt:
+  secret: "change-me-in-production"
+  ttl_hours: 24
+  issuer: "edgecloud"

@@ -2,9 +2,9 @@ package handler
 
 import (
 	"io"
-	"log"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -18,11 +18,12 @@ func NewInternalHandler(deploymentSvc *service.DeploymentService) *InternalHandl
 }
 
 // Download serves Wasm artifacts to authenticated workers.
-// WARNING: Worker JWT authentication is not yet implemented.
-// This endpoint allows any caller who knows a deployment ID to download the artifact.
+// Requires a valid worker JWT via Authorization: Bearer <token> header or ?jwt= query param.
 func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
-	log.Printf("WARNING: internal download endpoint called without worker JWT auth for deploymentID=%s — auth not yet implemented", r.PathValue("deploymentID"))
-	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), "", r.PathValue("deploymentID"))
+	tenantID := middleware.GetWorkerTenantID(r.Context())
+	deploymentID := r.PathValue("deploymentID")
+
+	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
 	if err != nil || deployment == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return

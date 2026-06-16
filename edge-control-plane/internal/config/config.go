@@ -14,6 +14,7 @@ type Config struct {
 	NATS     NATSConfig     `yaml:"nats"`
 	App      AppConfig      `yaml:"app"`
 	Storage  StorageConfig  `yaml:"storage"`
+	JWT      JWTConfig      `yaml:"jwt"`
 }
 
 type DatabaseConfig struct {
@@ -37,6 +38,12 @@ type AppConfig struct {
 
 type StorageConfig struct {
 	ArtifactPath string `yaml:"artifact_path"`
+}
+
+type JWTConfig struct {
+	Secret string `yaml:"secret"`
+	TTL    int    `yaml:"ttl_hours"`
+	Issuer string `yaml:"issuer"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -100,6 +107,19 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("STORAGE_ARTIFACT_PATH"); v != "" {
 		cfg.Storage.ArtifactPath = v
+	}
+	if v := os.Getenv("JWT_SECRET"); v != "" {
+		cfg.JWT.Secret = v
+	}
+	if v := os.Getenv("JWT_TTL_HOURS"); v != "" {
+		ttl, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("JWT_TTL_HOURS must be a valid integer: %w", err)
+		}
+		cfg.JWT.TTL = ttl
+	}
+	if v := os.Getenv("JWT_ISSUER"); v != "" {
+		cfg.JWT.Issuer = v
 	}
 
 	return &cfg, nil
