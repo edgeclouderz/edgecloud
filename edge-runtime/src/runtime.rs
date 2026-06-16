@@ -39,7 +39,7 @@ impl RuntimeState {
         Self {
             http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
-            cache: Arc::new(cache::Cache::new(1000)),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler(),
@@ -61,7 +61,7 @@ impl RuntimeState {
         Self {
             http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
-            cache: Arc::new(cache::Cache::new(1000)),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler(),
@@ -83,7 +83,7 @@ impl RuntimeState {
         Self {
             http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
-            cache: Arc::new(cache::Cache::new(1000)),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler(),
@@ -116,6 +116,19 @@ impl RuntimeState {
             Err(e) => {
                 tracing::warn!("scheduling persistence unavailable, using ephemeral: {}", e);
                 scheduling::Scheduler::new()
+            }
+        }
+    }
+
+    /// Attempt to create a persistent Cache from `EDGE_CACHE_PATH`,
+    /// falling back to an ephemeral in-memory cache on any error.
+    fn make_cache() -> Arc<cache::Cache> {
+        match cache::Cache::from_env(1000) {
+            Ok(Some(c)) => Arc::new(c),
+            Ok(None) => Arc::new(cache::Cache::new(1000)),
+            Err(e) => {
+                tracing::warn!("cache persistence unavailable, using ephemeral: {}", e);
+                Arc::new(cache::Cache::new(1000))
             }
         }
     }
