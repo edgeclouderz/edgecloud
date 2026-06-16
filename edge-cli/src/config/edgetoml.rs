@@ -14,6 +14,7 @@ pub struct EdgeToml {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Project {
     pub name: String,
+    #[allow(dead_code)]
     pub version: String,
     pub target: String,
 }

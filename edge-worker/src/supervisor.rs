@@ -23,7 +23,7 @@ pub struct Supervisor {
     pub state: Arc<RwLock<WorkerState>>,
     pub downloader: Arc<Downloader>,
     pub port_pool: Arc<Mutex<PortPool>>,
-    pub nats: Arc<NatsClient>,
+    pub nats: Arc<dyn NatsClient>,
 }
 
 impl Supervisor {

@@ -583,6 +583,7 @@ impl HttpServer {
     }
 
     /// Poll for an incoming request (delivered by the accept loop).
+    #[allow(clippy::await_holding_lock)]
     pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
         let mut rx = self.rx.lock().await;
         if let Some(rx) = rx.as_mut() {
