@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -50,18 +51,31 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(app)
 }
 
-// List handles GET /api/apps — list all apps for the tenant.
+// List handles GET /api/apps — list all apps for the tenant with pagination.
 func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
-	apps, err := h.appSvc.List(r.Context(), tenantID)
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = min(v, 500)
+		}
+	}
+	offset := 0
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if v, err := strconv.Atoi(o); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+
+	apps, err := h.appSvc.List(r.Context(), tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps})
+	json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset})
 }
 
 // Get handles GET /api/apps/{appName} — get a specific app.

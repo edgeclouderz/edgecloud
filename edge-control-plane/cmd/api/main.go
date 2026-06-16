@@ -55,7 +55,7 @@ func main() {
 	// Initialize services
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	appSvc := service.NewAppService(appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo)
+	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo)
 	deploymentSvc := service.NewDeploymentService(
 		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
 	)
@@ -102,7 +102,6 @@ func main() {
 	api.HandleFunc("POST /api/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/apps", appHandler.List)
 	api.HandleFunc("GET /api/apps/{appName}", appHandler.Get)
-	api.HandleFunc("DELETE /api/apps/{appName}", appHandler.Delete)
 	api.HandleFunc("GET /api/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/keys/{keyID}", apiKeyHandler.Delete)
 
@@ -113,6 +112,7 @@ func main() {
 	admin.HandleFunc("GET /api/admin/tenants/{tenantID}", tenantHandler.Get)
 	admin.HandleFunc("PUT /api/admin/tenants/{tenantID}", tenantHandler.Update)
 	admin.HandleFunc("DELETE /api/admin/tenants/{tenantID}", tenantHandler.Delete)
+	admin.HandleFunc("DELETE /api/admin/apps/{appName}", appHandler.Delete)
 
 	// Chain auth + role middleware
 	apiWithAuth := authMiddleware.Authenticate(api)
