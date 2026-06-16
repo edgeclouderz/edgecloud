@@ -5,7 +5,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::interfaces::dns::DnsCache;
-use reqwest::Url;
 
 /// Default per-request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -58,7 +57,8 @@ fn config() -> &'static HttpClientConfig {
 
 pub struct HttpClient {
     client: Arc<reqwest::blocking::Client>,
-    dns_cache: Arc<DnsCache>,
+    #[allow(dead_code)]
+    dns_cache: Arc<DnsCache>, // kept for future DNS pre-resolution feature
 }
 
 impl Default for HttpClient {
@@ -88,7 +88,10 @@ impl HttpClient {
 
     /// Fetch a URL with retry, backoff, and per-request timeout.
     /// Returns the response on success; on error the `error` field is populated.
-    pub fn fetch(
+    ///
+    /// The retry loop runs in `spawn_blocking` to avoid blocking the tokio executor
+    /// thread during backoff sleeps.
+    pub async fn fetch(
         &self,
         method: &str,
         url: &str,
@@ -101,41 +104,69 @@ impl HttpClient {
         let base_delay = Duration::from_millis(DEFAULT_BASE_DELAY_MS);
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
-        let mut attempt = 0;
+        let client = self.client.clone();
+        let method = method.to_string();
+        let url = url.to_string();
+        let headers = headers.to_vec();
+        let body = body.map(|b| b.to_vec());
+        let traceparent = traceparent.map(|s| s.to_string());
 
-        loop {
-            let result = self.fetch_once(method, url, headers, body, timeout, traceparent);
+        // Run the blocking retry loop on a dedicated thread so std::thread::sleep
+        // during backoff does not block the tokio executor thread.
+        tokio::task::spawn_blocking(move || {
+            let mut attempt = 0;
 
-            match result {
-                Ok(resp) => {
-                    // Retry on 502, 503, 504, and 429 if we have retries left.
-                    if attempt < max_retries && is_retryable_status(resp.status) {
+            loop {
+                let result = Self::fetch_once_impl(
+                    &client,
+                    &method,
+                    &url,
+                    &headers,
+                    body.as_deref(),
+                    timeout,
+                    traceparent.as_deref(),
+                );
+
+                match result {
+                    Ok(resp) => {
+                        if attempt < max_retries && is_retryable_status(resp.status) {
+                            attempt += 1;
+                            let delay = backoff(attempt, base_delay);
+                            std::thread::sleep(delay);
+                            continue;
+                        }
+                        return resp;
+                    }
+                    Err(FetchError { message, retryable }) => {
+                        if attempt >= max_retries || !retryable {
+                            return HttpResponse {
+                                status: 0,
+                                headers: HashMap::new(),
+                                body: Vec::new(),
+                                error: Some(message),
+                            };
+                        }
                         attempt += 1;
                         let delay = backoff(attempt, base_delay);
                         std::thread::sleep(delay);
-                        continue;
                     }
-                    return resp;
-                }
-                Err(FetchError { message, retryable }) => {
-                    if attempt >= max_retries || !retryable {
-                        return HttpResponse {
-                            status: 0,
-                            headers: HashMap::new(),
-                            body: Vec::new(),
-                            error: Some(message),
-                        };
-                    }
-                    attempt += 1;
-                    let delay = backoff(attempt, base_delay);
-                    std::thread::sleep(delay);
                 }
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| HttpResponse {
+            status: 0,
+            headers: HashMap::new(),
+            body: Vec::new(),
+            error: Some("fetch task panicked".into()),
+        })
     }
 
-    fn fetch_once(
-        &self,
+    /// Non-blocking implementation of a single HTTP request.
+    /// Client and dns_cache are passed explicitly so this can be called from
+    /// inside spawn_blocking without a Self reference.
+    fn fetch_once_impl(
+        client: &reqwest::blocking::Client,
         method: &str,
         url: &str,
         headers: &[(String, String)],
@@ -148,7 +179,7 @@ impl HttpClient {
             retryable: false,
         })?;
 
-        let mut req = self.client.request(method, url);
+        let mut req = client.request(method, url);
 
         for (k, v) in headers {
             req = req.header(k, v);
@@ -167,13 +198,6 @@ impl HttpClient {
 
         // Apply per-request read/write timeout.
         req = req.timeout(timeout);
-
-        // Attempt to resolve the hostname into the DNS cache before connecting.
-        if let Ok(host) = Url::parse(url) {
-            if let Some(host_str) = host.host_str() {
-                let _ = self.dns_cache.resolve(host_str);
-            }
-        }
 
         let response = req.send();
 
@@ -313,11 +337,13 @@ mod tests {
         assert!(Arc::ptr_eq(&c1, &c2));
     }
 
-    #[test]
-    fn test_error_field_populated_on_network_failure() {
+    #[tokio::test]
+    async fn test_error_field_populated_on_network_failure() {
         let client = HttpClient::new();
         // Unreachable address — should fail fast without hanging.
-        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None);
+        let resp = client
+            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None)
+            .await;
         assert!(
             resp.error.is_some(),
             "error field should be populated on network failure"
@@ -325,30 +351,34 @@ mod tests {
         assert_eq!(resp.status, 0);
     }
 
-    #[test]
-    fn test_timeout_ms_short_timeout() {
+    #[tokio::test]
+    async fn test_timeout_ms_short_timeout() {
         let client = HttpClient::new();
         // Unreachable address with a very short timeout.
         // Should return a timeout- or connection-related error.
-        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(1), None);
+        let resp = client
+            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(1), None)
+            .await;
         let err_msg = resp.error.unwrap_or_default();
         // Any error is acceptable here — just verify error field is populated.
         assert!(!err_msg.is_empty(), "error field should be populated");
     }
 
-    #[test]
-    fn test_successful_response_error_field_is_none() {
+    #[tokio::test]
+    async fn test_successful_response_error_field_is_none() {
         let client = HttpClient::new();
         // jsonplaceholder.typicode.com/todos/1 returns a valid JSON response with status 200.
         // On success, error field must be None.
-        let resp = client.fetch(
-            "GET",
-            "https://jsonplaceholder.typicode.com/todos/1",
-            &[],
-            None,
-            Some(5000),
-            None,
-        );
+        let resp = client
+            .fetch(
+                "GET",
+                "https://jsonplaceholder.typicode.com/todos/1",
+                &[],
+                None,
+                Some(5000),
+                None,
+            )
+            .await;
         assert!(
             resp.error.is_none(),
             "error field should be None on success, got: {:?}",
@@ -358,20 +388,22 @@ mod tests {
         assert!(!resp.body.is_empty());
     }
 
-    #[test]
-    fn test_traceparent_header_injected() {
+    #[tokio::test]
+    async fn test_traceparent_header_injected() {
         let client = HttpClient::new();
         // Valid W3C traceparent format
         let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01";
         // Unreachable host — error should be network-related, not a traceparent parsing error.
-        let resp = client.fetch(
-            "GET",
-            "http://127.0.0.1:1",
-            &[],
-            None,
-            Some(100),
-            Some(traceparent),
-        );
+        let resp = client
+            .fetch(
+                "GET",
+                "http://127.0.0.1:1",
+                &[],
+                None,
+                Some(100),
+                Some(traceparent),
+            )
+            .await;
         assert!(resp.error.is_some(), "error field should be populated");
         let err_msg = resp.error.unwrap();
         // Should NOT fail due to traceparent validation — error should be network-related.

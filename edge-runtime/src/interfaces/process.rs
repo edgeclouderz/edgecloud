@@ -4,6 +4,43 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// Prefixes of environment variables that are blocked from the guest.
+/// These typically contain secrets (credentials, keys, tokens) that should
+/// not be exposed to guest WASM components.
+const BLOCKED_ENV_PREFIXES: &[&str] = &[
+    "AWS_",
+    "AZURE_",
+    "EDGE_SECRET",
+    "EDGE_API_KEY",
+    "DATABASE_URL",
+    "REDIS_PASSWORD",
+    "REDIS_URL",
+    "NATS_CREDS",
+    "NATS_TOKEN",
+    "JWT_SECRET",
+    "JWT_TOKEN",
+    "AUTH_TOKEN",
+    "BEARER_TOKEN",
+    "PASSWORD",
+    "SECRET",
+    "PRIVATE_KEY",
+    "API_KEY",
+    "ACCESS_TOKEN",
+    "SESSION_TOKEN",
+];
+
+/// Returns true if an env var name should not be exposed to the guest.
+fn is_blocked_env_key(key: &str) -> bool {
+    BLOCKED_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Filter an iterator of (key, value) pairs, removing blocked env vars.
+fn filter_env_vars<'a>(
+    iter: impl Iterator<Item = (String, String)> + 'a,
+) -> impl Iterator<Item = (String, String)> + 'a {
+    iter.filter(|(k, _)| !is_blocked_env_key(k))
+}
+
 /// Process state — holds per-app environment variables when used in the worker supervisor.
 pub struct Process {
     env: Arc<HashMap<String, String>>,
@@ -13,15 +50,16 @@ pub struct Process {
 }
 
 impl Process {
-    /// Create a new Process with no environment variables (uses host process env).
+    /// Create a new Process with environment variables from the host,
+    /// excluding sensitive vars (secrets, credentials, keys).
     pub fn new() -> Self {
         Self {
-            env: Arc::new(std::env::vars().collect()),
+            env: Arc::new(filter_env_vars(std::env::vars()).collect()),
             exit_code: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    /// Create a Process with a specific per-app environment map.
+    /// Create a Process with a specific per-app environment map (pre-filtered by caller).
     pub fn with_env(env: Arc<HashMap<String, String>>) -> Self {
         Self {
             env,
