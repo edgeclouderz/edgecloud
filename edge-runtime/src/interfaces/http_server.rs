@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::sync::{oneshot, Semaphore};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 
 /// Enum to hold either a plain TCP stream or a TLS stream.
 /// Allows a single handle_connection to work with both without dyn Trait.
@@ -137,6 +137,8 @@ pub struct HttpServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     /// Maximum request body size in bytes.
     max_body_size: u64,
+    /// Active connection handler task handles — drained on shutdown.
+    conn_handles: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HttpServer {
@@ -160,6 +162,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
             tls_config: try_load_tls_config(),
             max_body_size,
+            conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -184,6 +187,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(conn_timeout_secs),
             tls_config: try_load_tls_config(),
             max_body_size,
+            conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -213,6 +217,7 @@ impl HttpServer {
         let responses = self.responses.clone();
         let meter = self.meter.clone();
         let conn_limit = self.conn_limit.clone();
+        let conn_handles = self.conn_handles.clone();
         let conn_timeout = self.conn_timeout;
         let max_connections = self.max_connections;
         let tls_config = self.tls_config.clone();
@@ -244,7 +249,7 @@ impl HttpServer {
 
                                 // Spawn a task that handles the connection and
                                 // acquires/releases the connection permit.
-                                tokio::spawn(async move {
+                                let handle = tokio::spawn(async move {
                                     let permit = match conn_limit.acquire().await {
                                         Ok(p) => p,
                                         Err(_) => return, // Semaphore closed — shouldn't happen.
@@ -283,6 +288,7 @@ impl HttpServer {
                                     .await;
                                     drop(permit); // release connection slot
                                 });
+                                conn_handles.lock().unwrap().push(handle);
                             }
                             Err(e) => {
                                 tracing::warn!(err = %e, "accept error");
@@ -302,17 +308,44 @@ impl HttpServer {
         Ok(())
     }
 
-    /// Initiate graceful shutdown of the accept loop.
-    /// Idempotent — subsequent calls after the first are no-ops.
-    pub fn shutdown(&self) {
+    /// Initiate graceful shutdown of the accept loop and drain all in-flight
+    /// connection handler tasks. Idempotent — subsequent calls after the first
+    /// are no-ops.
+    ///
+    /// Each in-flight connection is given up to `drain_timeout` seconds to finish.
+    /// Connections that exceed the timeout are dropped (their tasks continue running
+    /// independently — we simply stop waiting).
+    pub async fn shutdown(&self) {
+        // Signal the accept loop to stop accepting new connections.
         if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
+        }
+        // Drain all in-flight connection handler tasks with a per-connection timeout.
+        // Each handle is awaited with its own timeout so a single slow connection
+        // cannot block the drain of other connections.
+        let handles: Vec<_> = self.conn_handles.lock().unwrap().drain(..).collect();
+        let drain_timeout = Duration::from_secs(5);
+        for handle in handles {
+            let _ = timeout(drain_timeout, handle).await;
         }
     }
 
     /// Alias for shutdown — used by the WIT stop() call.
+    /// Spawns shutdown as a background task since WIT cannot call async functions.
     pub fn stop(&self) {
-        self.shutdown();
+        let shutdown_tx = self.shutdown_tx.clone();
+        let conn_handles = self.conn_handles.clone();
+        // We intentionally do NOT await the JoinHandle — fire-and-forget graceful shutdown.
+        std::mem::drop(tokio::spawn(async move {
+            if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let handles: Vec<_> = conn_handles.lock().unwrap().drain(..).collect();
+            let drain_timeout = Duration::from_secs(5);
+            for handle in handles {
+                let _ = tokio::time::timeout(drain_timeout, handle).await;
+            }
+        }));
     }
 
     /// Returns the port the server is bound to, if it has been started.
@@ -696,10 +729,13 @@ fn try_load_tls_config() -> Option<Arc<rustls::ServerConfig>> {
         .ok()
         .flatten()?;
 
-    let cfg = rustls::ServerConfig::builder()
+    let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .ok()?;
+
+    // Advertise HTTP/2 via ALPN so clients can negotiate it over TLS.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     tracing::info!(cert_path = %cert_path, "TLS configured");
     Some(Arc::new(cfg))
@@ -834,10 +870,10 @@ mod tests {
         assert!(server.get_assigned_port().is_none());
     }
 
-    #[test]
-    fn test_shutdown_is_idempotent() {
+    #[tokio::test]
+    async fn test_shutdown_is_idempotent() {
         let server = HttpServer::new();
-        server.shutdown();
-        server.shutdown();
+        server.shutdown().await;
+        server.shutdown().await;
     }
 }
