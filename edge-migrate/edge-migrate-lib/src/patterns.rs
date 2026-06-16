@@ -29,6 +29,8 @@ pub struct PatternMatch {
     pub pattern: PosixPattern,
     /// The original source code snippet.
     pub snippet: String,
+    /// Raw text of each argument node from the AST (for accurate arg extraction).
+    pub arg_nodes: Vec<String>,
     /// Whether this pattern can be auto-transformed.
     pub transformability: Transformability,
 }
