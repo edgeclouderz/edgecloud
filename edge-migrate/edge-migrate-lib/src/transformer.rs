@@ -153,11 +153,12 @@ impl Transformer {
             }
             PosixPattern::Listen => {
                 // Two-phase: start-listen + finish-listen
+                // listen(fd, backlog) — arg0=fd(socket), arg1=backlog
                 format!(
                     "// WASI: two-phase listen\n{{\n  wasi_socket_tcp_start_listen({}, {});\n  wasi_socket_tcp_finish_listen({});\n}}",
-                    Self::extract_first_arg(m),
-                    Self::extract_second_arg(m),
-                    Self::extract_third_arg(m)
+                    Self::extract_first_arg(m),  // socket fd
+                    Self::extract_second_arg(m), // backlog
+                    Self::extract_first_arg(m)   // socket fd again
                 )
             }
             PosixPattern::Connect => {
