@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -13,10 +14,32 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// Sentinel errors for WorkerService Register.
+var (
+	ErrInvalidWorkerID = errors.New("invalid worker_id format: must be w_<region>_<uuid>")
+	ErrRegionMismatch  = errors.New("region mismatch between worker_id and request region")
+	ErrQuotaExceeded   = errors.New("max workers reached for tenant")
+)
+
+// workerRepoInterface defines the repository methods used by WorkerService.
+type workerRepoInterface interface {
+	Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
+	CountByTenant(ctx context.Context, tenantID string) (int, error)
+	Delete(ctx context.Context, id string) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	UpdateLastSeen(ctx context.Context, id string) error
+	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
+}
+
+// quotaRepoInterface defines the repository methods used by WorkerService.
+type quotaRepoInterface interface {
+	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+}
+
 // WorkerService handles worker lifecycle business logic.
 type WorkerService struct {
-	workerRepo *repository.WorkerRepository
-	quotaRepo  *repository.QuotaRepository
+	workerRepo workerRepoInterface
+	quotaRepo  quotaRepoInterface
 	nc         *nats.Conn
 }
 
@@ -34,57 +57,45 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 func (s *WorkerService) Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error {
 	// 1. Validate worker_id format: w_<region>_<uuid>
 	if !domain.IsValidWorkerID(req.WorkerID) {
-		return errors.New("invalid worker_id format: must be w_<region>_<uuid>")
+		return ErrInvalidWorkerID
 	}
 
 	// 2. Validate region in worker_id matches request region
 	parts := strings.SplitN(req.WorkerID[2:], "_", 2)
 	if len(parts) != 2 || parts[0] != req.Region {
-		return fmt.Errorf("region mismatch: worker_id region %q does not match request region %q", parts[0], req.Region)
+		return ErrRegionMismatch
 	}
 
-	// 3. Check if worker already exists
-	existing, err := s.workerRepo.GetByID(ctx, req.WorkerID)
+	// 3. Atomic upsert — handles both new registrations and re-registrations.
+	// Uses ON CONFLICT DO NOTHING so concurrent inserts for the same worker_id
+	// are safely deduplicated; the RETURNING clause tells us if a row was inserted.
+	wasCreated, err := s.workerRepo.Upsert(ctx, tenantID, req)
 	if err != nil {
-		return fmt.Errorf("checking existing worker: %w", err)
-	}
-	if existing != nil {
-		// Idempotent: just update last_seen
-		return s.workerRepo.UpdateLastSeen(ctx, req.WorkerID)
+		return fmt.Errorf("upserting worker: %w", err)
 	}
 
-	// 4. Enforce MaxWorkers quota
+	// 4. If this was a re-registration (worker already existed), we're done.
+	if !wasCreated {
+		return nil
+	}
+
+	// 5. New worker: enforce MaxWorkers quota.
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {
+		// Rollback the newly inserted worker row.
+		_ = s.workerRepo.Delete(ctx, req.WorkerID)
 		return fmt.Errorf("getting quota: %w", err)
 	}
 	count, err := s.workerRepo.CountByTenant(ctx, tenantID)
 	if err != nil {
+		_ = s.workerRepo.Delete(ctx, req.WorkerID)
 		return fmt.Errorf("counting workers: %w", err)
 	}
-	if count >= quota.MaxWorkers {
-		return fmt.Errorf("max workers (%d) reached for tenant", quota.MaxWorkers)
+	if count > quota.MaxWorkers {
+		_ = s.workerRepo.Delete(ctx, req.WorkerID)
+		return ErrQuotaExceeded
 	}
-
-	// 5. Create new worker
-	memoryMB := req.MemoryMB
-	if memoryMB == 0 {
-		memoryMB = 4096
-	}
-	var ip *string
-	if req.IP != "" {
-		ip = &req.IP
-	}
-	worker := &domain.Worker{
-		ID:        req.WorkerID,
-		TenantID:  tenantID,
-		Region:    req.Region,
-		IP:        ip,
-		MemoryMB:  memoryMB,
-		LastSeen:  time.Now(),
-		CreatedAt: time.Now(),
-	}
-	return s.workerRepo.Create(ctx, worker)
+	return nil
 }
 
 // ListByTenant returns all workers for a tenant.
@@ -122,23 +133,25 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 
 func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	var hb struct {
-		Type      string    `json:"type"`
-		Timestamp time.Time `json:"timestamp"`
-		WorkerID  string    `json:"worker_id"`
-		Region    string    `json:"region"`
+		Type      string          `json:"type"`
+		Timestamp time.Time       `json:"timestamp"`
+		WorkerID  string          `json:"worker_id"`
+		Region    string          `json:"region"`
 		Apps      json.RawMessage `json:"apps"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
 		return
 	}
-	// Update last_seen (idempotent — worker must already be registered)
-	_ = s.workerRepo.UpdateLastSeen(ctx, hb.WorkerID)
+	if err := s.workerRepo.UpdateLastSeen(ctx, hb.WorkerID); err != nil {
+		log.Printf("heartbeat: failed to update last_seen for %s: %v", hb.WorkerID, err)
+	}
 
-	// Upsert per-app status
 	ws := &domain.WorkerStatus{
 		WorkerID:   hb.WorkerID,
 		Apps:       hb.Apps,
 		LastReport: hb.Timestamp,
 	}
-	_ = s.workerRepo.UpsertStatus(ctx, ws)
+	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
+		log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
+	}
 }
