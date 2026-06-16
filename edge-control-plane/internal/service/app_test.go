@@ -1,0 +1,278 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+)
+
+// mockAppRepo implements appRepoInterface for testing.
+type mockAppRepo struct {
+	createFunc            func(ctx context.Context, app *domain.App) error
+	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	listFunc              func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	atomicDeleteFunc      func(ctx context.Context, tenantID, appName string) (bool, error)
+	insertIfNotExistsFunc func(ctx context.Context, app *domain.App) (bool, error)
+}
+
+func (m *mockAppRepo) Create(ctx context.Context, app *domain.App) error {
+	if m.createFunc != nil {
+		return m.createFunc(ctx, app)
+	}
+	return nil
+}
+
+func (m *mockAppRepo) Get(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	if m.getFunc != nil {
+		return m.getFunc(ctx, tenantID, appName)
+	}
+	return nil, nil
+}
+
+func (m *mockAppRepo) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+	if m.listFunc != nil {
+		return m.listFunc(ctx, tenantID, limit, offset)
+	}
+	return nil, nil
+}
+
+func (m *mockAppRepo) AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error) {
+	if m.atomicDeleteFunc != nil {
+		return m.atomicDeleteFunc(ctx, tenantID, appName)
+	}
+	return false, nil
+}
+
+func (m *mockAppRepo) InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error) {
+	if m.insertIfNotExistsFunc != nil {
+		return m.insertIfNotExistsFunc(ctx, app)
+	}
+	return false, nil
+}
+
+// appSvcForTest builds an AppService with mock dependencies.
+// Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
+// Delete is not testable without a real DB connection for repository.Transaction.
+func appSvcForTest(repo appRepoInterface) *AppService {
+	return &AppService{
+		appRepo: repo,
+	}
+}
+
+func TestAppService_Create_HappyPath(t *testing.T) {
+	createdApp := (*domain.App)(nil)
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			createdApp = app
+			return true, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	app, err := svc.Create(context.Background(), "t_tenant1", "my-app", &domain.CreateAppRequest{
+		Description: "my description",
+	})
+	if err != nil {
+		t.Errorf("Create() error = %v, want nil", err)
+	}
+	if app == nil {
+		t.Fatal("Create() app = nil, want non-nil")
+	}
+	if app.TenantID != "t_tenant1" {
+		t.Errorf("app.TenantID = %q, want %q", app.TenantID, "t_tenant1")
+	}
+	if app.Name != "my-app" {
+		t.Errorf("app.Name = %q, want %q", app.Name, "my-app")
+	}
+	if app.Description == nil || *app.Description != "my description" {
+		t.Errorf("app.Description = %v, want %q", app.Description, "my description")
+	}
+	if createdApp == nil {
+		t.Error("repo InsertIfNotExists was not called")
+	}
+}
+
+func TestAppService_Create_AlreadyExists(t *testing.T) {
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return false, nil // already exists
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	app, err := svc.Create(context.Background(), "t_tenant1", "existing-app", &domain.CreateAppRequest{})
+	if !errors.Is(err, ErrAppAlreadyExists) {
+		t.Errorf("Create() error = %v, want ErrAppAlreadyExists", err)
+	}
+	if app != nil {
+		t.Errorf("Create() app = %v, want nil", app)
+	}
+}
+
+func TestAppService_Create_InvalidName(t *testing.T) {
+	// IsValidAppName rejects empty strings and path traversal characters.
+	tests := []struct {
+		name    string
+		appName string
+	}{
+		{"empty", ""},
+		{"path traversal slash", "foo/bar"},
+		{"path traversal backslash", "foo\\bar"},
+		{"path traversal parent", ".."},
+		{"path traversal combo", "../etc"},
+	}
+	repo := &mockAppRepo{}
+	svc := appSvcForTest(repo)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := svc.Create(context.Background(), "t_tenant1", tt.appName, &domain.CreateAppRequest{})
+			if err == nil {
+				t.Errorf("Create(%q) error = nil, want non-nil", tt.appName)
+			}
+		})
+	}
+}
+
+func TestAppService_Create_DBError(t *testing.T) {
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return false, errors.New("db error")
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	_, err := svc.Create(context.Background(), "t_tenant1", "valid-app", &domain.CreateAppRequest{})
+	if err == nil {
+		t.Error("Create() error = nil, want non-nil")
+	}
+}
+
+func TestAppService_Get_NotFound(t *testing.T) {
+	repo := &mockAppRepo{
+		getFunc: func(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+			return nil, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	app, err := svc.Get(context.Background(), "t_tenant1", "nonexistent")
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if app != nil {
+		t.Errorf("Get() app = %v, want nil", app)
+	}
+}
+
+func TestAppService_Get_Found(t *testing.T) {
+	existing := &domain.App{
+		ID:        "a_abc123",
+		TenantID:  "t_tenant1",
+		Name:      "my-app",
+		CreatedAt: time.Now(),
+	}
+	repo := &mockAppRepo{
+		getFunc: func(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+			return existing, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	app, err := svc.Get(context.Background(), "t_tenant1", "my-app")
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if app == nil {
+		t.Fatal("Get() app = nil, want non-nil")
+	}
+	if app.ID != "a_abc123" {
+		t.Errorf("app.ID = %q, want %q", app.ID, "a_abc123")
+	}
+}
+
+func TestAppService_List_HappyPath(t *testing.T) {
+	apps := []domain.App{
+		{ID: "a_1", TenantID: "t_tenant1", Name: "app-a"},
+		{ID: "a_2", TenantID: "t_tenant1", Name: "app-b"},
+	}
+	repo := &mockAppRepo{
+		listFunc: func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+			return apps, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2", len(got))
+	}
+}
+
+func TestAppService_List_Empty(t *testing.T) {
+	repo := &mockAppRepo{
+		listFunc: func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+			return nil, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(got) = %d, want 0", len(got))
+	}
+}
+
+func TestAppService_CreateIfNotExists_HappyPath(t *testing.T) {
+	var createdApp *domain.App
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			createdApp = app
+			return true, nil
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "new-app")
+	if err != nil {
+		t.Errorf("CreateIfNotExists() error = %v, want nil", err)
+	}
+	if createdApp == nil {
+		t.Error("InsertIfNotExists was not called")
+	}
+}
+
+func TestAppService_CreateIfNotExists_Idempotent(t *testing.T) {
+	// When app already exists, InsertIfNotExists returns false, no error.
+	// The operation should still succeed (idempotent).
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return false, nil // already existed
+		},
+	}
+	svc := appSvcForTest(repo)
+
+	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "existing-app")
+	if err != nil {
+		t.Errorf("CreateIfNotExists() error = %v, want nil (idempotent)", err)
+	}
+}
+
+func TestAppService_CreateIfNotExists_InvalidName(t *testing.T) {
+	repo := &mockAppRepo{}
+	svc := appSvcForTest(repo)
+
+	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "")
+	if err == nil {
+		t.Error("CreateIfNotExists() error = nil, want non-nil")
+	}
+}

@@ -11,7 +11,7 @@ type Worker struct {
 	ID        string    `db:"id"`
 	TenantID  string    `db:"tenant_id"`
 	Region    string    `db:"region"`
-	IP        *string   `db:"ip"`   // nil means NULL in DB
+	IP        *string   `db:"ip"` // nil means NULL in DB
 	MemoryMB  int       `db:"memory_mb"`
 	LastSeen  time.Time `db:"last_seen"`
 	CreatedAt time.Time `db:"created_at"`
@@ -21,22 +21,22 @@ type Worker struct {
 type RegisterWorkerRequest struct {
 	WorkerID string `json:"worker_id"` // e.g. "w_fra_<uuid>"
 	Region   string `json:"region"`    // e.g. "fra"
-	IP       string `json:"ip"`       // optional, worker's IP address
+	IP       string `json:"ip"`        // optional, worker's IP address
 	MemoryMB int    `json:"memory_mb"` // optional, default 4096
 }
 
 // WorkerStatus holds the running app state reported by a worker.
 type WorkerStatus struct {
 	WorkerID   string          `db:"worker_id"`
-	Apps       json.RawMessage `db:"apps"`  // { app_name: { status, exit_code, deployment_id } }
+	Apps       json.RawMessage `db:"apps"` // { app_name: { status, exit_code, deployment_id } }
 	LastReport time.Time       `db:"last_report"`
 }
 
 // AppStatus represents the status of a single app on a worker.
 type AppStatus struct {
-	Status        string `json:"status"`
-	ExitCode      int    `json:"exit_code"`
-	DeploymentID  string `json:"deployment_id"`
+	Status       string `json:"status"`
+	ExitCode     int    `json:"exit_code"`
+	DeploymentID string `json:"deployment_id"`
 }
 
 // IsValidWorkerID checks that worker ID matches the format w_<region>_<uuid>.
