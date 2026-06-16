@@ -105,7 +105,10 @@ impl CAnalyzer {
             transformability: pattern.transformability(),
         }];
 
-        // Check for O_NONBLOCK in socket calls
+        // Check for O_NONBLOCK in socket calls — adds a second PatternMatch
+        // (NonBlocking, NotTransformable) alongside the socket call match.
+        // Both share the same source range; the NonBlocking entry goes to
+        // manual_review and does not produce transformed WASI code.
         if func_name == "socket" {
             let has_nonblocking = arg_nodes.iter().any(|arg| arg.contains("O_NONBLOCK"));
             if has_nonblocking {
