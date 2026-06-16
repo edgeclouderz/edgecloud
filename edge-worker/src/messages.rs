@@ -27,7 +27,7 @@ pub struct AppSpec {
 }
 
 /// HeartbeatMessage: published to `edgecloud.heartbeats.<region>` every 30s.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
@@ -38,7 +38,7 @@ pub struct HeartbeatMessage {
 }
 
 /// AppStatus: status of a single app within a heartbeat.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStatus {
     pub deployment_id: String,
     pub status: String, // "running" | "starting" | "stopping" | "crashed"
