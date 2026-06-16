@@ -10,7 +10,8 @@ use crate::state::State;
 /// Set an environment variable for the app.
 #[cfg(feature = "network")]
 pub fn set_var(path: &Path, key: &str, value: &str) -> Result<()> {
-    let state = State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
+    let state =
+        State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
@@ -23,7 +24,8 @@ pub fn set_var(path: &Path, key: &str, value: &str) -> Result<()> {
 /// List environment variables for the app.
 #[cfg(feature = "network")]
 pub fn list_vars(path: &Path) -> Result<()> {
-    let state = State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
+    let state =
+        State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;

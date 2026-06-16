@@ -11,11 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "edge",
-    version = "0.1.0",
-    about = "edgeCloud developer CLI"
-)]
+#[command(name = "edge", version = "0.1.0", about = "edgeCloud developer CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

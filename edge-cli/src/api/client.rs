@@ -49,7 +49,11 @@ impl ApiClient {
             .build()
             .map_err(|e| anyhow::anyhow!("reqwest client failed: {}", e))?;
         let api_key = ApiKey::load()?;
-        Ok(Self { http, base_url, api_key })
+        Ok(Self {
+            http,
+            base_url,
+            api_key,
+        })
     }
 
     fn auth_header(&self) -> String {
@@ -61,11 +65,11 @@ impl ApiClient {
         use reqwest::blocking::multipart;
 
         let url = format!("{}/api/deploy/{}", self.base_url, app_name);
-        let part = multipart::Part::bytes(wasm_bytes.to_vec())
-            .file_name("payload");
+        let part = multipart::Part::bytes(wasm_bytes.to_vec()).file_name("payload");
         let form = multipart::Form::new().part("payload", part);
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .header("Authorization", self.auth_header())
             .multipart(form)
@@ -82,7 +86,8 @@ impl ApiClient {
     /// Get deployment status.
     pub fn status(&self, deployment_id: &str) -> Result<StatusResponse> {
         let url = format!("{}/api/status/{}", self.base_url, deployment_id);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .header("Authorization", self.auth_header())
             .send()?;
@@ -97,7 +102,8 @@ impl ApiClient {
     /// List environment variables for an app.
     pub fn list_env(&self, app_name: &str) -> Result<Vec<EnvVar>> {
         let url = format!("{}/api/apps/{}/env", self.base_url, app_name);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .header("Authorization", self.auth_header())
             .send()?;
@@ -113,9 +119,13 @@ impl ApiClient {
     pub fn set_env(&self, app_name: &str, key: &str, value: &str) -> Result<()> {
         let url = format!("{}/api/apps/{}/env", self.base_url, app_name);
         #[derive(Serialize)]
-        struct Payload<'a> { key: &'a str, value: &'a str }
+        struct Payload<'a> {
+            key: &'a str,
+            value: &'a str,
+        }
         let payload = Payload { key, value };
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .header("Authorization", self.auth_header())
             .json(&payload)
@@ -134,7 +144,8 @@ impl ApiClient {
             "{}/api/apps/{}/activate/{}",
             self.base_url, app_name, deployment_id
         );
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .header("Authorization", self.auth_header())
             .send()?;
@@ -149,13 +160,18 @@ impl ApiClient {
     /// List all deployments for an app.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
         let url = format!("{}/api/list/{}", self.base_url, app_name);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .header("Authorization", self.auth_header())
             .send()?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("list deployments failed: {} {}", resp.status(), resp.text()?);
+            anyhow::bail!(
+                "list deployments failed: {} {}",
+                resp.status(),
+                resp.text()?
+            );
         }
 
         serde_json::from_str(&resp.text()?).map_err(Into::into)

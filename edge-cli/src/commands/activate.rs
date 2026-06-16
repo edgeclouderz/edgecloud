@@ -10,7 +10,8 @@ use crate::state::State;
 /// Activate a specific deployment.
 #[cfg(feature = "network")]
 pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
-    let state = State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
+    let state =
+        State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
