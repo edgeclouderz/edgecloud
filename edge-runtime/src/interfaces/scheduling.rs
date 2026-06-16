@@ -247,7 +247,8 @@ impl Scheduler {
         init_time_refs();
         let schedule_path = path.join(SCHEDULE_FILENAME);
         let persistence = SchedulerPersistence::new(schedule_path);
-        let rt = tokio::runtime::Handle::current();
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| SchedulerError::Io("no Tokio runtime active".into()))?;
         let loaded = rt.block_on(persistence.load())?;
 
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
