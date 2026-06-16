@@ -29,9 +29,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore working tree
-        run: git reset --hard
-
       - name: Generate Cargo.lock
         run: |
           cargo generate-lockfile --manifest-path edge-runtime/Cargo.toml || true
@@ -62,14 +59,21 @@ jobs:
           path: target/
           key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run ${{ matrix.tool }}
+      - name: Run ${{ matrix.tool }} (edge-runtime)
+        if: matrix.tool != 'audit'
+        run: cargo ${{ matrix.command }} --locked
+        working-directory: edge-runtime
+
+      - name: Run ${{ matrix.tool }} (edge-worker)
+        if: matrix.tool != 'audit'
+        run: cargo ${{ matrix.command }} --locked
+        working-directory: edge-worker
+
+      - name: Run audit
+        if: matrix.tool == 'audit'
         run: |
-          if [ "${{ matrix.tool }}" = "audit" ]; then
-            cargo install cargo-audit --locked
-            cargo audit --manifest-path edge-runtime/Cargo.toml || true
-          else
-            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml --locked
-          fi
+          cargo install cargo-audit --locked
+          cargo audit --manifest-path edge-runtime/Cargo.toml || true
 
   test:
     runs-on: ubuntu-latest
@@ -78,8 +82,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore working tree
-        run: git reset --hard
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-runtime/Cargo.toml || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -109,8 +114,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore working tree
-        run: git reset --hard
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4
