@@ -34,3 +34,8 @@ impl Default for NetworkingState {
         Self::new()
     }
 }
+
+// NOTE: NetworkingState::resolve() requires a Tokio runtime for async DNS resolution.
+// The slow path (resolve_async) is skipped when no runtime is active (returns Err).
+// Integration tests with a real runtime would be needed to test DNS resolution end-to-end.
+// The existing DnsCache::new() smoke test covers basic construction.

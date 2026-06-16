@@ -76,3 +76,61 @@ impl Default for Process {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_env() -> Arc<HashMap<String, String>> {
+        Arc::new(
+            [
+                ("FOO".into(), "bar".into()),
+                ("EDGE_VAR".into(), "value".into()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn test_get_env_existing() {
+        let process = Process::with_env(test_env());
+        assert_eq!(process.get_env("FOO"), Some("bar".into()));
+    }
+
+    #[test]
+    fn test_get_env_missing() {
+        let process = Process::with_env(test_env());
+        assert_eq!(process.get_env("DOES_NOT_EXIST"), None);
+    }
+
+    #[test]
+    fn test_get_all_env() {
+        let process = Process::with_env(test_env());
+        let all = process.get_all_env();
+        let keys: std::collections::HashSet<_> = all.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains("FOO"));
+        assert!(keys.contains("EDGE_VAR"));
+    }
+
+    #[test]
+    fn test_exit_stores_code() {
+        let env = test_env();
+        let exit_code = Arc::new(AtomicU32::new(0));
+        let process = Process::with_env_and_exit_code(env, exit_code.clone());
+        assert_eq!(process.exit_requested(), None);
+        process.exit(42);
+        assert_eq!(process.exit_requested(), Some(42));
+    }
+
+    #[test]
+    fn test_exit_code_persists_across_calls() {
+        let env = test_env();
+        let exit_code = Arc::new(AtomicU32::new(0));
+        let process = Process::with_env_and_exit_code(env, exit_code.clone());
+        process.exit(1);
+        process.exit(2); // second call should overwrite
+        assert_eq!(process.exit_requested(), Some(2));
+    }
+}
