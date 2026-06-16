@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -61,6 +62,34 @@ func (r *WorkerRepository) ListByTenant(ctx context.Context, tenantID string) ([
 
 func (r *WorkerRepository) UpdateLastSeen(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, `UPDATE workers SET last_seen = NOW() WHERE id = $1`, id)
+	return err
+}
+
+func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
+	memoryMB := req.MemoryMB
+	if memoryMB == 0 {
+		memoryMB = 4096
+	}
+	var ip *string
+	if req.IP != "" {
+		ip = &req.IP
+	}
+	now := time.Now()
+	query := `
+		INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+		RETURNING (xmax = 0) AS was_created`
+	var wasCreatedRow bool
+	err = r.db.GetContext(ctx, &wasCreatedRow, query, req.WorkerID, tenantID, req.Region, ip, memoryMB, now, now)
+	if err != nil {
+		return false, err
+	}
+	return wasCreatedRow, nil
+}
+
+func (r *WorkerRepository) Delete(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM workers WHERE id = $1`, id)
 	return err
 }
 
