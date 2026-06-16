@@ -8,6 +8,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
@@ -23,11 +24,12 @@ type appRepoInterface interface {
 
 // AppService handles app business logic.
 type AppService struct {
-	db         *sqlx.DB
-	appRepo    appRepoInterface
-	appEnvRepo *repository.AppEnvRepository
-	activeRepo *repository.ActiveDeploymentRepository
-	deployRepo *repository.DeploymentRepository
+	db            *sqlx.DB
+	appRepo       appRepoInterface
+	appEnvRepo    *repository.AppEnvRepository
+	activeRepo    *repository.ActiveDeploymentRepository
+	deployRepo    *repository.DeploymentRepository
+	artifactStore *storage.ArtifactStore
 }
 
 func NewAppService(
@@ -36,13 +38,15 @@ func NewAppService(
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
+	artifactStore *storage.ArtifactStore,
 ) *AppService {
 	return &AppService{
-		db:         db,
-		appRepo:    appRepo,
-		activeRepo: activeRepo,
-		appEnvRepo: appEnvRepo,
-		deployRepo: deploymentRepo,
+		db:            db,
+		appRepo:       appRepo,
+		activeRepo:    activeRepo,
+		appEnvRepo:    appEnvRepo,
+		deployRepo:    deploymentRepo,
+		artifactStore: artifactStore,
 	}
 }
 
@@ -98,6 +102,20 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 	}
 	if !deleted {
 		return ErrAppNotFound
+	}
+
+	// Delete artifact files before cascade — os.Remove is idempotent (no error if absent).
+	if s.artifactStore != nil {
+		deployments, err := s.deployRepo.ListByApp(ctx, tenantID, appName)
+		if err != nil {
+			log.Printf("warning: failed to list deployments for artifact cleanup: %v", err)
+		} else {
+			for _, d := range deployments {
+				if err := s.artifactStore.Delete(tenantID, appName, d.ID); err != nil {
+					log.Printf("warning: failed to delete artifact %s/%s/%s: %v", tenantID, appName, d.ID, err)
+				}
+			}
+		}
 	}
 
 	// Cascade deletes run in a transaction so they either all succeed or all fail.
