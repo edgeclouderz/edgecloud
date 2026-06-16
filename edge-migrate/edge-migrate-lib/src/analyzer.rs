@@ -2,7 +2,7 @@
 //!
 //! Parses C source code into an AST and detects POSIX patterns.
 
-use crate::patterns::{PatternMatch, PosixPattern};
+use crate::patterns::{PatternMatch, PosixPattern, Transformability};
 use tree_sitter::Parser;
 
 /// C source code analyzer using tree-sitter.
@@ -31,21 +31,25 @@ impl CAnalyzer {
     }
 
     fn walk_node(&self, source: &str, node: tree_sitter::Node, matches: &mut Vec<PatternMatch>) {
-        if let Some(call_match) = self.match_call_node(source, node) {
-            matches.push(call_match);
-        }
+        matches.extend(self.match_call_node(source, node));
         for i in 0..node.child_count() {
             self.walk_node(source, node.child(i).unwrap(), matches);
         }
     }
 
-    fn match_call_node(&self, source: &str, node: tree_sitter::Node) -> Option<PatternMatch> {
+    /// Returns all pattern matches for a call expression node.
+    /// A single call can produce multiple matches (e.g., socket with O_NONBLOCK
+    /// produces both SocketTcp and NonBlocking).
+    fn match_call_node(&self, source: &str, node: tree_sitter::Node) -> Vec<PatternMatch> {
         if node.kind() != "call_expression" {
-            return None;
+            return Vec::new();
         }
 
-        let func_node = node.child(0)?;
-        let func_name = func_node.utf8_text(source.as_bytes()).ok()?;
+        let func_node = match node.child(0) {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        let func_name = func_node.utf8_text(source.as_bytes()).unwrap_or_default();
 
         let line = node.start_position().row + 1;
 
@@ -83,22 +87,44 @@ impl CAnalyzer {
             "exec" | "execve" | "execl" | "execvp" => PosixPattern::Exec,
             "socketpair" => PosixPattern::SocketPair,
             "shutdown" => PosixPattern::Shutdown,
-            _ => return None,
+            _ => return Vec::new(),
         };
 
-        let snippet = node.utf8_text(source.as_bytes()).ok()?.to_string();
-        let transformability = pattern.transformability();
+        let snippet = node.utf8_text(source.as_bytes()).unwrap_or_default().to_string();
         let start_byte = node.start_byte();
         let end_byte = node.end_byte();
+        let arg_nodes = self.get_call_args(source, node);
 
-        Some(PatternMatch {
+        let mut results = vec![PatternMatch {
             line,
             start_byte,
             end_byte,
-            pattern,
-            snippet,
-            transformability,
-        })
+            pattern: pattern.clone(),
+            snippet: snippet.clone(),
+            arg_nodes: arg_nodes.clone(),
+            transformability: pattern.transformability(),
+        }];
+
+        // Check for O_NONBLOCK in socket calls — adds a second PatternMatch
+        // (NonBlocking, NotTransformable) alongside the socket call match.
+        // Both share the same source range; the NonBlocking entry goes to
+        // manual_review and does not produce transformed WASI code.
+        if func_name == "socket" {
+            let has_nonblocking = arg_nodes.iter().any(|arg| arg.contains("O_NONBLOCK"));
+            if has_nonblocking {
+                results.push(PatternMatch {
+                    line,
+                    start_byte,
+                    end_byte,
+                    pattern: PosixPattern::NonBlocking,
+                    snippet,
+                    arg_nodes,
+                    transformability: Transformability::NotTransformable,
+                });
+            }
+        }
+
+        results
     }
 
     fn get_call_args(&self, source: &str, node: tree_sitter::Node) -> Vec<String> {
@@ -150,6 +176,23 @@ int main() {
 "#;
         let matches = analyzer.analyze(source);
         assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::SocketUdp)));
+    }
+
+    #[test]
+    fn test_detect_socket_with_o_nonblock() {
+        let mut analyzer = CAnalyzer::new();
+        let source = r#"
+int main() {
+    int fd = socket(AF_INET, SOCK_STREAM | O_NONBLOCK, 0);
+    return 0;
+}
+"#;
+        let matches = analyzer.analyze(source);
+        // Should produce both SocketTcp and NonBlocking
+        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::NonBlocking)));
+        let nonblocking = matches.iter().find(|m| matches!(m.pattern, PosixPattern::NonBlocking)).unwrap();
+        assert!(matches!(nonblocking.transformability, Transformability::NotTransformable));
     }
 
     #[test]
