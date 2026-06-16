@@ -38,6 +38,7 @@ type DeploymentService struct {
 	tenantRepo     *repository.TenantRepository
 	artifactStore  *storage.ArtifactStore
 	publisher      nats.Publisher
+	appSvc         *AppService
 }
 
 func NewDeploymentService(
@@ -60,11 +61,23 @@ func NewDeploymentService(
 	}
 }
 
+// SetAppService sets the AppService dependency for auto-creating apps on deploy.
+func (s *DeploymentService) SetAppService(appSvc *AppService) {
+	s.appSvc = appSvc
+}
+
 // Deploy creates a new deployment and stores the artifact.
 func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
+	}
+
+	// Auto-create the app record if it doesn't already exist (backward compatible).
+	if s.appSvc != nil {
+		if err := s.appSvc.CreateIfNotExists(ctx, tenantID, appName); err != nil {
+			return nil, fmt.Errorf("creating app: %w", err)
+		}
 	}
 
 	// Check quota
