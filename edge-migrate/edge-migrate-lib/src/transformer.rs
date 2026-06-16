@@ -55,10 +55,18 @@ pub struct Transformer;
 
 impl Transformer {
     /// Transform the given C source based on detected pattern matches.
+    ///
+    /// Processes matches from highest to lowest byte position, splicing in
+    /// WASI replacements. The running_offset tracks how much the output
+    /// has grown due to WASI code being longer than the original code it
+    /// replaces. This offset is added to all subsequent match positions.
+    ///
+    /// The WASI header is prepended first (at output position 0), so all
+    /// match positions in the output are shifted by header_len — regardless
+    /// of whether the first match is at byte 0 or not.
     pub fn transform(source: &str, matches: Vec<PatternMatch>) -> TransformResult {
         let mut transformations_applied = Vec::new();
         let mut manual_review = Vec::new();
-        let errors = Vec::new();
 
         // Partition into transformable and not-transformable
         let (transformable, not_transformable): (Vec<_>, Vec<_>) = matches
@@ -68,71 +76,65 @@ impl Transformer {
         manual_review.extend(not_transformable);
 
         // Sort by start_byte descending — process from end of file backward
-        // so earlier byte positions remain valid after replacements
+        // so earlier byte positions remain valid as we splice
         let mut sorted = transformable;
         sorted.sort_by_key(|m| Reverse(m.start_byte));
 
-        let mut source_bytes = source.as_bytes().to_vec();
-        let mut added_wasi_header = false;
-        let header_len = WASI_INCLUDES.len();
-        // Cumulative offset from all splices performed so far.
-        // A positive value means the source has grown; all subsequent
-        // positions must be adjusted by this amount.
-        let mut running_offset = 0_isize;
+        let source_bytes = source.as_bytes();
+
+        // Prepend WASI header — it is always prepended, so all subsequent
+        // splice positions are offset by header_len from the very start.
+        let mut result = WASI_INCLUDES.as_bytes().to_vec();
+
+        let mut last_end = 0usize;
 
         for m in &sorted {
             let wasi_code = Self::generate_wasi_code(m);
-            if !wasi_code.is_empty() {
-                // Mark that we need the WASI header
-                if !added_wasi_header && m.start_byte > 0 {
-                    // Prepend header at the top of the file
-                    source_bytes = Self::prepend_wasi_header(&source_bytes);
-                    added_wasi_header = true;
-                    running_offset += header_len as isize;
-                }
-
-                // Apply running offset to get current position in source_bytes
-                let current_start = (m.start_byte as isize + running_offset) as usize;
-                let current_end = (m.end_byte as isize + running_offset) as usize;
-
-                // Replace the matched bytes with WASI code
-                let new_len = wasi_code.len();
-                let old_len = current_end - current_start;
-                source_bytes.splice(current_start..current_end, wasi_code.as_bytes().to_vec());
-
-                // Update running offset: subsequent positions shift by (new_len - old_len)
-                running_offset += (new_len as isize) - (old_len as isize);
-
-                transformations_applied.push(Transformation {
-                    line: m.line,
-                    pattern: m.pattern.clone(),
-                    description: format!(
-                        "Transformed {} → {}",
-                        m.snippet.split('(').next().unwrap_or(&m.snippet),
-                        m.pattern.wasi_equivalent()
-                    ),
-                });
+            if wasi_code.is_empty() {
+                continue;
             }
+
+            let orig_start = m.start_byte;
+            let orig_end = m.end_byte;
+
+            // Copy original content between last_end and orig_start (the gap)
+            if orig_start > last_end {
+                result.extend_from_slice(&source_bytes[last_end..orig_start]);
+            }
+
+            // Insert WASI replacement
+            result.extend_from_slice(wasi_code.as_bytes());
+
+            last_end = orig_end;
+
+            transformations_applied.push(Transformation {
+                line: m.line,
+                pattern: m.pattern.clone(),
+                description: format!(
+                    "Transformed {} → {}",
+                    m.snippet.split('(').next().unwrap_or(&m.snippet),
+                    m.pattern.wasi_equivalent()
+                ),
+            });
         }
 
-        let transformed_source = String::from_utf8(source_bytes)
+        // Append remaining original content after the last processed match
+        if last_end < source_bytes.len() {
+            result.extend_from_slice(&source_bytes[last_end..]);
+        }
+
+        let transformed_source = String::from_utf8(result)
             .expect("Transformed source is not valid UTF-8");
 
         TransformResult {
             transformed_source,
             transformations_applied,
             manual_review,
-            errors,
+            errors: Vec::new(),
         }
     }
 
-    /// Prepend WASI header includes to the source.
-    fn prepend_wasi_header(source: &[u8]) -> Vec<u8> {
-        let mut result = WASI_INCLUDES.as_bytes().to_vec();
-        result.extend_from_slice(source);
-        result
-    }
-
+    
     /// Generate WASI C code for a pattern match.
     fn generate_wasi_code(m: &PatternMatch) -> String {
         match m.pattern {
@@ -264,10 +266,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("socket(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 48,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::SocketTcp,
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
@@ -287,10 +291,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("poll(").unwrap();
+        let call_end = source.find("timeout);").unwrap() + 9; // include "timeout);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 0,
-            end_byte: 0,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Poll,
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
@@ -309,10 +315,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("bind(").unwrap();
+        let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 65,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Bind,
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
@@ -332,10 +340,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("connect(").unwrap();
+        let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 68,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Connect,
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
@@ -355,10 +365,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("recv(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 35,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Recv,
             snippet: "recv(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
@@ -377,10 +389,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("send(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 35,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Send,
             snippet: "send(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
@@ -399,10 +413,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("accept(").unwrap();
+        let call_end = source.find("NULL);").unwrap() + 6; // include "NULL);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 38,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Accept,
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
