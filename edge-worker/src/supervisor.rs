@@ -320,14 +320,18 @@ impl Supervisor {
                             );
                             sleep(backoff).await;
                         }
-                        Err(_) => {
+                        Err(_elapsed) => {
                             // Health check timeout — app hung.
                             restart_count += 1;
+                            let backoff = std::cmp::min(
+                                base_backoff * 2u32.pow(restart_count - 1),
+                                max_backoff,
+                            );
                             tracing::warn!(
                                 restart_count,
                                 timeout_secs = health_check_timeout_secs,
                                 "app hung (health check timeout), restarting in {:?}",
-                                Duration::from_secs(1)
+                                backoff
                             );
                             if restart_count >= max_restarts {
                                 let mut s = state.write().await;
@@ -337,7 +341,7 @@ impl Supervisor {
                                 }
                                 break;
                             }
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(backoff).await;
                         }
                     }
                 }
