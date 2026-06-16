@@ -107,8 +107,7 @@ impl TestHarness {
             config.port_cooldown_secs,
         )));
 
-        let nats = Arc::new(NatsClientImpl::connect(&nats_url).await?)
-            as Arc<dyn NatsClientTrait>;
+        let nats = Arc::new(NatsClientImpl::connect(&nats_url).await?) as Arc<dyn NatsClientTrait>;
 
         let supervisor = Arc::new(Supervisor {
             config,
@@ -139,12 +138,17 @@ impl TestHarness {
 async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
     let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
         .with_startup_timeout(std::time::Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration { length: std::time::Duration::from_secs(5) }])
+        .with_ready_conditions(vec![WaitFor::Duration {
+            length: std::time::Duration::from_secs(5),
+        }])
         .start()
         .await
         .expect("start NATS container");
     let host = container.get_host().await.expect("get host");
-    let port = container.get_host_port_ipv4(4222).await.expect("get NATS port");
+    let port = container
+        .get_host_port_ipv4(4222)
+        .await
+        .expect("get NATS port");
     (container, format!("{}:{}", host, port))
 }
 
@@ -163,11 +167,7 @@ async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<He
 }
 
 /// Helper: wait for an app to appear in state with Running status.
-async fn wait_for_app_running(
-    supervisor: &Supervisor,
-    app_name: &str,
-    timeout_secs: u64,
-) -> bool {
+async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
@@ -183,11 +183,7 @@ async fn wait_for_app_running(
 }
 
 /// Helper: wait for an app to disappear from state.
-async fn wait_for_app_gone(
-    supervisor: &Supervisor,
-    app_name: &str,
-    timeout_secs: u64,
-) -> bool {
+async fn wait_for_app_gone(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
@@ -215,9 +211,7 @@ async fn test_app_lifecycle() {
     // Wire up the mock HTTP server to serve the test component.
     Mock::given(method("GET"))
         .and(path("/api/internal/download/d_deploy_001"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(test_component_bytes()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
         .mount(&harness.mock_server)
         .await;
 
@@ -255,7 +249,10 @@ async fn test_app_lifecycle() {
         "heartbeat should contain test-app"
     );
     let app_status = heartbeat.apps.get("test-app").unwrap();
-    assert_eq!(app_status.status, "running", "app status should be 'running'");
+    assert_eq!(
+        app_status.status, "running",
+        "app status should be 'running'"
+    );
     assert_eq!(
         app_status.deployment_id, "d_deploy_001",
         "deployment_id should match"
@@ -317,8 +314,11 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         config.port_cooldown_secs,
     )));
 
-    let nats = Arc::new(NatsClientImpl::connect(&nats_url).await.context("connect nats")?)
-        as Arc<dyn NatsClientTrait>;
+    let nats = Arc::new(
+        NatsClientImpl::connect(&nats_url)
+            .await
+            .context("connect nats")?,
+    ) as Arc<dyn NatsClientTrait>;
 
     let supervisor = Arc::new(Supervisor {
         config,
@@ -362,9 +362,7 @@ async fn test_stop_all_apps() {
     // Wire up the mock HTTP server to serve the test component.
     Mock::given(method("GET"))
         .and(path("/api/internal/download/d_deploy_001"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(test_component_bytes()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
         .mount(&harness.mock_server)
         .await;
 
@@ -390,13 +388,8 @@ async fn test_stop_all_apps() {
 
     // Wait for both apps to be running (not a fixed sleep)
     for i in 0..2 {
-        let running =
-            wait_for_app_running(&harness.supervisor, &format!("app-{}", i), 10).await;
-        assert!(
-            running,
-            "app-{} should be running within 10s",
-            i
-        );
+        let running = wait_for_app_running(&harness.supervisor, &format!("app-{}", i), 10).await;
+        assert!(running, "app-{} should be running within 10s", i);
     }
 
     let state = harness.supervisor.state.read().await;

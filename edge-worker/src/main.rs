@@ -67,7 +67,8 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Connect to NATS
-    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn crate::nats::NatsClient>;
+    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url).await?)
+        as Arc<dyn crate::nats::NatsClient>;
     tracing::info!(url = %config.nats_url, "connected to NATS");
 
     // Create the shutdown broadcast channel for the heartbeat task.
@@ -184,10 +185,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Perform graceful shutdown: signal the heartbeat to stop, stop all apps,
 /// publish a final heartbeat, then exit the process.
-async fn graceful_shutdown(
-    shutdown_tx: Arc<broadcast::Sender<()>>,
-    supervisor: Arc<Supervisor>,
-) {
+async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
     // Signal the heartbeat task to stop.
     let _ = shutdown_tx.send(());
 

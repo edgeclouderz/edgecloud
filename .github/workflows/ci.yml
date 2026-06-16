@@ -72,7 +72,7 @@ jobs:
       - name: Run audit
         if: matrix.tool == 'audit'
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --force
           cargo audit --manifest-path edge-runtime/Cargo.toml || true
 
   test:
