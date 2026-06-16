@@ -21,6 +21,51 @@ type CreateTenantRequest struct {
 	Plan string `json:"plan"`
 }
 
+type BootstrapRequest struct {
+	Name    string `json:"name"`
+	Plan    string `json:"plan"`
+	KeyName string `json:"key_name"`
+}
+
+type BootstrapResponse struct {
+	TenantID string `json:"tenant_id"`
+	APIKey   string `json:"api_key"`
+}
+
+// Bootstrap handles POST /api/tenants — creates a tenant + first API key atomically.
+// This is the self-signup endpoint; no auth required.
+func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
+	var req BootstrapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.KeyName == "" {
+		req.KeyName = "default"
+	}
+	plan := req.Plan
+	if plan == "" {
+		plan = "free"
+	}
+
+	tenant, rawKey, err := h.tenantSvc.BootstrapTenant(r.Context(), req.Name, plan, req.KeyName)
+	if err != nil {
+		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(BootstrapResponse{
+		TenantID: tenant.ID,
+		APIKey:   rawKey,
+	})
+}
+
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req CreateTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
