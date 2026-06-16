@@ -415,7 +415,9 @@ impl Supervisor {
                 AppInstanceStatus::Hung => "hung",
             };
             let exit_code = match &inst.status {
-                AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Stopping => None,
+                AppInstanceStatus::Running
+                | AppInstanceStatus::Starting
+                | AppInstanceStatus::Stopping => None,
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
             msg.apps.insert(
