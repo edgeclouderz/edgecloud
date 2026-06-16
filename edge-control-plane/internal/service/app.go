@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -11,13 +12,22 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
+// appRepoInterface defines the app repository methods used by AppService.
+type appRepoInterface interface {
+	Create(ctx context.Context, app *domain.App) error
+	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
+	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
+}
+
 // AppService handles app business logic.
 type AppService struct {
-	db             *sqlx.DB
-	appRepo        *repository.AppRepository
-	deploymentRepo *repository.DeploymentRepository
-	activeRepo     *repository.ActiveDeploymentRepository
-	appEnvRepo     *repository.AppEnvRepository
+	db         *sqlx.DB
+	appRepo    appRepoInterface
+	appEnvRepo *repository.AppEnvRepository
+	activeRepo *repository.ActiveDeploymentRepository
+	deployRepo *repository.DeploymentRepository
 }
 
 func NewAppService(
@@ -28,11 +38,11 @@ func NewAppService(
 	appEnvRepo *repository.AppEnvRepository,
 ) *AppService {
 	return &AppService{
-		db:             db,
-		appRepo:        appRepo,
-		deploymentRepo: deploymentRepo,
-		activeRepo:     activeRepo,
-		appEnvRepo:     appEnvRepo,
+		db:         db,
+		appRepo:    appRepo,
+		activeRepo: activeRepo,
+		appEnvRepo: appEnvRepo,
+		deployRepo: deploymentRepo,
 	}
 }
 
@@ -44,19 +54,12 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		return nil, fmt.Errorf("invalid app name: %s", appName)
 	}
 
-	exists, err := s.appRepo.Exists(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("checking app existence: %w", err)
-	}
-	if exists {
-		return nil, ErrAppAlreadyExists
-	}
-
 	var desc *string
 	if req.Description != "" {
 		desc = &req.Description
 	}
 
+	// Use InsertIfNotExists for an atomic check-and-insert — no TOCTOU race.
 	app := &domain.App{
 		ID:          "a_" + uuid.New().String(),
 		TenantID:    tenantID,
@@ -64,8 +67,12 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		Description: desc,
 		CreatedAt:   time.Now(),
 	}
-	if err := s.appRepo.Create(ctx, app); err != nil {
+	inserted, err := s.appRepo.InsertIfNotExists(ctx, app)
+	if err != nil {
 		return nil, fmt.Errorf("creating app: %w", err)
+	}
+	if !inserted {
+		return nil, ErrAppAlreadyExists
 	}
 	return app, nil
 }
@@ -85,7 +92,6 @@ func (s *AppService) List(ctx context.Context, tenantID string, limit, offset in
 var ErrAppNotFound = fmt.Errorf("app not found")
 
 func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error {
-	// Use AtomicDelete to check existence and delete in one step.
 	deleted, err := s.appRepo.AtomicDelete(ctx, tenantID, appName)
 	if err != nil {
 		return fmt.Errorf("deleting app: %w", err)
@@ -98,7 +104,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 	err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		appEnvRepo := s.appEnvRepo.WithTx(tx)
 		activeRepo := s.activeRepo.WithTx(tx)
-		deploymentRepo := s.deploymentRepo.WithTx(tx)
+		deployRepo := s.deployRepo.WithTx(tx)
 
 		if err := appEnvRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting app env: %w", err)
@@ -106,7 +112,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		if err := activeRepo.Delete(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting active deployment: %w", err)
 		}
-		if err := deploymentRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
+		if err := deployRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting deployments: %w", err)
 		}
 		return nil
@@ -114,7 +120,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 	if err != nil {
 		// Log but don't fail — app row already deleted above.
 		// In production, consider a background reconciler to clean orphaned rows.
-		fmt.Printf("warning: cascade delete partially failed after app deletion: %v\n", err)
+		log.Printf("warning: cascade delete partially failed after app deletion: %v", err)
 	}
 	return nil
 }
@@ -133,7 +139,7 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		Description: nil,
 		CreatedAt:   time.Now(),
 	}
-	// Upsert is inherently idempotent — concurrent calls are safely deduplicated.
+	// InsertIfNotExists uses INSERT ... ON CONFLICT DO NOTHING — inherently idempotent.
 	_, err := s.appRepo.InsertIfNotExists(ctx, app)
 	if err != nil {
 		return fmt.Errorf("creating app: %w", err)

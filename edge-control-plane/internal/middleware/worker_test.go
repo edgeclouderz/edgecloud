@@ -13,7 +13,7 @@ func TestVerifyWorkerJWT_Valid(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -42,7 +42,7 @@ func TestVerifyWorkerJWT_Expired(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-1 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -62,7 +62,7 @@ func TestVerifyWorkerJWT_WrongSecret(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -98,7 +98,7 @@ func TestWorkerAuth_ValidToken(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",

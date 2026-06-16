@@ -75,8 +75,8 @@ func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateTenantRequest struct {
-	Name                   string   `json:"name"`
-	Plan                   string   `json:"plan"`
+	Name                    string   `json:"name"`
+	Plan                    string   `json:"plan"`
 	AllowlistedDestinations []string `json:"allowlisted_destinations"`
 }
 
