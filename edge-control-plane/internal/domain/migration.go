@@ -4,13 +4,12 @@ package domain
 type MigrationStatus string
 
 const (
-	MigrationStatusSuccess = "success" // all patterns auto-transformed
-	MigrationStatusPartial = "partial" // some require manual review
-	MigrationStatusFailed  = "failed"  // untransformable patterns detected
+	MigrationStatusSuccess = MigrationStatus("success") // all patterns auto-transformed
+	MigrationStatusPartial = MigrationStatus("partial") // some require manual review
+	MigrationStatusFailed  = MigrationStatus("failed")  // untransformable patterns detected
 )
 
 // MigrationReport is the JSON response returned by POST /api/migrate.
-// It is serialized directly to the edge-migrate CLI client.
 type MigrationReport struct {
 	Status               MigrationStatus `json:"status"`
 	WasmStored           bool           `json:"wasm_stored"`
