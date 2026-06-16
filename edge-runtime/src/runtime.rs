@@ -289,21 +289,30 @@ impl HttpServerHost for RuntimeState {
     }
     fn poll(&mut self) -> Result<Option<crate::edge::cloud::http_server::IncomingRequest>, String> {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.http_server.poll())
-            .map(|opt| opt.map(|req| crate::edge::cloud::http_server::IncomingRequest {
+        rt.block_on(self.http_server.poll()).map(|opt| {
+            opt.map(|req| crate::edge::cloud::http_server::IncomingRequest {
                 id: req.id,
                 method: req.method,
                 path: req.path,
                 query: req.query,
                 headers: req.headers,
                 body: req.body,
-                trace: req.trace.map(|tc| crate::edge::cloud::http_server::TraceContext {
-                    traceparent: tc.traceparent,
-                    tracestate: tc.tracestate,
-                }),
-            }))
+                trace: req
+                    .trace
+                    .map(|tc| crate::edge::cloud::http_server::TraceContext {
+                        traceparent: tc.traceparent,
+                        tracestate: tc.tracestate,
+                    }),
+            })
+        })
     }
-    fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Result<(), String> {
+    fn respond(
+        &mut self,
+        req_id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<(), String> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.respond(req_id, status, headers, body))
     }
