@@ -304,15 +304,15 @@ impl HttpServer {
 
     /// Initiate graceful shutdown of the accept loop.
     /// Idempotent — subsequent calls after the first are no-ops.
-    pub async fn shutdown(&self) {
+    pub fn shutdown(&self) {
         if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
     }
 
     /// Returns the port the server is bound to, if it has been started.
-    pub fn get_assigned_port(&self) -> u16 {
-        self.port.unwrap_or(0)
+    pub fn get_assigned_port(&self) -> Option<u16> {
+        self.port
     }
 
     /// Handle one TCP connection: read and parse HTTP, send request to guest,
@@ -821,5 +821,18 @@ mod tests {
         // try_load_tls_config should return None (not panic).
         let result = try_load_tls_config();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_assigned_port_before_start() {
+        let server = HttpServer::new();
+        assert!(server.get_assigned_port().is_none());
+    }
+
+    #[test]
+    fn test_shutdown_is_idempotent() {
+        let server = HttpServer::new();
+        server.shutdown();
+        server.shutdown();
     }
 }

@@ -308,10 +308,9 @@ impl HttpServerHost for RuntimeState {
         rt.block_on(self.http_server.respond(req_id, status, headers, body))
     }
     fn shutdown(&mut self) {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.http_server.shutdown());
+        self.http_server.shutdown();
     }
     fn get_assigned_port(&mut self) -> u16 {
-        self.http_server.get_assigned_port()
+        self.http_server.get_assigned_port().unwrap_or(0)
     }
 }
