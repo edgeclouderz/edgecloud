@@ -45,5 +45,6 @@ struct TomlConfig {
 #[derive(Debug, Deserialize)]
 struct DefaultSection {
     api_key: Option<String>,
+    #[allow(dead_code)]
     api: Option<String>,
 }
