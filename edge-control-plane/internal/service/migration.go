@@ -6,29 +6,45 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 )
 
+// ErrEdgeMigrateFailed is returned when the edge-migrate subprocess fails.
+var ErrEdgeMigrateFailed = fmt.Errorf("edge-migrate transform failed")
+
+// ErrClangFailed is returned when the wasi-sdk clang subprocess fails.
+var ErrClangFailed = fmt.Errorf("wasi-sdk clang compilation failed")
+
+// DeploymentRepoInterface abstracts deployment creation for testing.
+type DeploymentRepoInterface interface {
+	Create(ctx context.Context, d *domain.Deployment) error
+}
+
+// ArtifactStoreInterface abstracts wasm artifact storage for testing.
+type ArtifactStoreInterface interface {
+	Save(tenantID, appName, deploymentID string, r io.Reader) error
+}
+
+// MigrationService transforms POSIX C source to WASI and compiles it to wasm.
 type MigrationService struct {
-	deploymentRepo  *repository.DeploymentRepository
-	artifactStore   *storage.ArtifactStore
+	deploymentRepo  DeploymentRepoInterface
+	artifactStore   ArtifactStoreInterface
 	edgeMigratePath string
 	wasiSdkPath     string
 }
 
+// NewMigrationService creates a MigrationService.
 func NewMigrationService(
-	deploymentRepo *repository.DeploymentRepository,
-	artifactStore *storage.ArtifactStore,
+	deploymentRepo DeploymentRepoInterface,
+	artifactStore ArtifactStoreInterface,
 	edgeMigratePath, wasiSdkPath string,
 ) *MigrationService {
 	return &MigrationService{
@@ -39,59 +55,93 @@ func NewMigrationService(
 	}
 }
 
-func (s *MigrationService) Migrate(
-	ctx context.Context,
-	tenantID, filename, language, source string,
-) (*domain.MigrationReport, error) {
-	if language != "c" {
-		return nil, fmt.Errorf("only C language is supported, got: %s", language)
+// Migrate transforms the given C source to WASI C, compiles it to wasm,
+// stores the artifact, and creates a deployment record.
+func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _language, source string) (*domain.MigrationReport, error) {
+	// Derive app name: strip .c suffix
+	appName := strings.TrimSuffix(filename, ".c")
+	if appName == "" {
+		appName = "app"
 	}
 
-	appName := strings.TrimSuffix(filepath.Base(filename), ".c")
-	if !IsValidAppName(appName) {
-		return nil, fmt.Errorf("invalid app name derived from filename: %s", appName)
-	}
-
-	patterns := detectPatterns(source)
-
-	tmpDir := os.TempDir()
-	srcPath := filepath.Join(tmpDir, fmt.Sprintf("edge_migrate_src_%d.c", time.Now().UnixNano()))
-	if err := os.WriteFile(srcPath, []byte(source), 0600); err != nil {
-		return nil, fmt.Errorf("writing temp source file: %w", err)
-	}
-	defer os.Remove(srcPath)
-
-	wasiSource, err := s.runEdgeMigrateTransform(ctx, srcPath)
+	// Write source to a temp file for edge-migrate (reads a path, not stdin)
+	tmpSrc, err := os.CreateTemp("", "migrate-*.c")
 	if err != nil {
-		return nil, fmt.Errorf("edge-migrate transform: %w", err)
+		return nil, fmt.Errorf("creating temp source file: %w", err)
+	}
+	tmpSrcPath := tmpSrc.Name()
+	defer os.Remove(tmpSrcPath)
+	if _, err := tmpSrc.WriteString(source); err != nil {
+		tmpSrc.Close()
+		return nil, fmt.Errorf("writing temp source: %w", err)
+	}
+	tmpSrc.Close()
+
+	// Run edge-migrate --transform <path>
+	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--transform", tmpSrcPath)
+	var edgeMigOut bytes.Buffer
+	edgeMigCmd.Stdout = &edgeMigOut
+	var edgeMigErr bytes.Buffer
+	edgeMigCmd.Stderr = &edgeMigErr
+	if err := edgeMigCmd.Run(); err != nil {
+		return &domain.MigrationReport{
+			Status:    domain.MigrationStatusFailed,
+			WasmStored: false,
+			AppName:   appName,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: fmt.Sprintf("edge-migrate failed: %s — %s", err, edgeMigErr.String()),
+			}},
+		}, ErrEdgeMigrateFailed
+	}
+	wasiC := edgeMigOut.String()
+
+	// Build pattern report from the WASI C output
+	patternsTransformed := detectTransformedPatterns(wasiC)
+
+	// Compile WASI C → wasm via clang
+	tmpWasm, err := os.CreateTemp("", "migrate-*.wasm")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp wasm file: %w", err)
+	}
+	tmpWasmPath := tmpWasm.Name()
+	tmpWasm.Close()
+	defer os.Remove(tmpWasmPath)
+
+	clangBin := filepath.Join(s.wasiSdkPath, "clang")
+	clangCmd := exec.CommandContext(ctx, clangBin,
+		"--target=wasm32-wasip2", "-nostdlib",
+		"-o", tmpWasmPath, "-")
+	clangCmd.Stdin = strings.NewReader(wasiC)
+	var clangErr bytes.Buffer
+	clangCmd.Stderr = &clangErr
+
+	if err := clangCmd.Run(); err != nil {
+		return &domain.MigrationReport{
+			Status:              domain.MigrationStatusPartial,
+			WasmStored:          false,
+			AppName:             appName,
+			PatternsTransformed: patternsTransformed,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: fmt.Sprintf("clang failed: %s — %s", err, clangErr.String()),
+			}},
+		}, ErrClangFailed
 	}
 
-	wasmPath := filepath.Join(tmpDir, fmt.Sprintf("edge_migrate_out_%d.wasm", time.Now().UnixNano()))
-	defer os.Remove(wasmPath)
-
-	if err := s.compileWasm(ctx, wasiSource, wasmPath); err != nil {
-		report := buildReport(appName, patterns, nil, false)
-		report.Errors = append(report.Errors, domain.ErrorInfo{
-			Message: fmt.Sprintf("compilation failed: %s", err.Error()),
-		})
-		report.Status = domain.MigrationStatusFailed
-		return report, nil
-	}
-
-	wasmData, err := os.ReadFile(wasmPath)
+	// Read wasm bytes
+	wasmBytes, err := os.ReadFile(tmpWasmPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading compiled wasm: %w", err)
 	}
-	hash := sha256.Sum256(wasmData)
-	deploymentID := "d_" + uuid.New().String()
 
-	// Save artifact first so we never have a deployment record without an artifact.
-	if err := s.artifactStore.Save(tenantID, appName, deploymentID, bytes.NewReader(wasmData)); err != nil {
-		return nil, fmt.Errorf("saving wasm artifact: %w", err)
-	}
+	// Generate deployment ID and hash
+	depID := "d_" + uuid.New().String()
+	hash := sha256.Sum256(wasmBytes)
 
+	// Create deployment DB record
 	deployment := &domain.Deployment{
-		ID:        deploymentID,
+		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    "migrated",
@@ -102,127 +152,57 @@ func (s *MigrationService) Migrate(
 		return nil, fmt.Errorf("creating deployment record: %w", err)
 	}
 
-	report := buildReport(appName, patterns, &deploymentID, true)
-	return report, nil
-}
-
-func (s *MigrationService) runEdgeMigrateTransform(ctx context.Context, srcPath string) (string, error) {
-	cmd := exec.CommandContext(ctx, s.edgeMigratePath, "--transform", srcPath)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("edge-migrate failed: %s (%s)", err.Error(), stderr.String())
+	// Store wasm artifact
+	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
-	return stdout.String(), nil
-}
 
-func (s *MigrationService) compileWasm(ctx context.Context, wasiSource, wasmPath string) error {
-	clangPath := filepath.Join(s.wasiSdkPath, "clang")
-	cmd := exec.CommandContext(ctx, clangPath,
-		"--target=wasm32-wasip2", "-nostdlib", "-o", wasmPath, "-",
-	)
-	cmd.Stdin = strings.NewReader(wasiSource)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("clang failed: %s (%s)", err.Error(), stderr.String())
-	}
-	return nil
-}
-
-type patternDef struct {
-	regex          *regexp.Regexp
-	name           string
-	wasiEquivalent string
-	transformable  bool
-}
-
-var posixPatterns = []patternDef{
-	{regexp.MustCompile(`\bsocket\s*\([^)]*SOCK_STREAM[^)]*\)`), "SocketTcp", "wasi_socket_tcp_create", true},
-	{regexp.MustCompile(`\bsocket\s*\([^)]*SOCK_DGRAM[^)]*\)`), "SocketUdp", "wasi_socket_udp_create", true},
-	{regexp.MustCompile(`\bbind\s*\(`), "Bind", "wasi_socket_tcp_start_bind / finish_bind", true},
-	{regexp.MustCompile(`\blisten\s*\(`), "Listen", "wasi_socket_tcp_start_listen / finish_listen", true},
-	{regexp.MustCompile(`\baccept4?\s*\(`), "Accept", "wasi_socket_tcp_accept", true},
-	{regexp.MustCompile(`\bconnect\s*\(`), "Connect", "wasi_socket_tcp_start_connect / finish_connect", true},
-	{regexp.MustCompile(`\brecv\s*\(`), "Recv", "wasi_input_stream_read", true},
-	{regexp.MustCompile(`\bsend\s*\(`), "Send", "wasi_output_stream_write", true},
-	{regexp.MustCompile(`\bgethostbyname\s*\(`), "GetHostByName", "wasi_ip_name_lookup_resolve", true},
-	{regexp.MustCompile(`\bfopen\s*\(`), "Fopen", "wasi_filesystem_open", true},
-	{regexp.MustCompile(`\bfread\s*\(`), "Fread", "wasi_filesystem_read", true},
-	{regexp.MustCompile(`\bfwrite\s*\(`), "Fwrite", "wasi_filesystem_write", true},
-	{regexp.MustCompile(`\bfclose\s*\(`), "Fclose", "wasi_filesystem_close", true},
-	{regexp.MustCompile(`\bclose\s*\(`), "Close", "wasi_socket_close", true},
-	{regexp.MustCompile(`\bpoll\s*\(`), "Poll", "wasi_poll_poll", false},
-	{regexp.MustCompile(`\bselect\s*\(`), "Select", "", false},
-	{regexp.MustCompile(`\bfork\s*\(`), "Fork", "", false},
-	{regexp.MustCompile(`\bexecv?e?\s*\(`), "Exec", "", false},
-}
-
-type detectedPattern struct {
-	name           string
-	transformable  bool
-	wasiEquivalent string
-	line           int
-	snippet        string
-}
-
-func detectPatterns(source string) []detectedPattern {
-	lines := strings.Split(source, "\n")
-	var results []detectedPattern
-	for lineNum, line := range lines {
-		for _, p := range posixPatterns {
-			if p.regex.MatchString(line) {
-				results = append(results, detectedPattern{
-					name:           p.name,
-					transformable:  p.transformable,
-					wasiEquivalent: p.wasiEquivalent,
-					line:           lineNum + 1,
-					snippet:        strings.TrimSpace(line),
-				})
-			}
-		}
-	}
-	return results
-}
-
-func buildReport(appName string, patterns []detectedPattern, deploymentID *string, wasmStored bool) *domain.MigrationReport {
-	var detected, transformed, manualReview []domain.PatternInfo
-	for _, p := range patterns {
-		transformability := "NotTransformable"
-		if p.transformable {
-			transformability = "AutoTransformable"
-		}
-		info := domain.PatternInfo{
-			Line:             p.line,
-			Pattern:          p.name,
-			Snippet:          p.snippet,
-			WasiEquivalent:   p.wasiEquivalent,
-			Transformability: transformability,
-		}
-		detected = append(detected, info)
-		if p.transformable {
-			transformed = append(transformed, info)
-		} else {
-			manualReview = append(manualReview, info)
-		}
-	}
-	status := domain.MigrationStatusSuccess
-	if len(manualReview) > 0 {
-		if len(transformed) == 0 {
-			status = domain.MigrationStatusFailed
-		} else {
-			status = domain.MigrationStatusPartial
-		}
-	}
 	return &domain.MigrationReport{
-		Status:               status,
-		WasmStored:           wasmStored,
-		DeploymentID:         deploymentID,
-		AppName:              appName,
-		PatternsDetected:     detected,
-		PatternsTransformed:  transformed,
-		PatternsManualReview: manualReview,
-		Errors:               []domain.ErrorInfo{},
+		Status:              domain.MigrationStatusSuccess,
+		WasmStored:          true,
+		DeploymentID:        &depID,
+		AppName:             appName,
+		PatternsTransformed:  patternsTransformed,
+	}, nil
+}
+
+// detectTransformedPatterns scans WASI C output for known WASI function names
+// and returns a list of PatternInfo describing what was transformed.
+func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
+	transforms := []struct {
+		contains string
+		pattern  string
+		wasi     string
+	}{
+		{"wasi_socket_tcp_create", "socket(AF_INET, SOCK_STREAM, 0)", "wasi_socket_tcp_create"},
+		{"wasi_socket_tcp_start_bind", "bind(fd, addr, len)", "wasi_socket_tcp_start_bind"},
+		{"wasi_socket_tcp_start_listen", "listen(fd, backlog)", "wasi_socket_tcp_start_listen"},
+		{"wasi_socket_tcp_accept", "accept(fd, ...)", "wasi_socket_tcp_accept"},
+		{"wasi_socket_tcp_start_connect", "connect(fd, addr, len)", "wasi_socket_tcp_start_connect"},
+		{"wasi_output_stream_write", "send(fd, buf, len, flags)", "wasi_output_stream_write"},
+		{"wasi_input_stream_read", "recv(fd, buf, len, flags)", "wasi_input_stream_read"},
+		{"wasi_filesystem_open", "fopen(path, mode)", "wasi_filesystem_open"},
+		{"wasi_ip_name_lookup_resolve", "gethostbyname(name)", "wasi_ip_name_lookup_resolve"},
 	}
+
+	var patterns []domain.PatternInfo
+	seen := make(map[string]bool)
+	for _, t := range transforms {
+		if strings.Contains(wasiC, t.contains) && !seen[t.pattern] {
+			seen[t.pattern] = true
+			patterns = append(patterns, domain.PatternInfo{
+				Line:             0,
+				Pattern:          t.pattern,
+				Snippet:          t.pattern,
+				WasiEquivalent:    t.wasi,
+				Transformability: "Auto-transformable",
+			})
+		}
+	}
+	return patterns
+}
+
+// validateWasm checks whether b is a valid wasm binary (magic number check).
+func validateWasm(b []byte) bool {
+	return bytes.HasPrefix(b, []byte{0x00, 0x61, 0x73, 0x6d})
 }

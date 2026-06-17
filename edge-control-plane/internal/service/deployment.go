@@ -140,6 +140,41 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, tenantID, appNa
 	return s.deploymentRepo.ListByApp(ctx, tenantID, appName)
 }
 
+func (s *DeploymentService) ListDeploymentsPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+	// Negative inputs are silently corrected: limit ≤ 0 becomes 20, offset < 0 becomes 0.
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
+}
+
+func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
+	if err != nil {
+		return nil, 0, fmt.Errorf("counting deployments: %w", err)
+	}
+	deployments, err := s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return deployments, total, nil
+}
+
 func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error {
 	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
 	if err != nil || deployment == nil {
@@ -167,6 +202,14 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		envMap[e.EnvKey] = e.EnvValue
 	}
 
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return fmt.Errorf("tenant not found")
+	}
+
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
 		Timestamp: time.Now(),
@@ -176,7 +219,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentID:   deploymentID,
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
-				Allowlist:      []string{},
+				Allowlist:      tenant.AllowlistedDestinations,
 			},
 		},
 	}

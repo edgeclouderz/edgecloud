@@ -45,6 +45,13 @@ func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName 
 	return deployments, err
 }
 
+func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+	var deployments []domain.Deployment
+	query := `SELECT id, tenant_id, app_name, status, hash, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
+	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
+	return deployments, err
+}
+
 func (r *DeploymentRepository) CountByApp(ctx context.Context, tenantID, appName string) (int, error) {
 	var count int
 	query := `SELECT COUNT(*) FROM deployments WHERE tenant_id = $1 AND app_name = $2`
