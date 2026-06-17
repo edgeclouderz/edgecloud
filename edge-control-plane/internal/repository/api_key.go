@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -24,12 +25,15 @@ func (r *APIKeyRepository) WithTx(tx *sqlx.Tx) *APIKeyRepository {
 }
 
 func (r *APIKeyRepository) Create(ctx context.Context, k *domain.APIKey) error {
-	query := `INSERT INTO api_keys (id, tenant_id, name, key_hash, lookup_hash, role, created_at, expires_at, hash_algorithm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	algo := k.HashAlgorithm
-	if algo == "" {
-		algo = domain.HashAlgorithmArgon2ID // safe default for new keys
+	if k.HashAlgorithm == "" {
+		// Programming error: callers must set HashAlgorithm explicitly.
+		// A silent default would mask bugs (e.g. a future migration that
+		// wants to insert SHA-256 rows would silently write argon2id).
+		return fmt.Errorf("api_key %s: HashAlgorithm must be set (use %q or %q)",
+			k.ID, domain.HashAlgorithmArgon2ID, domain.HashAlgorithmSHA256)
 	}
-	_, err := r.db.ExecContext(ctx, query, k.ID, k.TenantID, k.Name, k.KeyHash, k.LookupHash, k.Role, k.CreatedAt, k.ExpiresAt, algo)
+	query := `INSERT INTO api_keys (id, tenant_id, name, key_hash, lookup_hash, role, created_at, expires_at, hash_algorithm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+	_, err := r.db.ExecContext(ctx, query, k.ID, k.TenantID, k.Name, k.KeyHash, k.LookupHash, k.Role, k.CreatedAt, k.ExpiresAt, k.HashAlgorithm)
 	return err
 }
 
@@ -70,14 +74,6 @@ func (r *APIKeyRepository) Delete(ctx context.Context, id string) error {
 
 func (r *APIKeyRepository) UpdateLastUsed(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, `UPDATE api_keys SET last_used = $2 WHERE id = $1`, id, time.Now())
-	return err
-}
-
-// UpdateHash overwrites the stored hash and algorithm for a key. Used by the
-// AuthMiddleware lazy-rehash path on first successful auth of a legacy
-// SHA-256-stored key.
-func (r *APIKeyRepository) UpdateHash(ctx context.Context, id, newHash, algo string) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE api_keys SET key_hash = $2, hash_algorithm = $3 WHERE id = $1`, id, newHash, algo)
 	return err
 }
 

@@ -2,12 +2,11 @@ package middleware
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log"
 	"net/http"
 	"strings"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/hashutil"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
@@ -45,9 +44,10 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		rawKey := parts[1]
 		// Lookup uses SHA-256 hex of the raw key. The repo resolves this
 		// against the dedicated `lookup_hash` column (migration 006), which
-		// is independent of the algorithm-specific `key_hash`.
-		hash := sha256.Sum256([]byte(rawKey))
-		lookupHash := hex.EncodeToString(hash[:])
+		// is independent of the algorithm-specific `key_hash`. We use the
+		// shared helper rather than inlining sha256+hex so the service
+		// layer produces byte-identical lookup strings.
+		lookupHash := hashutil.SHA256Hex(rawKey)
 
 		apiKey, err := m.apiKeyRepo.GetByLookupHash(r.Context(), lookupHash)
 		if err != nil {

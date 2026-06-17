@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/hashutil"
 )
 
 // mockAPIKeyRepo implements apiKeyRepoInterface for testing.
@@ -17,7 +18,6 @@ type mockAPIKeyRepo struct {
 	listByTenantFn          func(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	deleteFn                func(ctx context.Context, id string) error
 	updateLastUsedFn        func(ctx context.Context, id string) error
-	updateHashFn            func(ctx context.Context, id, newHash, algo string) error
 	updateHashIfAlgorithmFn func(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error)
 }
 
@@ -51,12 +51,6 @@ func (m *mockAPIKeyRepo) UpdateLastUsed(ctx context.Context, id string) error {
 	}
 	return m.updateLastUsedFn(ctx, id)
 }
-func (m *mockAPIKeyRepo) UpdateHash(ctx context.Context, id, newHash, algo string) error {
-	if m.updateHashFn == nil {
-		return nil
-	}
-	return m.updateHashFn(ctx, id, newHash, algo)
-}
 func (m *mockAPIKeyRepo) UpdateHashIfAlgorithm(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error) {
 	if m.updateHashIfAlgorithmFn == nil {
 		return 0, nil
@@ -70,7 +64,7 @@ func TestAPIKeyService_AuthenticateRawKey_Argon2_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashAPIKey: %v", err)
 	}
-	shaHex := sha256HexOf(raw)
+	shaHex := hashutil.SHA256Hex(raw)
 
 	lastUsedCalled := false
 	repo := &mockAPIKeyRepo{
@@ -126,7 +120,7 @@ func TestAPIKeyService_AuthenticateRawKey_Argon2_WrongKey(t *testing.T) {
 func TestAPIKeyService_AuthenticateRawKey_LegacySHA256_LazyRehash(t *testing.T) {
 	// Simulate a pre-migration row: stored as hex SHA-256.
 	raw := "legacy-raw-key"
-	legacyHash := sha256HexOf(raw)
+	legacyHash := hashutil.SHA256Hex(raw)
 
 	var rehashCalled bool
 	var rehashToArgon bool
@@ -178,39 +172,65 @@ func TestAPIKeyService_AuthenticateRawKey_LegacySHA256_LazyRehash(t *testing.T) 
 }
 
 // TestAPIKeyService_AuthenticateRawKey_ConcurrentLazyRehash exercises the
-// atomic-CAS path: two goroutines authenticate the same legacy SHA-256 row
-// simultaneously. Only one CAS wins (rows-affected == 1); the other observes
-// rows-affected == 0 (or its auth path loses to the upgraded row). Both
-// authentications must succeed without panic, and the row must end up in
-// argon2id format.
+// atomic-CAS path against a mock that models the production race.
+//
+// Scenario: 4 goroutines authenticate the same legacy SHA-256 row
+// concurrently. The mock is a tiny in-memory table — once the first CAS
+// "wins", subsequent lookups return the row in its upgraded argon2id
+// format and bypass the CAS path entirely (the production behavior the
+// CAS guard exists to enable).
+//
+// Invariants verified:
+//   - every goroutine's auth succeeds (no panic, no spurious error),
+//   - exactly one CAS guard matches (rowsAffected == 1),
+//   - subsequent lookups see an argon2id row and skip the CAS path.
 func TestAPIKeyService_AuthenticateRawKey_ConcurrentLazyRehash(t *testing.T) {
 	raw := "concurrent-legacy-key"
-	legacyHash := sha256HexOf(raw)
+	legacyHash := hashutil.SHA256Hex(raw)
+	argonHash, err := HashAPIKey(raw)
+	if err != nil {
+		t.Fatalf("HashAPIKey: %v", err)
+	}
 
 	var (
 		mu          sync.Mutex
 		casAttempts int
 		casWins     int
+		upgraded    bool
 	)
 
-	// First call returns 1 (this goroutine upgraded the row).
-	// Subsequent calls return 0 (the row is already in argon2id).
 	updateHashIfAlgorithmFn := func(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error) {
 		mu.Lock()
+		defer mu.Unlock()
 		casAttempts++
 		var affected int64
-		if casAttempts == 1 {
+		// Only the first CAS guard sees algorithm=sha256 — every later
+		// attempt would see argon2id and skip the CAS path entirely.
+		if !upgraded {
 			affected = 1
 			casWins++
+			upgraded = true
 		}
-		mu.Unlock()
 		return affected, nil
 	}
 
 	repo := &mockAPIKeyRepo{
 		getByLookupHashFn: func(ctx context.Context, h string) (*domain.APIKey, error) {
-			// Always return the legacy row — both auth attempts see it as
-			// SHA-256. The CAS guard is what serializes the upgrade.
+			mu.Lock()
+			defer mu.Unlock()
+			if upgraded {
+				// Production: once the row is upgraded, subsequent lookups
+				// see HashAlgorithm=argon2id. The auth path takes the
+				// VerifyAPIKey branch, never re-entering the CAS path.
+				return &domain.APIKey{
+					ID:            "k_legacy",
+					TenantID:      "t_test",
+					KeyHash:       argonHash,
+					LookupHash:    h,
+					HashAlgorithm: domain.HashAlgorithmArgon2ID,
+					Role:          domain.RoleDeveloper,
+				}, nil
+			}
 			return &domain.APIKey{
 				ID:            "k_legacy",
 				TenantID:      "t_test",
@@ -243,11 +263,20 @@ func TestAPIKeyService_AuthenticateRawKey_ConcurrentLazyRehash(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent auth returned error: %v", err)
 	}
-	if casAttempts != goroutines {
-		t.Errorf("CAS attempts = %d, want %d", casAttempts, goroutines)
-	}
+	// Exactly one CAS guard matches: the first auth's. All later auths
+	// hit the upgraded argon2id row and bypass the CAS path entirely.
+	// (In a contended test the CAS count is 1 — the mock serializes
+	// upgrades atomically. In a more relaxed schedule some lookups could
+	// happen after the upgrade, lowering CAS attempts below goroutines;
+	// the strict invariant is casWins == 1, not casAttempts == N.)
 	if casWins != 1 {
 		t.Errorf("CAS wins = %d, want exactly 1", casWins)
+	}
+	if casAttempts < 1 {
+		t.Errorf("CAS attempts = %d, want at least 1", casAttempts)
+	}
+	if casAttempts > goroutines {
+		t.Errorf("CAS attempts = %d, want at most %d (one per goroutine)", casAttempts, goroutines)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"log"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/hashutil"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/google/uuid"
 )
@@ -26,7 +27,6 @@ type apiKeyRepoInterface interface {
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	Delete(ctx context.Context, id string) error
 	UpdateLastUsed(ctx context.Context, id string) error
-	UpdateHash(ctx context.Context, id, newHash, algo string) error
 	UpdateHashIfAlgorithm(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error)
 }
 
@@ -65,7 +65,7 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role s
 	// algorithm-specific verifier. Independent of the encoded KeyHash so it
 	// stays a fixed-length, fixed-format lookup key even after algorithm
 	// changes. (Migration 006.)
-	lookupHash := sha256HexOf(rawKey)
+	lookupHash := hashutil.SHA256Hex(rawKey)
 
 	apiKey := &domain.APIKey{
 		ID:            "k_" + uuid.New().String(),
@@ -109,7 +109,7 @@ func (s *APIKeyService) AuthenticateRawKey(ctx context.Context, rawKey string) (
 		return nil, ErrInvalidAPIKey
 	}
 
-	lookup := sha256HexOf(rawKey)
+	lookup := hashutil.SHA256Hex(rawKey)
 
 	candidate, err := s.apiKeyRepo.GetByLookupHash(ctx, lookup)
 	if err != nil {
