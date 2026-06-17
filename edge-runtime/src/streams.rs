@@ -102,7 +102,14 @@ impl IncomingStream {
 
 /// guest → host direction. The guest calls `write_chunk` then `finish`.
 pub struct OutgoingStream {
-    tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    /// The sender is wrapped in `Option` so `finish` can drop it (closing the
+    /// channel and unblocking the adapter's drain) without taking `&mut self`
+    /// on the host side. After `finish` or `Drop`, `tx.is_none()` is the
+    /// canonical closed-channel signal.
+    tx: Option<mpsc::Sender<Result<Vec<u8>, String>>>,
+    /// Kept for documentation and as a cheap read-side hint; `tx.is_none()`
+    /// is the authoritative check. Marked on `finish` and on `Drop` as a
+    /// cancellation backstop.
     finished: Arc<AtomicBool>,
 }
 
@@ -110,28 +117,30 @@ impl OutgoingStream {
     /// Write a chunk to the stream. Returns `Err(Closed)` if the consumer has
     /// dropped its receiver (e.g. host cancelled, or upstream connection lost)
     /// or if `finish()` was already called.
-    pub async fn write_chunk(&self, bytes: Vec<u8>) -> Result<(), StreamError> {
-        if self.finished.load(Ordering::Acquire) {
-            return Err(StreamError::Closed);
-        }
-        self.tx
-            .send(Ok(bytes))
-            .await
-            .map_err(|_| StreamError::Closed)
+    pub async fn write_chunk(&mut self, bytes: Vec<u8>) -> Result<(), StreamError> {
+        let tx = self.tx.as_ref().ok_or(StreamError::Closed)?;
+        tx.send(Ok(bytes)).await.map_err(|_| StreamError::Closed)
     }
 
-    /// Signal end-of-stream. Subsequent `write_chunk` calls return `Err(Closed)`.
-    pub async fn finish(&self) -> Result<(), StreamError> {
+    /// Signal end-of-stream. Drops the sender, closing the channel so the
+    /// adapter's next `poll_next` returns `None` (EOF) without waiting for the
+    /// resource handle itself to be released. Subsequent `write_chunk` calls
+    /// return `Err(Closed)`.
+    pub async fn finish(&mut self) -> Result<(), StreamError> {
         self.finished.store(true, Ordering::Release);
+        // Drop the sender — this closes the channel and unblocks the adapter.
+        let _ = self.tx.take();
         Ok(())
     }
 }
 
 impl Drop for OutgoingStream {
     fn drop(&mut self) {
-        // Mark finished so any racing write_chunk would observe Closed rather
-        // than blocking forever on a half-closed channel.
+        // Cancellation backstop: if the guest abandons the stream without
+        // calling finish(), drop the sender so the adapter's drain does not
+        // stall forever on a never-arriving chunk.
         self.finished.store(true, Ordering::Release);
+        let _ = self.tx.take();
     }
 }
 
@@ -219,7 +228,10 @@ pub fn outgoing_pair(buffer: usize) -> (OutgoingStream, OutgoingStreamAdapter) {
     let (tx, rx) = mpsc::channel(buffer);
     let finished = Arc::new(AtomicBool::new(false));
     (
-        OutgoingStream { tx, finished },
+        OutgoingStream {
+            tx: Some(tx),
+            finished,
+        },
         OutgoingStreamAdapter { rx },
     )
 }
@@ -242,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outgoing_pair_roundtrip() {
-        let (out, adapter) = outgoing_pair(DEFAULT_STREAM_CAPACITY);
+        let (mut out, adapter) = outgoing_pair(DEFAULT_STREAM_CAPACITY);
 
         // Producer (guest side) writes two chunks then finishes.
         tokio::spawn(async move {
@@ -293,5 +305,44 @@ mod tests {
         let mut adapter = _adapter;
         use futures::StreamExt;
         assert!(adapter.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_finish_closes_channel_without_writer_drop() {
+        // Regression for C1 (review of PR #90): `finish()` must close the
+        // channel so the adapter observes EOF immediately, rather than waiting
+        // for the OutgoingStream to be dropped.
+        use futures::StreamExt;
+
+        let (mut out, mut adapter) = outgoing_pair(DEFAULT_STREAM_CAPACITY);
+
+        out.write_chunk(b"hello".to_vec()).await.unwrap();
+        out.finish().await.unwrap();
+
+        // First pull returns the chunk written before finish.
+        let first = adapter.next().await.expect("chunk present");
+        assert_eq!(first.unwrap(), bytes::Bytes::from_static(b"hello"));
+
+        // Second pull MUST observe EOF from finish() — not stall.
+        // (A 100ms timeout protects against regressions where the channel
+        // only closes on Drop.)
+        let eof = tokio::time::timeout(std::time::Duration::from_millis(100), adapter.next())
+            .await
+            .expect("adapter should observe EOF promptly after finish, not stall");
+        assert!(eof.is_none(), "expected EOF after finish, got {:?}", eof);
+
+        // OutgoingStream is still alive at this point — that's the point.
+        // A second write_chunk must return Closed.
+        let write_after_finish = out.write_chunk(b"after".to_vec()).await;
+        assert_eq!(write_after_finish, Err(StreamError::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_write_chunk_after_finish_returns_closed() {
+        // Defensive: write after finish must be rejected immediately.
+        let (mut out, _adapter) = outgoing_pair(DEFAULT_STREAM_CAPACITY);
+        out.finish().await.unwrap();
+        let err = out.write_chunk(b"x".to_vec()).await;
+        assert_eq!(err, Err(StreamError::Closed));
     }
 }
