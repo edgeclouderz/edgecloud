@@ -237,6 +237,41 @@ func TestMigrationService_Migrate_AppNameNoExtension(t *testing.T) {
 	}
 }
 
+func TestMigrationService_Migrate_PathTraversalFilename(t *testing.T) {
+	// Service-level rejection: this fires before any subprocess, so no
+	// skipIfNoEdgeMigrate / skipIfNoClang needed. Guards against future
+	// refactors that try to remove the defense-in-depth check on the
+	// grounds that the handler already rejects.
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "../etc.c", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+	if len(store.artifacts) != 0 {
+		t.Errorf("expected 0 artifacts stored, got: %d", len(store.artifacts))
+	}
+}
+
+func TestMigrationService_Migrate_EmptyFilename(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for empty filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+}
+
 func TestDetectTransformedPatterns(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -328,5 +363,12 @@ func TestSanitizeAppName_Backslash(t *testing.T) {
 	_, err := sanitizeAppName(`foo\bar.c`)
 	if err == nil {
 		t.Fatal("expected error for backslash filename")
+	}
+}
+
+func TestSanitizeAppName_EmptyString(t *testing.T) {
+	_, err := sanitizeAppName("")
+	if err == nil {
+		t.Fatal("expected error for empty filename")
 	}
 }

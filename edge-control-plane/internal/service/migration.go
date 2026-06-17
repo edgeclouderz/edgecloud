@@ -63,8 +63,11 @@ func sanitizeAppName(filename string) (string, error) {
 	if appName == "" {
 		return "", fmt.Errorf("invalid filename %q: cannot derive app name", filename)
 	}
-	if strings.ContainsAny(appName, "/\\") || strings.Contains(appName, "..") {
-		return "", fmt.Errorf("invalid filename %q: contains path-traversal characters", filename)
+	if strings.ContainsAny(appName, "/\\") {
+		return "", fmt.Errorf("invalid filename %q: contains path separator", filename)
+	}
+	if strings.Contains(appName, "..") {
+		return "", fmt.Errorf("invalid filename %q: contains '..'", filename)
 	}
 	return appName, nil
 }
