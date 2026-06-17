@@ -3,6 +3,11 @@
 use anyhow::Context;
 use std::path::PathBuf;
 
+// `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
+// env vars but not yet consumed by the supervisor — the wiring is tracked as a
+// follow-up to PR #61. Allow dead code on these fields so `clippy -D warnings`
+// stays green; remove the allow once the supervisor reads them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub worker_id: String,
