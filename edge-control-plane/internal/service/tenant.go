@@ -13,6 +13,16 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
+// TenantServiceInterface abstracts tenant operations for testing.
+type TenantServiceInterface interface {
+	BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error)
+	CreateTenant(ctx context.Context, name, plan string) (*domain.Tenant, error)
+	GetTenant(ctx context.Context, id string) (*domain.TenantWithQuota, error)
+	ListTenants(ctx context.Context) ([]domain.Tenant, error)
+	UpdateTenant(ctx context.Context, t *domain.Tenant) error
+	DeleteTenant(ctx context.Context, id string) error
+}
+
 // TenantService handles tenant business logic.
 type TenantService struct {
 	db         *sqlx.DB
