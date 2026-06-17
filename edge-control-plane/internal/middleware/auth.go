@@ -43,10 +43,13 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		}
 
 		rawKey := parts[1]
+		// Lookup uses SHA-256 hex of the raw key. The repo resolves this
+		// against the dedicated `lookup_hash` column (migration 006), which
+		// is independent of the algorithm-specific `key_hash`.
 		hash := sha256.Sum256([]byte(rawKey))
-		keyHash := hex.EncodeToString(hash[:])
+		lookupHash := hex.EncodeToString(hash[:])
 
-		apiKey, err := m.apiKeyRepo.GetByHash(r.Context(), keyHash)
+		apiKey, err := m.apiKeyRepo.GetByLookupHash(r.Context(), lookupHash)
 		if err != nil {
 			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 			return
