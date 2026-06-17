@@ -175,8 +175,15 @@ async fn body_pipeline(
         }
         remaining -= n;
     }
-    // Dropping `producer` closes the channel; the guest's next `read_chunk`
-    // observes `StreamError::Closed`.
+    // If the client closed the connection before delivering all promised
+    // bytes, surface the truncation so the guest does not treat a partial
+    // body as complete. Dropping `producer` afterwards closes the channel;
+    // the guest's next `read_chunk` observes `StreamError::Closed`.
+    if remaining > 0 {
+        let _ = producer
+            .push(Err(format!("truncated body: {} bytes short", remaining)))
+            .await;
+    }
 }
 
 /// Inline body read for small requests: reads `body_len` bytes from the split
@@ -214,6 +221,16 @@ async fn read_body_inline(
         };
         body.extend_from_slice(&buf[..n]);
         remaining -= n;
+    }
+    if body.len() < body_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "short body: got {} bytes, expected {}",
+                body.len(),
+                body_len
+            ),
+        ));
     }
     Ok(body)
 }
@@ -1168,6 +1185,127 @@ mod tests {
     #[test]
     fn test_status_text_unknown_code() {
         assert_eq!(HttpServer::status_text(999), "Unknown");
+    }
+
+    /// F1 regression: `read_body_inline` must return `Err(UnexpectedEof)`
+    /// when the source stream is closed before the promised `body_len`
+    /// bytes have been read — not a silently truncated `Vec<u8>`.
+    #[tokio::test]
+    async fn test_read_body_inline_truncated_body_returns_unexpected_eof() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        // Listener that writes 5 bytes then closes the connection. The
+        // client side (read half) gets an EOF after 5 bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"hello").await.unwrap();
+            sock.shutdown().await.unwrap();
+            // Hold the socket open until the client finishes reading EOF.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let err = read_body_inline(Vec::new(), read_half, 100, deadline)
+            .await
+            .expect_err("expected truncation error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("short body"),
+            "unexpected error message: {err}"
+        );
+        writer.await.unwrap();
+    }
+
+    /// F1 regression: `read_body_inline` returns the full body when the
+    /// source delivers exactly the promised `body_len` bytes (no spurious
+    /// truncation error).
+    #[tokio::test]
+    async fn test_read_body_inline_full_body_succeeds() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let payload = b"hello, world!".to_vec();
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&payload).await.unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let body = read_body_inline(Vec::new(), read_half, expected.len(), deadline)
+            .await
+            .expect("full body read");
+        assert_eq!(body, expected);
+        writer.await.unwrap();
+    }
+
+    /// F1 regression: `body_pipeline` must push an `Err("truncated body: ...")`
+    /// chunk into the producer when the source stream is closed before the
+    /// promised `body_len` bytes are read — the guest's `read_chunk` will
+    /// see the error before EOF.
+    #[tokio::test]
+    async fn test_body_pipeline_truncated_body_pushes_error() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"partial").await.unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let (producer, mut stream) = crate::streams::incoming_pair(8);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        tokio::spawn(body_pipeline(
+            Vec::new(),
+            read_half,
+            100,
+            deadline,
+            producer,
+        ));
+
+        // First read might be the partial data (Ok), or the truncation error.
+        // The error MUST be surfaced before the stream closes.
+        let mut saw_error = false;
+        loop {
+            match stream.read_chunk().await {
+                Ok(_chunk) => continue,
+                Err(crate::streams::StreamError::Io(msg)) => {
+                    assert!(msg.contains("truncated body"), "unexpected error: {msg}");
+                    saw_error = true;
+                    break;
+                }
+                Err(crate::streams::StreamError::Closed) => break,
+                Err(crate::streams::StreamError::Cancelled) => break,
+            }
+        }
+        assert!(saw_error, "expected a truncation error chunk");
+        writer.await.unwrap();
     }
 
     #[test]
