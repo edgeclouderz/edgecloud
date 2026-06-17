@@ -55,13 +55,29 @@ func NewMigrationService(
 	}
 }
 
+// sanitizeAppName derives the app name from an uploaded filename, rejecting
+// values that would either be unsafe as a path component or would silently
+// collide across tenants. Mirrors the checks in storage.validatePathComponent.
+func sanitizeAppName(filename string) (string, error) {
+	appName := strings.TrimSuffix(filename, ".c")
+	if appName == "" {
+		return "", fmt.Errorf("invalid filename %q: cannot derive app name", filename)
+	}
+	if strings.ContainsAny(appName, "/\\") {
+		return "", fmt.Errorf("invalid filename %q: contains path separator", filename)
+	}
+	if strings.Contains(appName, "..") {
+		return "", fmt.Errorf("invalid filename %q: contains '..'", filename)
+	}
+	return appName, nil
+}
+
 // Migrate transforms the given C source to WASI C, compiles it to wasm,
 // stores the artifact, and creates a deployment record.
 func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _language, source string) (*domain.MigrationReport, error) {
-	// Derive app name: strip .c suffix
-	appName := strings.TrimSuffix(filename, ".c")
-	if appName == "" {
-		appName = "app"
+	appName, err := sanitizeAppName(filename)
+	if err != nil {
+		return nil, err
 	}
 
 	// Write source to a temp file for edge-migrate (reads a path, not stdin)
@@ -85,9 +101,9 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	edgeMigCmd.Stderr = &edgeMigErr
 	if err := edgeMigCmd.Run(); err != nil {
 		return &domain.MigrationReport{
-			Status:    domain.MigrationStatusFailed,
+			Status:     domain.MigrationStatusFailed,
 			WasmStored: false,
-			AppName:   appName,
+			AppName:    appName,
 			Errors: []domain.ErrorInfo{{
 				Line:    0,
 				Message: fmt.Sprintf("edge-migrate failed: %s — %s", err, edgeMigErr.String()),
@@ -144,7 +160,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
-		Status:    "migrated",
+		Status:    domain.StatusMigrated,
 		Hash:      hex.EncodeToString(hash[:]),
 		CreatedAt: time.Now(),
 	}
@@ -162,7 +178,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		WasmStored:          true,
 		DeploymentID:        &depID,
 		AppName:             appName,
-		PatternsTransformed:  patternsTransformed,
+		PatternsTransformed: patternsTransformed,
 	}, nil
 }
 
@@ -194,7 +210,7 @@ func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
 				Line:             0,
 				Pattern:          t.pattern,
 				Snippet:          t.pattern,
-				WasiEquivalent:    t.wasi,
+				WasiEquivalent:   t.wasi,
 				Transformability: "Auto-transformable",
 			})
 		}
