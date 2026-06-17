@@ -248,6 +248,12 @@ impl Supervisor {
     /// backoff restart (max 5 restarts, then gives up). Long-running apps
     /// (HTTP servers) that return from handle() keep running — only an explicit
     /// process.exit from the guest means "stop".
+    // The two extra parameters (max_memory_mb, epoch_deadline_ticks) come
+    // from PR #61 — they are per-app limits plumbed from Config. Refactoring
+    // them into a single struct is left for a future PR; suppressing the
+    // clippy lint here keeps the function signature honest about what it
+    // actually depends on.
+    #[allow(clippy::too_many_arguments)]
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
