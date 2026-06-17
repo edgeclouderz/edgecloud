@@ -407,8 +407,14 @@ mod tests {
         }
 
         let published = publisher.published_levels();
-        assert!(!published.contains(&LogLevel::Error), "Error should be filtered");
-        assert!(!published.contains(&LogLevel::Warn), "Warn should be filtered");
+        assert!(
+            !published.contains(&LogLevel::Error),
+            "Error should be filtered"
+        );
+        assert!(
+            !published.contains(&LogLevel::Warn),
+            "Warn should be filtered"
+        );
         assert!(published.contains(&LogLevel::Info), "Info should pass");
         assert!(published.contains(&LogLevel::Debug), "Debug should pass");
         assert!(published.contains(&LogLevel::Trace), "Trace should pass");
