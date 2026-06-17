@@ -96,9 +96,15 @@ impl Downloader {
 
 /// Verify that `sha256(bytes)` equals `expected_hex` (a bare lowercase hex digest).
 ///
+/// `expected_hex` must be exactly 64 characters from the set `0-9 a-f` — the
+/// shape the Go control plane produces (`internal/service/deployment.go:112`).
+/// Uppercase hex is rejected at the pre-check rather than failing later inside
+/// the decoder, so the error is specific and actionable.
+///
 /// Errors on:
 /// - empty `expected_hex` (closes the pre-fix bypass where empty meant "skip")
-/// - wrong length or non-hex characters
+/// - wrong length
+/// - non-lowercase or non-hex characters
 /// - hash mismatch
 fn verify_hash(bytes: &[u8], expected_hex: &str, deployment_id: &str) -> anyhow::Result<()> {
     if expected_hex.is_empty() {
@@ -109,15 +115,25 @@ fn verify_hash(bytes: &[u8], expected_hex: &str, deployment_id: &str) -> anyhow:
         anyhow::bail!("deployment_hash is empty for {deployment_id}");
     }
 
-    if expected_hex.len() != 64 || !expected_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if expected_hex.len() != 64 {
         tracing::error!(
             deployment_id,
             len = expected_hex.len(),
-            "deployment_hash must be 64 lowercase hex chars"
+            "deployment_hash must be exactly 64 chars (SHA-256 hex digest length)"
         );
         anyhow::bail!(
-            "deployment_hash for {deployment_id} has wrong length or non-hex chars (got {} chars)",
+            "deployment_hash for {deployment_id} has wrong length: expected 64, got {}",
             expected_hex.len()
+        );
+    }
+
+    if !expected_hex.bytes().all(is_lower_hex) {
+        tracing::error!(
+            deployment_id,
+            "deployment_hash contains non-lowercase or non-hex chars; must be 64 lowercase hex (0-9, a-f)"
+        );
+        anyhow::bail!(
+            "deployment_hash for {deployment_id} contains non-hex chars; must be 64 lowercase hex (0-9, a-f)"
         );
     }
 
@@ -141,7 +157,7 @@ fn verify_hash(bytes: &[u8], expected_hex: &str, deployment_id: &str) -> anyhow:
 }
 
 /// Decode exactly 64 lowercase hex chars into 32 bytes.
-/// Caller must have validated `len == 64 && all hex`.
+/// Caller must have validated `len == 64 && all is_lower_hex`.
 fn decode_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let bytes = s.as_bytes();
     let mut out = [0u8; 32];
@@ -153,6 +169,11 @@ fn decode_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+/// `true` iff `b` is a lowercase hex digit (`0-9` or `a-f`).
+const fn is_lower_hex(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'a'..=b'f')
+}
+
 fn hex_nibble(b: u8) -> anyhow::Result<u8> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
@@ -162,9 +183,10 @@ fn hex_nibble(b: u8) -> anyhow::Result<u8> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -198,6 +220,19 @@ mod tests {
     }
 
     #[test]
+    fn verify_hash_rejects_uppercase() {
+        // 64 chars, all valid hex, but uppercase — must be rejected at the
+        // pre-check so the error is specific (not "non-hex byte: 0x41").
+        let bad = "A".repeat(64);
+        let err = verify_hash(b"anything", &bad, "d_test").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lowercase"),
+            "expected error to mention lowercase, got: {msg}"
+        );
+    }
+
+    #[test]
     fn verify_hash_accepts_matching() {
         let data = b"hello world";
         let hash = sha256_hex(data);
@@ -212,21 +247,24 @@ mod tests {
     }
 
     #[test]
-    fn hex_encode_decode_roundtrip() {
+    fn hex_encode_doubles_length_and_is_lowercase() {
         let data: Vec<u8> = (0u8..=255).collect();
         let encoded = hex_encode(&data);
         assert_eq!(encoded.len(), data.len() * 2);
-        // Every byte 0x00..=0xff round-trips cleanly via the decoder (used for
-        // fixed-size SHA-256 digests, but exercised here across the full byte range).
-        let encoded_32 = encoded.chars().take(64).collect::<String>();
-        let decoded = decode_hex_32(&encoded_32).expect("decode");
-        assert_eq!(decoded.to_vec(), data[..32]);
+        assert!(
+            encoded.bytes().all(is_lower_hex),
+            "hex_encode must emit only lowercase hex"
+        );
     }
 
     #[test]
-    fn decode_hex_32_rejects_non_hex() {
-        // Length is 64 but contains 'Z' (non-hex) at index 0.
-        let bad = format!("Z{}", "0".repeat(63));
-        assert!(decode_hex_32(&bad).is_err());
+    fn decode_hex_32_accepts_any_byte_value() {
+        // Every byte 0x00..=0xff must encode to a 2-char lowercase string that
+        // decode_hex_32 (called twice in sequence) recovers losslessly.
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = hex_encode(&data);
+        let encoded_32: String = encoded.chars().take(64).collect();
+        let decoded = decode_hex_32(&encoded_32).expect("decode");
+        assert_eq!(decoded.to_vec(), data[..32]);
     }
 }
