@@ -35,7 +35,8 @@ impl Analyzer {
             bind_re: Regex::new(r"bind\s*\(").unwrap(),
             open_re: Regex::new(r"open\s*\(").unwrap(),
             fopen_re: Regex::new(r"fopen\s*\(").unwrap(),
-            read_write_re: Regex::new(r"\b(read|write)\s*\(\s*(\d+|[a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
+            read_write_re: Regex::new(r"\b(read|write)\s*\(\s*(\d+|[a-zA-Z_][a-zA-Z0-9_]*)")
+                .unwrap(),
             fprintf_stdout_re: Regex::new(r"fprintf\s*\(\s*stdout\s*,").unwrap(),
             printf_re: Regex::new(r"\bprintf\s*\(").unwrap(),
         }

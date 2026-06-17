@@ -31,7 +31,9 @@ impl ApiKey {
             }
         }
 
-        anyhow::bail!("API key not found: set EDGE_API_KEY env var or create ~/.config/edgecloud/config.toml")
+        anyhow::bail!(
+            "API key not found: set EDGE_API_KEY env var or create ~/.config/edgecloud/config.toml"
+        )
     }
 }
 
@@ -43,5 +45,6 @@ struct TomlConfig {
 #[derive(Debug, Deserialize)]
 struct DefaultSection {
     api_key: Option<String>,
+    #[allow(dead_code)]
     api: Option<String>,
 }

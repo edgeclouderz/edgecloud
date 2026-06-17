@@ -123,10 +123,10 @@ mod tests {
         let port = pool.acquire().unwrap();
         pool.release(port);
         pool.release(port); // second release should be a no-op
-        // Port should only be in cooling_down once; acquire returns it after cooldown.
-        // With 0 cooldown it would be immediately available, but with 60s it stays
-        // in cooling_down so acquire falls back to sequential.
-        // Verify by checking the port is NOT in available (since cooldown hasn't passed).
+                            // Port should only be in cooling_down once; acquire returns it after cooldown.
+                            // With 0 cooldown it would be immediately available, but with 60s it stays
+                            // in cooling_down so acquire falls back to sequential.
+                            // Verify by checking the port is NOT in available (since cooldown hasn't passed).
         let next = pool.acquire();
         assert_ne!(next, Some(port));
     }
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn test_sequential_fallback_skips_cooldown() {
         let mut pool = PortPool::new(8081, 0); // 0-second cooldown so ports are immediately reusable
-        // Exhaust the pre-populated ports
+                                               // Exhaust the pre-populated ports
         let mut ports = Vec::new();
         for _ in 0..100 {
             ports.push(pool.acquire().unwrap());

@@ -11,7 +11,10 @@ pub fn run(path: &Path) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = &edge_toml.project.name;
 
-    println!("Building '{}' (target: {})...", project_name, edge_toml.project.target);
+    println!(
+        "Building '{}' (target: {})...",
+        project_name, edge_toml.project.target
+    );
 
     // Run cargo build for the wasm target
     let status = Command::new("cargo")
