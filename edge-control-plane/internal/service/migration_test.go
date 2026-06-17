@@ -106,7 +106,7 @@ func TestMigrationService_Migrate_Success(t *testing.T) {
 	if len(repo.deployments) != 1 {
 		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
 	}
-	if repo.deployments[0].Status != "migrated" {
+	if repo.deployments[0].Status != domain.StatusMigrated {
 		t.Errorf("expected deployment status=migrated, got: %s", repo.deployments[0].Status)
 	}
 	if len(store.artifacts) != 1 {
@@ -237,6 +237,41 @@ func TestMigrationService_Migrate_AppNameNoExtension(t *testing.T) {
 	}
 }
 
+func TestMigrationService_Migrate_PathTraversalFilename(t *testing.T) {
+	// Service-level rejection: this fires before any subprocess, so no
+	// skipIfNoEdgeMigrate / skipIfNoClang needed. Guards against future
+	// refactors that try to remove the defense-in-depth check on the
+	// grounds that the handler already rejects.
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "../etc.c", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+	if len(store.artifacts) != 0 {
+		t.Errorf("expected 0 artifacts stored, got: %d", len(store.artifacts))
+	}
+}
+
+func TestMigrationService_Migrate_EmptyFilename(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for empty filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+}
+
 func TestDetectTransformedPatterns(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -280,5 +315,60 @@ func TestValidateWasm(t *testing.T) {
 				t.Errorf("ValidateWasm() = %v, want %v", got, tt.valid)
 			}
 		})
+	}
+}
+
+func TestSanitizeAppName_StripsDotC(t *testing.T) {
+	got, err := sanitizeAppName("hello.c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_NoExtension(t *testing.T) {
+	got, err := sanitizeAppName("hello")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_Empty(t *testing.T) {
+	_, err := sanitizeAppName(".c")
+	if err == nil {
+		t.Fatal("expected error for empty derived app name")
+	}
+}
+
+func TestSanitizeAppName_PathTraversal(t *testing.T) {
+	_, err := sanitizeAppName("../etc.c")
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+}
+
+func TestSanitizeAppName_AbsolutePath(t *testing.T) {
+	_, err := sanitizeAppName("/etc/passwd.c")
+	if err == nil {
+		t.Fatal("expected error for absolute-path filename")
+	}
+}
+
+func TestSanitizeAppName_Backslash(t *testing.T) {
+	_, err := sanitizeAppName(`foo\bar.c`)
+	if err == nil {
+		t.Fatal("expected error for backslash filename")
+	}
+}
+
+func TestSanitizeAppName_EmptyString(t *testing.T) {
+	_, err := sanitizeAppName("")
+	if err == nil {
+		t.Fatal("expected error for empty filename")
 	}
 }
