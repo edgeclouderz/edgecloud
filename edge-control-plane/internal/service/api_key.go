@@ -60,16 +60,37 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role s
 		return nil, "", fmt.Errorf("invalid role: %s", role)
 	}
 
-	// Generate a 32-byte random key, hex-encoded for transport (64 chars).
+	rawKey, apiKey, err := mintAPIKey(tenantID, name, role)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := s.apiKeyRepo.Create(ctx, apiKey); err != nil {
+		return nil, "", fmt.Errorf("creating api key: %w", err)
+	}
+
+	return apiKey, rawKey, nil
+}
+
+// mintAPIKey generates a 32-byte random key, hashes it with argon2id, and
+// returns both the raw key (shown to the caller exactly once) and a fully
+// populated *domain.APIKey ready to persist. Shared by CreateAPIKey and
+// BootstrapTenant so both code paths produce identical APIKey structures.
+//
+// Caller responsibilities:
+//   - validate the role before calling (CreateAPIKey does this; BootstrapTenant
+//     passes the trusted RoleOwner constant);
+//   - call apiKeyRepo.Create(ctx, apiKey) within the same transaction.
+func mintAPIKey(tenantID, name, role string) (string, *domain.APIKey, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
-		return nil, "", fmt.Errorf("generating key: %w", err)
+		return "", nil, fmt.Errorf("generating key: %w", err)
 	}
 	rawKey := hex.EncodeToString(raw)
 
 	keyHash, err := HashAPIKey(rawKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("hashing key: %w", err)
+		return "", nil, fmt.Errorf("hashing key: %w", err)
 	}
 
 	// lookupHash is the stable SHA-256 hex of the raw key. AuthenticateRawKey
@@ -88,12 +109,7 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID, name, role s
 		Role:          role,
 		HashAlgorithm: domain.HashAlgorithmArgon2ID,
 	}
-
-	if err := s.apiKeyRepo.Create(ctx, apiKey); err != nil {
-		return nil, "", fmt.Errorf("creating api key: %w", err)
-	}
-
-	return apiKey, rawKey, nil
+	return rawKey, apiKey, nil
 }
 
 func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
