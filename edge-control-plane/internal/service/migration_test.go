@@ -272,28 +272,44 @@ func TestMigrationService_Migrate_EmptyFilename(t *testing.T) {
 	}
 }
 
-func TestDetectTransformedPatterns(t *testing.T) {
-	tests := []struct {
-		name     string
-		wasiC    string
-		expected int // minimum number of patterns we expect to detect
-	}{
-		{"socket only", `wasi_socket_tcp_create`, 1},
-		{"full pipeline", `#include <wasi/sockets.h>
-wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4);
-wasi_socket_tcp_start_bind(fd, addr);
-wasi_socket_tcp_start_listen(fd, 128);
-wasi_socket_tcp_accept(fd);`, 4},
-		{"empty", ``, 0},
+func TestMigrationService_Migrate_PopulatesPatternsDetected(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	// posixHTTPSource has socket + bind + listen + accept — all transformable
+	// (Accept is "best-effort"; the rest are "auto-transformable").
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			patterns := detectTransformedPatterns(tt.wasiC)
-			if len(patterns) < tt.expected {
-				t.Errorf("detectTransformedPatterns() returned %d patterns, want at least %d", len(patterns), tt.expected)
-			}
-		})
+	// Bug #3: PatternsDetected was always empty in API responses. With
+	// --format json, the report now carries the lib's classification.
+	if len(report.PatternsDetected) == 0 {
+		t.Error("expected PatternsDetected to be non-empty for a source with POSIX patterns")
+	}
+	if len(report.PatternsTransformed) == 0 {
+		t.Error("expected PatternsTransformed to be non-empty for an auto-transformable source")
+	}
+
+	// Line numbers should be populated, not the fabricated 0s from before.
+	for _, p := range report.PatternsDetected {
+		if p.Line == 0 {
+			t.Errorf("expected non-zero line on detected pattern: %+v", p)
+		}
+		if p.Transformability == "" {
+			t.Errorf("expected non-empty transformability on detected pattern: %+v", p)
+		}
+	}
+
+	// The struct field name is PatternsManualReview; for this source there
+	// are no untransformable patterns.
+	if len(report.PatternsManualReview) != 0 {
+		t.Errorf("expected no manual-review patterns for an all-transformable source, got: %d", len(report.PatternsManualReview))
 	}
 }
 
