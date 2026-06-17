@@ -267,4 +267,144 @@ mod tests {
         let decoded = decode_hex_32(&encoded_32).expect("decode");
         assert_eq!(decoded.to_vec(), data[..32]);
     }
+
+    // -----------------------------------------------------------------------
+    // get_artifact cache-path tests (no Docker needed — run in CI).
+    //
+    // Use wiremock + tempfile to drive Downloader::get_artifact through its
+    // cache fast-path, cache-invalidation-then-redownload path, and the
+    // download-failure path.
+    // -----------------------------------------------------------------------
+
+    /// Cache hit: a pre-populated cache file whose bytes match the expected
+    /// hash must be returned without contacting the control plane.
+    #[tokio::test]
+    async fn get_artifact_cached_file_verifies_and_returns_bytes() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        // No mock mounted — any request to the server fails this test.
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+
+        let bytes: Vec<u8> = b"some test bytes".to_vec();
+        let hash = sha256_hex(&bytes);
+        tokio::fs::write(cache_dir.join("d_unit_cache_hit.wasm"), &bytes)
+            .await
+            .expect("pre-populate cache");
+
+        let result = downloader
+            .get_artifact("d_unit_cache_hit", &hash)
+            .await
+            .expect("cache hit must succeed");
+        assert_eq!(result.as_ref(), bytes.as_slice());
+
+        let received = server.received_requests().await.expect("received");
+        assert!(
+            received.is_empty(),
+            "expected zero requests on cache hit, got {}",
+            received.len()
+        );
+    }
+
+    /// Tampered cache: the cache file's bytes do NOT match the expected hash.
+    /// The downloader must invalidate the cache, re-download from the control
+    /// plane, verify, and write the verified bytes back to the cache.
+    #[tokio::test]
+    async fn get_artifact_cached_file_hash_mismatch_invalidates_and_redownloads() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let good_bytes: Vec<u8> = b"the real artifact".to_vec();
+        let good_hash = sha256_hex(&good_bytes);
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_unit_redownload"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(good_bytes.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+
+        // Pre-populate the cache with content that won't match the expected hash.
+        tokio::fs::write(cache_dir.join("d_unit_redownload.wasm"), b"tampered bytes")
+            .await
+            .expect("pre-populate tampered cache");
+
+        let result = downloader
+            .get_artifact("d_unit_redownload", &good_hash)
+            .await
+            .expect("re-downloaded bytes must verify and return");
+        assert_eq!(result.as_ref(), good_bytes.as_slice());
+
+        // The cache file should now contain the verified good bytes.
+        let on_disk = tokio::fs::read(cache_dir.join("d_unit_redownload.wasm"))
+            .await
+            .expect("read cache after re-download");
+        assert_eq!(
+            on_disk, good_bytes,
+            "cache file must be rewritten with verified bytes"
+        );
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            1,
+            "expected exactly one download request after cache invalidation"
+        );
+    }
+
+    /// Network error after cache invalidation: a tampered cache triggers
+    /// invalidation, the subsequent download fails with HTTP 500, and the
+    /// error propagates. The failed download must NOT recreate the cache file.
+    #[tokio::test]
+    async fn get_artifact_download_failure_propagates_error() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_unit_500"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+
+        // Pre-populate the cache with tampered bytes so the cache fast-path
+        // is exercised, then invalidated, forcing the download path.
+        let cache_path = cache_dir.join("d_unit_500.wasm");
+        tokio::fs::write(&cache_path, b"tampered bytes")
+            .await
+            .expect("pre-populate tampered cache");
+
+        // The hash the caller is asking for doesn't match the cache (and
+        // wouldn't match a 500 body either). Use the real-hash of any
+        // non-tampered bytes — the result is the same: the download fails.
+        let hash = sha256_hex(b"any bytes");
+
+        let err = downloader
+            .get_artifact("d_unit_500", &hash)
+            .await
+            .expect_err("500 from server must propagate as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP error") || msg.contains("500"),
+            "expected HTTP error in message, got: {msg}"
+        );
+
+        assert!(
+            !cache_path.exists(),
+            "cache file should not be recreated on download failure"
+        );
+    }
 }
