@@ -275,6 +275,7 @@ impl HttpServer {
                                                             err = %e,
                                                             "TLS handshake failed",
                                                         );
+                                                        drop(permit); // release connection slot before returning
                                                         return;
                                                     }
                                                 }
