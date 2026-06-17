@@ -282,3 +282,51 @@ func TestValidateWasm(t *testing.T) {
 		})
 	}
 }
+
+func TestSanitizeAppName_StripsDotC(t *testing.T) {
+	got, err := sanitizeAppName("hello.c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_NoExtension(t *testing.T) {
+	got, err := sanitizeAppName("hello")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_Empty(t *testing.T) {
+	_, err := sanitizeAppName(".c")
+	if err == nil {
+		t.Fatal("expected error for empty derived app name")
+	}
+}
+
+func TestSanitizeAppName_PathTraversal(t *testing.T) {
+	_, err := sanitizeAppName("../etc.c")
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+}
+
+func TestSanitizeAppName_AbsolutePath(t *testing.T) {
+	_, err := sanitizeAppName("/etc/passwd.c")
+	if err == nil {
+		t.Fatal("expected error for absolute-path filename")
+	}
+}
+
+func TestSanitizeAppName_Backslash(t *testing.T) {
+	_, err := sanitizeAppName(`foo\bar.c`)
+	if err == nil {
+		t.Fatal("expected error for backslash filename")
+	}
+}
