@@ -296,14 +296,42 @@ func TestMigrationService_Migrate_PopulatesPatternsDetected(t *testing.T) {
 		t.Error("expected PatternsTransformed to be non-empty for an auto-transformable source")
 	}
 
-	// Line numbers should be populated, not the fabricated 0s from before.
+	// Bug #3 regression guard: the wire form must be kebab-case, matching
+	// edge-migrate-lib's `Transformability::as_str`. A future drift (e.g.,
+	// someone switching back to Debug-serialized CamelCase) would otherwise
+	// pass a non-empty check silently — the API would just stop returning
+	// patterns the control plane can interpret.
 	for _, p := range report.PatternsDetected {
 		if p.Line == 0 {
 			t.Errorf("expected non-zero line on detected pattern: %+v", p)
 		}
-		if p.Transformability == "" {
-			t.Errorf("expected non-empty transformability on detected pattern: %+v", p)
+		switch p.Transformability {
+		case domain.TransformabilityAutoTransformable,
+			domain.TransformabilityBestEffort,
+			domain.TransformabilityNotTransformable:
+			// ok — one of the three documented kebab-case values
+		default:
+			t.Errorf("transformability must be one of the documented kebab-case values, got: %q (pattern: %s)", p.Transformability, p.Pattern)
 		}
+	}
+
+	// posixHTTPSource has socket + bind + listen + accept. The first three
+	// are auto-transformable; accept is best-effort (poll loop). Count the
+	// bins to catch a regression where, say, Accept is silently dropped.
+	var gotAuto, gotBest int
+	for _, p := range report.PatternsDetected {
+		switch p.Transformability {
+		case domain.TransformabilityAutoTransformable:
+			gotAuto++
+		case domain.TransformabilityBestEffort:
+			gotBest++
+		}
+	}
+	if gotAuto < 3 {
+		t.Errorf("expected at least 3 auto-transformable patterns (socket/bind/listen), got: %d", gotAuto)
+	}
+	if gotBest < 1 {
+		t.Errorf("expected at least 1 best-effort pattern (accept), got: %d", gotBest)
 	}
 
 	// The struct field name is PatternsManualReview; for this source there
