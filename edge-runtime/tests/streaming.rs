@@ -300,3 +300,70 @@ async fn test_inbound_body_below_threshold_is_buffered() {
         other => panic!("expected BodySource::Buffered, got {:?}", other),
     }
 }
+
+/// Regression for F1 streaming path: Content-Length: N with body shorter
+/// than N should deliver an `Err(IO("truncated body: ..."))` chunk to the
+/// guest via the IncomingStream before the stream closes. The buffered
+/// path is covered by a unit test against `read_body_inline` directly in
+/// the `http_server::tests` module.
+#[tokio::test]
+async fn test_truncated_body_streaming_path_returns_error() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_stream_threshold(4) // force streaming path
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        100
+    );
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(request.as_bytes())
+        .await
+        .expect("write head");
+    sock.write_all(b"only-fifty").await.expect("write body");
+    sock.shutdown().await.expect("shutdown");
+
+    let req = tokio::time::timeout(std::time::Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!("expected BodySource::Streamed, got {:?}", other),
+    };
+
+    // Read chunks until we see the truncation error or EOF.
+    let mut saw_error = false;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(chunk) if chunk.starts_with(b"only-fifty") => continue,
+            Ok(chunk) => panic!("unexpected chunk: {:?}", chunk),
+            Err(StreamError::Io(msg)) => {
+                assert!(
+                    msg.contains("truncated body"),
+                    "expected truncation error, got {:?}",
+                    msg
+                );
+                saw_error = true;
+                break;
+            }
+            Err(StreamError::Closed) => break,
+            Err(StreamError::Cancelled) => break,
+        }
+    }
+    assert!(saw_error, "expected a truncation error chunk");
+}
