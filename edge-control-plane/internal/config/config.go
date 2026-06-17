@@ -8,6 +8,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// insecureJWTSecretValues are placeholder secrets that must never be accepted
+// in production. They are checked case-sensitively after env-var overrides.
+var insecureJWTSecretValues = map[string]struct{}{
+	"":                          {},
+	"change-me-in-production":   {},
+	"change-me":                 {},
+	"secret":                    {},
+	"changeme":                  {},
+}
+
 // Config holds all application configuration.
 type Config struct {
 	Database DatabaseConfig `yaml:"database"`
@@ -128,6 +138,15 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.JWT.TTL == 0 {
 		cfg.JWT.TTL = 24
+	}
+
+	// Validate JWT secret: refuse to start with a placeholder or weak secret.
+	// Operators must set JWT_SECRET (preferred) or jwt.secret in config.yaml.
+	if _, insecure := insecureJWTSecretValues[cfg.JWT.Secret]; insecure {
+		return nil, fmt.Errorf("jwt.secret must be set via JWT_SECRET env var or config.yaml; placeholder values are not accepted")
+	}
+	if len(cfg.JWT.Secret) < 32 {
+		return nil, fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(cfg.JWT.Secret))
 	}
 
 	return &cfg, nil

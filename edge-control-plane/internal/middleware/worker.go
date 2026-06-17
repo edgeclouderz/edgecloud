@@ -31,8 +31,12 @@ const (
 )
 
 // VerifyWorkerJWT parses and validates a HMAC-SHA256 JWT.
+//
+// Tokens must carry an `exp` claim (enforced via jwt.WithExpirationRequired()).
+// Tokens without one are rejected to prevent replay of long-lived bearer tokens.
 func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
+	parser := jwt.NewParser(jwt.WithExpirationRequired())
+	token, err := parser.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
@@ -44,6 +48,11 @@ func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, er
 	claims, ok := token.Claims.(*WorkerClaims)
 	if !ok || !token.Valid {
 		return nil, errors.New("invalid claims")
+	}
+	// Belt-and-suspenders: parser may have validated expiry, but be explicit so the
+	// behavior is obvious from this function alone.
+	if claims.ExpiresAt == nil {
+		return nil, errors.New("token missing exp claim")
 	}
 	if cfg.Issuer != "" && claims.Issuer != cfg.Issuer {
 		return nil, fmt.Errorf("invalid issuer: %s", claims.Issuer)

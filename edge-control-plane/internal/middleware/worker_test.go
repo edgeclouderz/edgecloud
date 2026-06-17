@@ -13,7 +13,7 @@ func TestVerifyWorkerJWT_Valid(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -42,7 +42,7 @@ func TestVerifyWorkerJWT_Expired(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-1 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -58,11 +58,33 @@ func TestVerifyWorkerJWT_Expired(t *testing.T) {
 	}
 }
 
+func TestVerifyWorkerJWT_NoExpiresAt(t *testing.T) {
+	// Tokens without an exp claim must be rejected. This closes the gap where
+	// the parser previously accepted tokens with no expiry at all.
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer: "edgecloud",
+			// no ExpiresAt
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for token with no exp claim, got nil")
+	}
+}
+
 func TestVerifyWorkerJWT_WrongSecret(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
@@ -98,7 +120,7 @@ func TestWorkerAuth_ValidToken(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	claims := &WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:   "edgecloud",
+			Issuer:    "edgecloud",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},
 		WorkerID: "w_fra_abc123",
