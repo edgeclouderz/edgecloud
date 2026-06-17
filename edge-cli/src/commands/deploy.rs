@@ -64,9 +64,8 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(app, state.as_ref())?;
 
-    let edge_toml = EdgeToml::from_path(path).with_context(|| {
-        "edge deploy --id requires edge.toml with [deployment] api = \"<url>\""
-    })?;
+    let edge_toml = EdgeToml::from_path(path)
+        .with_context(|| "edge deploy --id requires edge.toml with [deployment] api = \"<url>\"")?;
     let base_url = edge_toml.deployment.api.clone();
 
     let client = ApiClient::new(base_url)?;
