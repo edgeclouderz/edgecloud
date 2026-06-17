@@ -12,9 +12,11 @@ use crate::edge::cloud::time::Host as TimeHost;
 use crate::interfaces::{
     cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
 };
+use crate::limits::new_memory_limits;
 use crate::metering::RequestMeter;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use wasmtime::StoreLimits;
 
 pub struct RuntimeState {
     pub http_client: http_client::HttpClient,
@@ -29,10 +31,13 @@ pub struct RuntimeState {
     /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
     /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
+    /// Per-store resource limits, attached to the wasmtime Store via
+    /// `create_store`. See `edge-runtime/src/limits.rs` for the configuration.
+    store_limits: StoreLimits,
 }
 
 impl RuntimeState {
-    pub fn new() -> Self {
+    pub fn new(max_memory_mb: u64) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         let dns_cache = networking.dns_cache();
@@ -50,11 +55,15 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
+            store_limits: new_memory_limits(max_memory_mb),
         }
     }
 
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
-    pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
+    pub fn with_env(
+        env: std::collections::HashMap<String, String>,
+        max_memory_mb: u64,
+    ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         let dns_cache = networking.dns_cache();
@@ -69,6 +78,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
+            store_limits: new_memory_limits(max_memory_mb),
         }
     }
 
@@ -76,6 +86,7 @@ impl RuntimeState {
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
+        max_memory_mb: u64,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
@@ -91,7 +102,14 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
             exit_code,
+            store_limits: new_memory_limits(max_memory_mb),
         }
+    }
+
+    /// Mutable accessor for the embedded store limits, used by `create_store`
+    /// to wire the limiter into the wasmtime Store. Kept private to the crate.
+    pub(crate) fn store_limits_mut(&mut self) -> &mut StoreLimits {
+        &mut self.store_limits
     }
 
     /// Attempt to create a persistent KvStore from `EDGE_KV_STORE_PATH`,
@@ -147,7 +165,9 @@ impl RuntimeState {
 
 impl Default for RuntimeState {
     fn default() -> Self {
-        Self::new()
+        // 256 MiB is a sensible interactive default. Production callers should
+        // use one of the explicit constructors and pass the per-app cap.
+        Self::new(256)
     }
 }
 
