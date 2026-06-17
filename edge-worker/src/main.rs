@@ -51,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
     let engine = edge_runtime::create_engine()?;
     tracing::info!("wasmtime engine created");
 
-    // Initialize shared state
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+    // Initialize shared state — clone the engine so the epoch ticker can use it
+    // later. WorkerState takes ownership of one reference.
+    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine.clone())));
 
     // Initialize downloader
     let downloader = Arc::new(Downloader::new(
@@ -74,6 +75,29 @@ async fn main() -> anyhow::Result<()> {
     // Create the shutdown broadcast channel for the heartbeat task.
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Start the epoch ticker task — calls engine.increment_epoch() on every
+    // tick. Combined with Store::set_epoch_deadline() in execute_app, this
+    // bounds the CPU time any single guest invocation can consume (issue #40).
+    let epoch_engine = engine.clone();
+    let epoch_tick_ms = config.epoch_tick_ms;
+    let mut epoch_shutdown_rx = shutdown_tx.subscribe();
+    let _epoch_task = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(epoch_tick_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = epoch_shutdown_rx.recv() => {
+                    tracing::info!("epoch ticker received shutdown signal, stopping");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    epoch_engine.increment_epoch();
+                }
+            }
+        }
+    });
 
     // Create the supervisor
     let supervisor = Arc::new(Supervisor {
@@ -186,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
 /// Perform graceful shutdown: signal the heartbeat to stop, stop all apps,
 /// publish a final heartbeat, then exit the process.
 async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
-    // Signal the heartbeat task to stop.
+    // Signal all broadcast subscribers (heartbeat, epoch ticker) to stop.
     let _ = shutdown_tx.send(());
 
     tracing::info!("graceful shutdown: stopping all apps");

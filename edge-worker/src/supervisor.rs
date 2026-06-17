@@ -152,6 +152,8 @@ impl Supervisor {
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
+        let max_memory_mb = self.config.max_memory_mb;
+        let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let handle = tokio::spawn(async move {
             Self::run_app_loop(
                 instance_pre_clone,
@@ -159,6 +161,8 @@ impl Supervisor {
                 env,
                 state_clone,
                 app_name_str.clone(),
+                max_memory_mb,
+                epoch_deadline_ticks,
                 shutdown_rx,
             )
             .await;
@@ -254,6 +258,8 @@ impl Supervisor {
         env: HashMap<String, String>,
         state: Arc<RwLock<WorkerState>>,
         app_name: String,
+        max_memory_mb: u64,
+        epoch_deadline_ticks: u64,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         let mut restart_count = 0u32;
@@ -270,7 +276,7 @@ impl Supervisor {
                 }
 
                 // Run the component
-                result = Self::execute_app(&instance_pre, &meter, env.clone()) => {
+                result = Self::execute_app(&instance_pre, &meter, env.clone(), max_memory_mb, epoch_deadline_ticks) => {
                     match result {
                         Ok(true) => {
                             // Component wants to keep running (blocking call returned normally).
@@ -328,20 +334,29 @@ impl Supervisor {
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
         env: HashMap<String, String>,
+        max_memory_mb: u64,
+        epoch_deadline_ticks: u64,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
-        // Create a fresh RuntimeState with per-app env vars and metering for tenant isolation.
-        let runtime_state =
-            edge_runtime::RuntimeState::with_env_and_meter(env, Some(Arc::clone(meter)));
+        // Create a fresh RuntimeState with per-app env vars, the request meter,
+        // and a memory cap embedded in the StoreLimits.
+        let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
+            env,
+            Some(Arc::clone(meter)),
+            max_memory_mb,
+        );
 
-        // Create a store with per-invocation state
-        let mut store = edge_runtime::create_store(engine, 256, runtime_state);
+        // Create a store with per-invocation state. create_store attaches the
+        // StoreLimits carried inside RuntimeState, so wasmtime will trap any
+        // memory.grow that would exceed the cap.
+        let mut store = edge_runtime::create_store(engine, max_memory_mb, runtime_state);
 
-        // Memory limits are enforced via cgroups in production.
-        // The wasmtime Store::limiter API (new_memory_limits) requires a ResourceLimiter
-        // bound to the RuntimeState lifetime, which needs careful integration.
-        // TODO: wire up Store::limiter with proper lifetime handling.
+        // Bound CPU time per call via epoch interruption. The worker spawns
+        // an epoch ticker that calls engine.increment_epoch() every
+        // epoch_tick_ms; this call sets a deadline N ticks ahead. Combined
+        // they guarantee that a runaway guest is trapped after ~N*tick_ms.
+        store.set_epoch_deadline(epoch_deadline_ticks);
 
         // Instantiate
         let instance = instance_pre.instantiate(&mut store)?;
