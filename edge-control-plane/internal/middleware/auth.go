@@ -99,3 +99,8 @@ func GetTenantID(ctx context.Context) string {
 	}
 	return ""
 }
+
+// WithTenantID returns a new context with tenant ID set. Used for testing.
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, TenantIDKey, tenantID)
+}
