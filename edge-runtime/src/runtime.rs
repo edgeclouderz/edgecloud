@@ -155,6 +155,7 @@ impl HttpClientHost for RuntimeState {
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let body = req.body.as_deref();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
+        let tracestate = req.trace_context.as_ref().and_then(|tc| tc.tracestate.as_deref());
         let rt = tokio::runtime::Handle::current();
         let resp = rt.block_on(self.http_client.fetch(
             method,
@@ -163,6 +164,7 @@ impl HttpClientHost for RuntimeState {
             body,
             req.timeout_ms,
             trace_context,
+            tracestate,
         ));
         Some(Response {
             status: resp.status,

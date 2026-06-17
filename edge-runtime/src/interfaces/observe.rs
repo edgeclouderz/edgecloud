@@ -13,6 +13,13 @@ type MetricLabels = Vec<(String, String)>;
 /// Guard that ensures the global metrics recorder is set exactly once.
 static RECORDER_GUARD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+/// Metrics exporter backed by a no-op recorder.
+///
+/// This is **intentional for now**: metrics are accumulated in local storage
+/// (visible to tests and logging) but not exported to a real backend (Prometheus,
+/// DataDog, etc.). Production deployments must replace the global recorder by
+/// calling `metrics::set_global_recorder` with a real exporter before instantiating
+/// this type.
 #[derive(Default)]
 pub struct Observer {
     /// Local counters for observability — mirrors what the global registry records.
@@ -23,10 +30,21 @@ pub struct Observer {
 }
 
 impl Observer {
+    /// Creates a new `Observer` and (once per process) installs a no-op global
+    /// metrics recorder.
+    ///
+    /// # Noop by Design
+    ///
+    /// `metrics::counter!`, `metrics::gauge!`, and `metrics::histogram!` macros
+    /// are no-ops until a real exporter is installed via
+    /// `metrics::set_global_recorder`. This struct also stores all increments /
+    /// recordings locally so unit tests can inspect them without a real backend.
+    ///
+    /// To enable production metrics: call `metrics::set_global_recorder` with a
+    /// suitable exporter (e.g. `metrics_exporter::Prometheus`) **before** constructing
+    /// the first `Observer`.
     pub fn new() -> Self {
         // Set a no-op global recorder on first construction.
-        // A real exporter (Prometheus, DataDog, etc.) replaces this in production.
-        // Until then, metrics::counter/gauge/histogram macros are no-ops.
         let _ = RECORDER_GUARD.get_or_init(|| {
             metrics::set_global_recorder(&NoopRecorder)
                 .expect("failed to set global metrics recorder");

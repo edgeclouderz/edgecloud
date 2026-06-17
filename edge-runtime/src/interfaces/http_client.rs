@@ -67,6 +67,7 @@ impl HttpClient {
     ///
     /// The retry loop runs in `spawn_blocking` to avoid blocking the tokio executor
     /// thread during backoff sleeps.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch(
         &self,
         method: &str,
@@ -75,6 +76,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         timeout_ms: Option<u64>,
         traceparent: Option<&str>,
+        tracestate: Option<&str>,
     ) -> HttpResponse {
         let max_retries = DEFAULT_MAX_RETRIES;
         let base_delay = Duration::from_millis(DEFAULT_BASE_DELAY_MS);
@@ -86,6 +88,7 @@ impl HttpClient {
         let headers = headers.to_vec();
         let body = body.map(|b| b.to_vec());
         let traceparent = traceparent.map(|s| s.to_string());
+        let tracestate = tracestate.map(|s| s.to_string());
 
         // Run the blocking retry loop on a dedicated thread so std::thread::sleep
         // during backoff does not block the tokio executor thread.
@@ -101,6 +104,7 @@ impl HttpClient {
                     body.as_deref(),
                     timeout,
                     traceparent.as_deref(),
+                    tracestate.as_deref(),
                 );
 
                 match result {
@@ -141,6 +145,7 @@ impl HttpClient {
     /// Non-blocking implementation of a single HTTP request.
     /// Client and dns_cache are passed explicitly so this can be called from
     /// inside spawn_blocking without a Self reference.
+    #[allow(clippy::too_many_arguments)]
     fn fetch_once_impl(
         client: &reqwest::blocking::Client,
         method: &str,
@@ -149,6 +154,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         timeout: Duration,
         traceparent: Option<&str>,
+        tracestate: Option<&str>,
     ) -> Result<HttpResponse, FetchError> {
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| FetchError {
             message: format!("invalid method: {}", e),
@@ -165,6 +171,13 @@ impl HttpClient {
         if let Some(tp) = traceparent {
             if is_valid_traceparent(tp) {
                 req = req.header("traceparent", tp);
+            }
+        }
+
+        // Inject tracestate header for distributed tracing, if present.
+        if let Some(ts) = tracestate {
+            if !ts.is_empty() {
+                req = req.header("tracestate", ts);
             }
         }
 
@@ -318,7 +331,7 @@ mod tests {
         let client = HttpClient::new();
         // Unreachable address — should fail fast without hanging.
         let resp = client
-            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None)
+            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None, None)
             .await;
         assert!(
             resp.error.is_some(),
@@ -333,7 +346,7 @@ mod tests {
         // Unreachable address with a very short timeout.
         // Should return a timeout- or connection-related error.
         let resp = client
-            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(1), None)
+            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(1), None, None)
             .await;
         let err_msg = resp.error.unwrap_or_default();
         // Any error is acceptable here — just verify error field is populated.
@@ -352,6 +365,7 @@ mod tests {
                 &[],
                 None,
                 Some(5000),
+                None,
                 None,
             )
             .await;
@@ -378,6 +392,7 @@ mod tests {
                 None,
                 Some(100),
                 Some(traceparent),
+                None,
             )
             .await;
         assert!(resp.error.is_some(), "error field should be populated");

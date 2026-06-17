@@ -52,6 +52,10 @@ impl DnsCache {
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.block_on(self.resolve_async(hostname))
         } else {
+            tracing::warn!(
+                hostname = hostname,
+                "DNS resolution skipped: no Tokio runtime active; returning empty list"
+            );
             Err("no Tokio runtime active".into())
         }
     }
