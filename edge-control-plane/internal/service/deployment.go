@@ -73,6 +73,23 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("invalid app name")
 	}
 
+	// Read artifact and compute hash (bounded to prevent memory exhaustion).
+	// Done before any DB write so we can fail fast on invalid input.
+	data, err := io.ReadAll(io.LimitReader(r, MaxArtifactSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading artifact: %w", err)
+	}
+	if int64(len(data)) > MaxArtifactSize {
+		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
+	}
+
+	// Reject anything that isn't a WebAssembly module before touching storage
+	// or the database. This closes the gap where non-wasm files filled disk
+	// and crashed workers downstream.
+	if err := ValidateWasmModule(data); err != nil {
+		return nil, fmt.Errorf("artifact rejected: %w", err)
+	}
+
 	// Auto-create the app record if it doesn't already exist (backward compatible).
 	if s.appSvc != nil {
 		if err := s.appSvc.CreateIfNotExists(ctx, tenantID, appName); err != nil {
@@ -94,14 +111,6 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("max deployments (%d) reached", quota.MaxDeployments)
 	}
 
-	// Read artifact and compute hash (bounded to prevent memory exhaustion)
-	data, err := io.ReadAll(io.LimitReader(r, MaxArtifactSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading artifact: %w", err)
-	}
-	if int64(len(data)) > MaxArtifactSize {
-		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
-	}
 	hash := sha256.Sum256(data)
 
 	deployment := &domain.Deployment{
