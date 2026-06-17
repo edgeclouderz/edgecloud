@@ -53,9 +53,9 @@ func main() {
 	artifactStore := storage.NewArtifactStore(cfg.Storage.ArtifactPath)
 
 	// Initialize services
-	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo)
+	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo)
+	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore)
 	deploymentSvc := service.NewDeploymentService(
 		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
 	)
@@ -86,7 +86,8 @@ func main() {
 	})
 
 	// Public endpoints (no auth required)
-	mux.HandleFunc("POST /api/keys", apiKeyHandler.Create) // Create API key (would need tenant creation first)
+	mux.HandleFunc("POST /api/tenants", tenantHandler.Bootstrap) // Self-signup: create tenant + first API key
+	mux.HandleFunc("POST /api/keys", apiKeyHandler.Create)       // Create API key (would need tenant creation first)
 
 	// Protected API routes
 	api := http.NewServeMux()

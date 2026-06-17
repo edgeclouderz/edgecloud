@@ -8,6 +8,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
@@ -23,11 +24,12 @@ type appRepoInterface interface {
 
 // AppService handles app business logic.
 type AppService struct {
-	db         *sqlx.DB
-	appRepo    appRepoInterface
-	appEnvRepo *repository.AppEnvRepository
-	activeRepo *repository.ActiveDeploymentRepository
-	deployRepo *repository.DeploymentRepository
+	db            *sqlx.DB
+	appRepo       appRepoInterface
+	appEnvRepo    *repository.AppEnvRepository
+	activeRepo    *repository.ActiveDeploymentRepository
+	deployRepo    *repository.DeploymentRepository
+	artifactStore *storage.ArtifactStore
 }
 
 func NewAppService(
@@ -36,13 +38,15 @@ func NewAppService(
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
+	artifactStore *storage.ArtifactStore,
 ) *AppService {
 	return &AppService{
-		db:         db,
-		appRepo:    appRepo,
-		activeRepo: activeRepo,
-		appEnvRepo: appEnvRepo,
-		deployRepo: deploymentRepo,
+		db:            db,
+		appRepo:       appRepo,
+		activeRepo:    activeRepo,
+		appEnvRepo:    appEnvRepo,
+		deployRepo:    deploymentRepo,
+		artifactStore: artifactStore,
 	}
 }
 
@@ -100,6 +104,22 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		return ErrAppNotFound
 	}
 
+	// Delete artifact files before cascade — os.Remove is idempotent (no error if absent).
+	// Collect errors so caller knows if cleanup failed.
+	var delErr error
+	if s.artifactStore != nil {
+		deployments, err := s.deployRepo.ListByApp(ctx, tenantID, appName)
+		if err != nil {
+			log.Printf("warning: failed to list deployments for artifact cleanup: %v", err)
+		} else {
+			for _, d := range deployments {
+				if err := s.artifactStore.Delete(tenantID, appName, d.ID); err != nil {
+					delErr = fmt.Errorf("artifact cleanup failed for %s: %w", d.ID, err)
+				}
+			}
+		}
+	}
+
 	// Cascade deletes run in a transaction so they either all succeed or all fail.
 	err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		appEnvRepo := s.appEnvRepo.WithTx(tx)
@@ -121,6 +141,10 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		// Log but don't fail — app row already deleted above.
 		// In production, consider a background reconciler to clean orphaned rows.
 		log.Printf("warning: cascade delete partially failed after app deletion: %v", err)
+	}
+	// Surface artifact deletion errors to the caller. DB deletion has already committed.
+	if delErr != nil {
+		return delErr
 	}
 	return nil
 }

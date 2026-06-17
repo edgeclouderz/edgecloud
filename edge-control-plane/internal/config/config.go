@@ -41,11 +41,6 @@ type StorageConfig struct {
 	ArtifactPath string `yaml:"artifact_path"`
 }
 
-type MigrationConfig struct {
-	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
-	WasiSdkPath     string `yaml:"wasi_sdk_path" env:"WASI_SDK_PATH" envDefault:"/usr/local/wasi-sdk/bin"`
-}
-
 type JWTConfig struct {
 	Secret string `yaml:"secret"`
 	TTL    int    `yaml:"ttl_hours"`
@@ -127,6 +122,8 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
 	}
+
+	// Override with migration config env vars
 	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
 		cfg.Migration.EdgeMigratePath = v
 	}
@@ -143,4 +140,10 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// MigrationConfig holds paths to migration toolchain binaries.
+type MigrationConfig struct {
+	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
+	WasiSdkPath     string `yaml:"wasi_sdk_path"     env:"WASI_SDK_PATH"     envDefault:"/usr/local/wasi-sdk/bin"`
 }

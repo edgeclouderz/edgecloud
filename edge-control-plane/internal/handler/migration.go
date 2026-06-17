@@ -10,57 +10,70 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
+// MigrationHandler handles migration requests.
 type MigrationHandler struct {
 	migrationSvc *service.MigrationService
 }
 
+// NewMigrationHandler creates a MigrationHandler.
 func NewMigrationHandler(migrationSvc *service.MigrationService) *MigrationHandler {
 	return &MigrationHandler{migrationSvc: migrationSvc}
 }
 
+// Migrate handles POST /api/migrate — accepts a C source file, transforms it,
+// and returns a MigrationReport.
 func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
+	if tenantID == "" {
+		http.Error(w, `{"error":"missing tenant ID"}`, http.StatusUnauthorized)
+		return
+	}
 
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		http.Error(w, `{"error": "failed to parse multipart form"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"failed to parse multipart form"}`, http.StatusBadRequest)
 		return
 	}
 
-	filenameParts := r.MultipartForm.Value["filename"]
-	languageParts := r.MultipartForm.Value["language"]
-	if len(filenameParts) == 0 || len(languageParts) == 0 {
-		http.Error(w, `{"error": "missing filename or language field"}`, http.StatusBadRequest)
+	filename := r.MultipartForm.Value["filename"]
+	if len(filename) == 0 || filename[0] == "" {
+		http.Error(w, `{"error":"missing filename field"}`, http.StatusBadRequest)
 		return
 	}
-	filename := filenameParts[0]
-	language := languageParts[0]
+
+	language := r.MultipartForm.Value["language"]
+	if len(language) == 0 || language[0] != "c" {
+		http.Error(w, `{"error":"only C language is supported"}`, http.StatusBadRequest)
+		return
+	}
 
 	fileParts := r.MultipartForm.File["file"]
 	if len(fileParts) == 0 {
-		http.Error(w, `{"error": "missing file field"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"missing file field"}`, http.StatusBadRequest)
 		return
 	}
 
 	srcFile, err := fileParts[0].Open()
 	if err != nil {
-		http.Error(w, `{"error": "failed to open file"}`, http.StatusBadRequest)
+		http.Error(w, `{"error": "failed to open file"}`, http.StatusInternalServerError)
 		return
 	}
 	defer srcFile.Close()
 
 	source, err := io.ReadAll(srcFile)
 	if err != nil {
-		http.Error(w, `{"error": "failed to read file"}`, http.StatusBadRequest)
+		http.Error(w, `{"error": "failed to read file"}`, http.StatusInternalServerError)
 		return
 	}
 
-	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename, language, string(source))
+	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename[0], language[0], string(source))
 	if err != nil {
-		log.Printf("migration error for tenant=%s filename=%s: %v", tenantID, filename, err)
-		http.Error(w, `{"error": "migration failed"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(report)
+	if err := json.NewEncoder(w).Encode(report); err != nil {
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+	}
 }
