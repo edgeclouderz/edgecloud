@@ -74,7 +74,7 @@ func main() {
 	appHandler := handler.NewAppHandler(appSvc)
 
 	// Initialize middleware
-	authMiddleware := middleware.NewAuthMiddleware(apiKeyRepo)
+	authMiddleware := middleware.NewAuthMiddleware(apiKeySvc)
 
 	// Setup router
 	mux := http.NewServeMux()

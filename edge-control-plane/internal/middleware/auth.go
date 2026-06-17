@@ -2,22 +2,24 @@ package middleware
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"log"
+	"errors"
 	"net/http"
 	"strings"
 
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // AuthMiddleware validates API keys and injects tenant context.
+//
+// It delegates the actual verification to APIKeyService.AuthenticateRawKey,
+// which supports both argon2id (new keys) and legacy SHA-256 with lazy
+// rehash — see issue #36.
 type AuthMiddleware struct {
-	apiKeyRepo *repository.APIKeyRepository
+	apiKeySvc *service.APIKeyService
 }
 
-func NewAuthMiddleware(apiKeyRepo *repository.APIKeyRepository) *AuthMiddleware {
-	return &AuthMiddleware{apiKeyRepo: apiKeyRepo}
+func NewAuthMiddleware(apiKeySvc *service.APIKeyService) *AuthMiddleware {
+	return &AuthMiddleware{apiKeySvc: apiKeySvc}
 }
 
 // contextKey is a custom type for context keys to avoid collisions.
@@ -42,23 +44,14 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		rawKey := parts[1]
-		hash := sha256.Sum256([]byte(rawKey))
-		keyHash := hex.EncodeToString(hash[:])
-
-		apiKey, err := m.apiKeyRepo.GetByHash(r.Context(), keyHash)
+		apiKey, err := m.apiKeySvc.AuthenticateRawKey(r.Context(), parts[1])
 		if err != nil {
+			if errors.Is(err, service.ErrInvalidAPIKey) {
+				http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
+				return
+			}
 			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 			return
-		}
-		if apiKey == nil {
-			http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
-			return
-		}
-
-		// Update last used
-		if err := m.apiKeyRepo.UpdateLastUsed(r.Context(), apiKey.ID); err != nil {
-			log.Printf("warning: failed to update last_used for api key %s: %v", apiKey.ID, err)
 		}
 
 		// Inject into context
