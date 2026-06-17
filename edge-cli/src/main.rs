@@ -32,8 +32,16 @@ enum Command {
     /// Compile the project to WebAssembly.
     Build,
 
-    /// Upload the artifact to the edgeCloud control plane.
-    Deploy,
+    /// Upload the artifact to the edgeCloud control plane, or activate a stored one.
+    Deploy {
+        /// App name (used with --id; otherwise read from edge.toml).
+        #[arg(default_value = "")]
+        app: String,
+
+        /// Activate a previously-stored deployment by ID (e.g. from `edge migrate`).
+        #[arg(long, value_name = "deployment_id")]
+        id: Option<String>,
+    },
 
     /// Get deployment status.
     Status,
@@ -81,7 +89,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { name } => commands::init::run(&name),
         Command::Build => commands::build::run(&cli.path),
-        Command::Deploy => commands::deploy::run(&cli.path),
+        Command::Deploy { app, id } => commands::deploy::run(&cli.path, &app, id.as_deref()),
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
