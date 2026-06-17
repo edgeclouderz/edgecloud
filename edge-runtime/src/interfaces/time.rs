@@ -15,12 +15,28 @@ impl Clock {
             .as_nanos() as u64
     }
 
-    /// Sleep — delegates to the scheduling subsystem's thread pool so it does not
-    /// block the tokio main thread.
+    /// Sleep (async) — uses tokio::time::sleep so it does not block the tokio worker.
+    async fn sleep_async(&self, duration_ms: u64) -> Result<(), String> {
+        let duration = std::time::Duration::from_millis(duration_ms);
+        tokio::time::sleep(duration).await;
+        Ok(())
+    }
+
+    /// Sleep (sync shim) — uses tokio::time::sleep when a runtime is available,
+    /// and falls back to blocking std::thread::sleep otherwise.
+    /// This is called by the WIT-generated sync TimeHost trait in runtime.rs.
     pub fn sleep(&self, duration_ms: u64) -> Result<(), String> {
         let duration = std::time::Duration::from_millis(duration_ms);
-        std::thread::sleep(duration);
-        Ok(())
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => rt.block_on(self.sleep_async(duration_ms)),
+            Err(_) => {
+                // No tokio runtime available (e.g., plain unit test without #[tokio::test]).
+                // Fall back to blocking sleep — this is safe here since Clock::sleep is not
+                // called from the hot path of the tokio executor.
+                std::thread::sleep(duration);
+                Ok(())
+            }
+        }
     }
 
     pub fn resolution(&self) -> u64 {
