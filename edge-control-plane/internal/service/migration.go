@@ -157,7 +157,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
-		Status:    "migrated",
+		Status:    domain.StatusMigrated,
 		Hash:      hex.EncodeToString(hash[:]),
 		CreatedAt: time.Now(),
 	}

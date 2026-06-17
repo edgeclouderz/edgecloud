@@ -106,7 +106,7 @@ func TestMigrationService_Migrate_Success(t *testing.T) {
 	if len(repo.deployments) != 1 {
 		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
 	}
-	if repo.deployments[0].Status != "migrated" {
+	if repo.deployments[0].Status != domain.StatusMigrated {
 		t.Errorf("expected deployment status=migrated, got: %s", repo.deployments[0].Status)
 	}
 	if len(store.artifacts) != 1 {
