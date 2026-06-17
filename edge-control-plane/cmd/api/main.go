@@ -185,6 +185,13 @@ func main() {
 		}
 	}()
 
+	// Start log retention GC. Tunable via env (LOG_GC_INTERVAL, LOG_RETENTION);
+	// defaults to a 1-hour sweep with 7-day retention.
+	logGC := service.NewLogGCService(logEntryRepo)
+	logGCInterval := parseDurationEnv("LOG_GC_INTERVAL", time.Hour)
+	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
+	go logGC.Run(context.Background(), logGCInterval, logRetention)
+
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -195,4 +202,20 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+// parseDurationEnv reads a duration-valued env var or returns the default.
+// On a malformed value it logs a warning and returns the default — the GC
+// service should never crash the control plane because of a typo.
+func parseDurationEnv(envName string, def time.Duration) time.Duration {
+	v := os.Getenv(envName)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Printf("%s=%q is not a valid duration; using default %s", envName, v, def)
+		return def
+	}
+	return d
 }
