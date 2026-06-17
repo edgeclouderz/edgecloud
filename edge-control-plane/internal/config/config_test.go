@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -52,6 +53,27 @@ func TestLoad_RejectsPlaceholderSecrets(t *testing.T) {
 	}
 }
 
+func TestLoad_RejectsEmptySecret(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	// A YAML block with jwt: but no secret at all (or an explicit empty
+	// string) must fail with a clear "not set" message — not be lumped
+	// in with the "known placeholder" category.
+	body := "jwt:\n  ttl_hours: 24\n  issuer: edgecloud\n"
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for missing jwt.secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "not set") {
+		t.Errorf("error %q should mention 'not set'", err.Error())
+	}
+	if strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error %q should NOT mention 'placeholder' for an empty secret", err.Error())
+	}
+}
+
 func TestLoad_RejectsShortSecret(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 
@@ -97,5 +119,37 @@ func TestLoad_EnvVarOverridesYAML(t *testing.T) {
 	}
 	if cfg.JWT.Secret != envSecret {
 		t.Errorf("JWT.Secret = %q, want env value %q", cfg.JWT.Secret, envSecret)
+	}
+}
+
+// TestBundledConfig_FailsStartup is a regression guard: the config.yaml
+// shipped at the repo root intentionally contains the `change-me-in-production`
+// placeholder. After the JWT-secret validation landed (Finding 5), a fresh
+// `cp config.yaml . && ./edge-control-plane` must refuse to boot rather than
+// silently use the placeholder. If this test starts passing (or stops finding
+// config.yaml), the validation or the file has drifted from intent.
+func TestBundledConfig_FailsStartup(t *testing.T) {
+	// Resolve the repo root from this test file's location: ../../
+	// relative to internal/config/config_test.go. Using runtime.Caller is
+	// robust against `go test` being invoked from any working directory.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Skip("runtime.Caller unavailable; cannot locate bundled config")
+	}
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	configPath := filepath.Join(repoRoot, "config.yaml")
+
+	if _, err := os.Stat(configPath); err != nil {
+		t.Skipf("bundled config.yaml not found at %s (run from repo root): %v", configPath, err)
+	}
+
+	t.Setenv("JWT_SECRET", "")
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatalf("Load(%s) succeeded; bundled config should be rejected due to placeholder jwt.secret", configPath)
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error %q should mention 'placeholder'", err.Error())
 	}
 }

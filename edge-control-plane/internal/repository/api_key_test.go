@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,34 @@ func newMockRepo(t *testing.T) (*APIKeyRepository, sqlmock.Sqlmock, func()) {
 	}
 	sqlxDB := sqlx.NewDb(mockDB, "postgres")
 	return &APIKeyRepository{db: sqlxDB}, mock, func() { _ = mockDB.Close() }
+}
+
+func TestAPIKeyRepository_Create_RejectsMissingHashAlgorithm(t *testing.T) {
+	repo, mock, cleanup := newMockRepo(t)
+	defer cleanup()
+
+	// No HashAlgorithm set — the repo must refuse to issue a query and
+	// surface a clear error rather than silently writing argon2id.
+	k := &domain.APIKey{
+		ID:         "k_abc",
+		TenantID:   "t_test",
+		Name:       "my-key",
+		KeyHash:    "anything",
+		LookupHash: "0xdeadbeef",
+		Role:       domain.RoleDeveloper,
+		CreatedAt:  time.Now(),
+	}
+
+	err := repo.Create(context.Background(), k)
+	if err == nil {
+		t.Fatal("expected error for missing HashAlgorithm, got nil")
+	}
+	if !strings.Contains(err.Error(), "HashAlgorithm") {
+		t.Errorf("error %q should name 'HashAlgorithm'", err.Error())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — should have been zero: %v", err)
+	}
 }
 
 func TestAPIKeyRepository_Create_IncludesLookupHash(t *testing.T) {

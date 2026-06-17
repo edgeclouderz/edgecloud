@@ -156,19 +156,28 @@ func Load(path string) (*Config, error) {
 //
 // The set is small and curated — adding entries requires a code review so
 // a typo doesn't accidentally invalidate a legitimate operator secret.
+//
+// An empty string is checked separately so operators get a clear "not set"
+// message rather than the misleading "is a known placeholder".
 var insecureJWTSecretValues = map[string]struct{}{
 	"change-me-in-production": {},
 	"changeme":                {},
 	"secret":                  {},
-	"":                        {},
 	"default":                 {},
 	"insecure":                {},
 }
 
-// validateJWTSecret enforces two rules: (1) the secret must not match a
-// known placeholder, and (2) it must be at least 32 bytes long. Both checks
-// are needed because a placeholder secret can be arbitrarily long.
+// validateJWTSecret enforces three rules in priority order:
+//  1. secret must be set (non-empty),
+//  2. secret must not match a known placeholder,
+//  3. secret must be at least 32 bytes long.
+//
+// Empty and placeholder checks are separate because the operator action
+// they imply is different (set the var vs. choose a unique value).
 func validateJWTSecret(s string) error {
+	if s == "" {
+		return fmt.Errorf("jwt.secret is not set; set JWT_SECRET or jwt.secret to a unique value")
+	}
 	if _, ok := insecureJWTSecretValues[s]; ok {
 		return fmt.Errorf("jwt.secret %q is a known placeholder; set JWT_SECRET or jwt.secret to a unique value", s)
 	}
