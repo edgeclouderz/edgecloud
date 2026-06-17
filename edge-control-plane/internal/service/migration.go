@@ -135,6 +135,24 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		return nil, fmt.Errorf("reading compiled wasm: %w", err)
 	}
 
+	// Reject clang output that isn't actually wasm. A misconfigured
+	// wasi-sdk or a non-wasm target will produce a file that passes the
+	// compiler but fails on the worker — surface that here so the
+	// migration report reflects a clear failure rather than silently
+	// storing a broken artifact.
+	if !validateWasm(wasmBytes) {
+		return &domain.MigrationReport{
+			Status:     domain.MigrationStatusFailed,
+			WasmStored: false,
+			AppName:    appName,
+			PatternsTransformed: patternsTransformed,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: "compiled output is not a valid wasm binary (missing magic bytes)",
+			}},
+		}, fmt.Errorf("compiled output is not a valid wasm binary")
+	}
+
 	// Generate deployment ID and hash
 	depID := "d_" + uuid.New().String()
 	hash := sha256.Sum256(wasmBytes)
