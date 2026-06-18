@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use edge_runtime::linker::create_component_linker;
 use edge_runtime::RequestMeter;
+use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
@@ -509,6 +510,88 @@ impl Supervisor {
         for app_name in &app_names {
             if let Err(e) = self.stop_app(app_name).await {
                 tracing::error!(app_name, err = %e, "failed to stop app during shutdown");
+            }
+        }
+    }
+
+    /// Run the JetStream task-consume loop until `shutdown_rx` fires.
+    ///
+    /// Subscribes to the queue-grouped consumer derived from
+    /// `config.queue_group` / `config.consumer_name`. Each delivered
+    /// `TaskMessage` is deserialized, passed to `handle_task_message`, and
+    /// ack'd on success. Failures are nack'd for redelivery; unparseable
+    /// (poison) messages are terminated so the consumer makes progress.
+    ///
+    /// The loop exits when `shutdown_rx` resolves. Any in-flight message
+    /// is finished first. Errors from the NATS layer are logged and the
+    /// loop returns — the caller decides whether to restart it.
+    pub async fn run_consume_loop(
+        &self,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        let mut stream = self
+            .nats
+            .subscribe_tasks(
+                &self.config.region,
+                &self.config.queue_group,
+                &self.config.consumer_name,
+            )
+            .await?;
+        tracing::info!(
+            region = %self.config.region,
+            queue_group = %self.config.queue_group,
+            consumer = %self.config.consumer_name,
+            "subscribed to task stream"
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("consume loop received shutdown signal");
+                    return Ok(());
+                }
+                msg = stream.next() => {
+                    let Some(msg) = msg else {
+                        // JetStream streams are durable and shouldn't end
+                        // on transient disconnects. If we get here, log
+                        // and exit so the caller can decide.
+                        tracing::warn!("task stream ended unexpectedly");
+                        return Ok(());
+                    };
+                    self.process_task_message(msg).await;
+                }
+            }
+        }
+    }
+
+    /// Process a single JetStream task message with ack/nack/term flow
+    /// control. Errors are logged, never propagated — a single bad
+    /// message must not tear down the consume loop.
+    async fn process_task_message(&self, msg: async_nats::jetstream::Message) {
+        let payload = msg.payload.clone();
+        let task_msg: TaskMessage = match serde_json::from_slice(&payload) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(err = %e, "poison-pill task message, terminating");
+                if let Err(e) = self.nats.term(&msg).await {
+                    tracing::error!(err = %e, "term() failed for poison message");
+                }
+                return;
+            }
+        };
+
+        match self.handle_task_message(task_msg).await {
+            Ok(()) => {
+                if let Err(e) = self.nats.ack(&msg).await {
+                    tracing::error!(err = %e, "ack() failed — server will redeliver");
+                }
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "handle_task_message failed, nacking");
+                if let Err(e) = self.nats.nack(&msg, None).await {
+                    tracing::error!(err = %e, "nack() failed");
+                }
             }
         }
     }
