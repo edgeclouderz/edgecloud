@@ -15,6 +15,7 @@ import (
 // mockAPIKeyRepo implements APIKeyRepo for testing.
 type mockAPIKeyRepo struct {
 	createFn                func(ctx context.Context, k *domain.APIKey) error
+	getByIDFn               func(ctx context.Context, id string) (*domain.APIKey, error)
 	getByLookupHashFn       func(ctx context.Context, lookupHash string) (*domain.APIKey, error)
 	listByTenantFn          func(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	deleteFn                func(ctx context.Context, id string) error
@@ -27,6 +28,12 @@ func (m *mockAPIKeyRepo) Create(ctx context.Context, k *domain.APIKey) error {
 		return nil
 	}
 	return m.createFn(ctx, k)
+}
+func (m *mockAPIKeyRepo) GetByID(ctx context.Context, id string) (*domain.APIKey, error) {
+	if m.getByIDFn == nil {
+		return nil, nil
+	}
+	return m.getByIDFn(ctx, id)
 }
 func (m *mockAPIKeyRepo) GetByLookupHash(ctx context.Context, lookupHash string) (*domain.APIKey, error) {
 	if m.getByLookupHashFn == nil {
