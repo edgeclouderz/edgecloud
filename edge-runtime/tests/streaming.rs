@@ -508,7 +508,7 @@ async fn test_streaming_response_rejects_missing_content_length() {
     // No Content-Length in the header set. Validation runs in the per-
     // connection task, so respond_stream returns Ok on the oneshot send.
     // The server tears the connection down before writing the head.
-    let _ = server
+    server
         .respond_stream(
             req_id,
             200,
@@ -566,7 +566,7 @@ async fn test_streaming_response_rejects_invalid_content_length() {
     let OutgoingEntry { stream, adapter } = entry;
     let adapter = adapter.expect("adapter present");
 
-    let _ = server
+    server
         .respond_stream(
             req_id,
             200,
@@ -707,7 +707,7 @@ async fn test_streaming_response_rejects_content_encoding() {
     let OutgoingEntry { stream, adapter } = entry;
     let adapter = adapter.expect("adapter present");
 
-    let _ = server
+    server
         .respond_stream(
             req_id,
             200,
