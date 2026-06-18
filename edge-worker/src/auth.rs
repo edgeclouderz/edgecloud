@@ -155,7 +155,10 @@ impl WorkerJwtSigner {
 
 /// Parses and validates a worker JWT with the given secret. Used by tests
 /// to round-trip the signed token back through the same wire format the
-/// control plane expects.
+/// control plane expects. Production code on the worker doesn't need to
+/// verify its own tokens — `sign()` always produces valid output — so the
+/// `allow(dead_code)` is justified; tests and future integrations may use it.
+#[allow(dead_code)]
 pub fn verify(secret: &[u8], token: &str) -> anyhow::Result<WorkerClaims> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
     // Don't enforce an `iss` here — tests use various issuers; the control

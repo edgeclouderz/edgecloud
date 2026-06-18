@@ -1,5 +1,6 @@
 //! edge-worker — Worker Supervisor entry point.
 
+mod auth;
 mod config;
 mod downloader;
 mod messages;
@@ -16,6 +17,7 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::nats::NatsClientImpl;
@@ -56,10 +58,22 @@ async fn main() -> anyhow::Result<()> {
     // Initialize shared state
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
 
+    // Initialize JWT signer — signs outbound calls to the control plane's
+    // /api/internal/* endpoints. Worker is per-tenant in this design; the
+    // JWT carries the worker's tenant_id claim.
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
+
     // Initialize downloader
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
+        jwt_signer,
     ));
 
     // Initialize port pool
