@@ -10,15 +10,13 @@ mod supervisor;
 
 use std::sync::Arc;
 
-use futures::StreamExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, Duration};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::downloader::Downloader;
-use crate::messages::TaskMessage;
 use crate::nats::NatsClientImpl;
 use crate::port_pool::PortPool;
 use crate::state::WorkerState;
@@ -40,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         worker_id = %config.worker_id,
         region = %config.region,
+        queue_group = %config.queue_group,
+        consumer = %config.consumer_name,
         "configuration loaded"
     );
 
@@ -120,9 +120,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("heartbeat task started");
 
-    // Subscribe to task updates
-    tracing::info!(region = %config.region, "subscribed to task updates");
-
     // Spawn SIGTERM handler for graceful shutdown
     let shutdown_supervisor = supervisor.clone();
     let shutdown_tx_s = Arc::new(shutdown_tx.clone());
@@ -143,55 +140,21 @@ async fn main() -> anyhow::Result<()> {
         graceful_shutdown(shutdown_tx_s, shutdown_supervisor).await;
     });
 
-    tracing::info!("ready — waiting for task messages");
+    tracing::info!(
+        region = %config.region,
+        queue_group = %config.queue_group,
+        "ready — waiting for task messages"
+    );
 
-    // Main loop: process NATS messages with automatic reconnection.
-    // If the subscription stream ends (e.g., after async_nats reconnects and
-    // the old mpsc channel closes), re-subscribe and continue.
-    loop {
-        let mut subscription = match supervisor.nats.subscribe(&config.region).await {
-            Ok(sub) => sub,
-            Err(e) => {
-                tracing::warn!(err = %e, "subscription failed, retrying in 5s");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(msg) = subscription.next().await {
-            let payload = msg.payload;
-
-            let task_msg: TaskMessage = match serde_json::from_slice(&payload) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::error!(err = %e, "failed to parse task message");
-                    continue;
-                }
-            };
-
-            let app_count = match &task_msg {
-                TaskMessage::TaskUpdate { apps, .. } => apps.len(),
-            };
-            tracing::debug!(app_count, "received task message");
-
-            if let Err(e) = supervisor.handle_task_message(task_msg).await {
-                tracing::error!(err = %e, "failed to handle task message");
-            }
-        }
-
-        tracing::warn!("subscription stream ended, re-subscribing...");
+    // Run the consume loop on the main task. Exits when the shutdown
+    // signal fires (handled inside the loop).
+    let consume_shutdown_rx = shutdown_tx.subscribe();
+    if let Err(e) = supervisor.run_consume_loop(consume_shutdown_rx).await {
+        tracing::error!(err = %e, "consume loop exited with error");
     }
-}
 
-/// Perform graceful shutdown: signal the heartbeat to stop, stop all apps,
-/// publish a final heartbeat, then exit the process.
-async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
-    // Signal the heartbeat task to stop.
-    let _ = shutdown_tx.send(());
-
-    tracing::info!("graceful shutdown: stopping all apps");
-    supervisor.stop_all_apps().await;
-
+    // If we got here the consume loop returned (which means shutdown was
+    // signalled). Do a final heartbeat + exit cleanly.
     tracing::info!("publishing final heartbeat");
     let heartbeat = supervisor.build_heartbeat().await;
     if let Err(e) = supervisor
@@ -201,6 +164,17 @@ async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: 
     {
         tracing::error!(err = %e, "failed to publish final heartbeat");
     }
+
+    Ok(())
+}
+
+/// Perform graceful shutdown: signal the heartbeat to stop, stop all apps.
+async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
+    // Signal the heartbeat task and the consume loop to stop.
+    let _ = shutdown_tx.send(());
+
+    tracing::info!("graceful shutdown: stopping all apps");
+    supervisor.stop_all_apps().await;
 
     tracing::info!("shutdown complete");
     std::process::exit(0);

@@ -116,6 +116,8 @@ impl TestHarness {
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
+            queue_group: "test-pinning-group".to_string(),
+            consumer_name: "test-consumer".to_string(),
         };
 
         let engine = edge_runtime::create_engine()?;
@@ -328,6 +330,8 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
+        queue_group: "test-heartbeat-group".to_string(),
+        consumer_name: "test-heartbeat-consumer".to_string(),
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
