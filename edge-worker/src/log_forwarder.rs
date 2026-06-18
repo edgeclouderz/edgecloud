@@ -47,6 +47,17 @@ const HARD_CAP_MULT: usize = 10;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Per-request timeout for the HTTP POST.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Early-flush byte threshold: 75% of the control-plane 1 MiB body cap
+/// (`MaxLogBatchSize` in the Go handler). Crossing this signals an early
+/// flush so a burst of large messages doesn't produce a batch the server
+/// will reject with 400. Over-estimating is harmless; under-estimating is
+/// bounded by the server-side cap.
+const BYTE_NOTIFY_THRESHOLD: usize = 768 * 1024;
+/// Conservative byte estimate for the per-entry JSON envelope (the other
+/// fields, brackets, and a small safety margin). The exact JSON size is
+/// not worth computing on the hot path — see `push()` for the full
+/// estimate formula.
+const BYTE_OVERHEAD_PER_ENTRY: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Wire format — matches `domain.LogEntry` (Go control plane)
@@ -81,13 +92,15 @@ struct IngestLogsRequest {
 // ---------------------------------------------------------------------------
 
 struct ForwarderState {
-    /// Buffer of pending entries. Drained (swapped with empty Vec) on each
-    /// flush. Mutex is fine — contention is negligible compared to HTTP RTT.
+    /// Buffer of pending entries. Drained (swapped with an empty but
+    /// pre-allocated Vec) on each flush so the capacity carries over.
+    /// Mutex is fine — contention is negligible compared to HTTP RTT.
     buffer: Vec<WireEntry>,
-    /// Soft cap: when `buffer.len() >= max_buffer_len`, signal an early flush.
-    max_buffer_len: usize,
-    /// Hard cap: when `buffer.len() > hard_cap`, drop incoming pushes.
-    hard_cap: usize,
+    /// Approximate total JSON byte count of the buffered entries,
+    /// tracked alongside `buffer.len()` so a burst of large messages
+    /// signals an early flush before a single batch blows past the
+    /// control-plane body cap. See `push()` for the estimate formula.
+    buffered_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +119,14 @@ pub struct LogForwarder {
     region: String,
     jwt_signer: Arc<WorkerJwtSigner>,
     flush_interval: Duration,
+    /// Soft cap: when `buffer.len() >= max_buffer_len`, signal an early flush.
+    max_buffer_len: usize,
+    /// Hard cap: when `buffer.len() > hard_cap`, drop incoming pushes.
+    hard_cap: usize,
+    /// When `buffered_bytes` crosses this threshold, signal an early flush
+    /// so a burst of large messages doesn't produce a batch the control
+    /// plane will reject with 400 (its 1 MiB body cap).
+    byte_notify_threshold: usize,
 }
 
 impl LogForwarder {
@@ -121,11 +142,11 @@ impl LogForwarder {
             .expect("reqwest client builder should not fail");
 
         let max_buffer_len = DEFAULT_MAX_BUFFER_LEN;
+        let hard_cap = max_buffer_len * HARD_CAP_MULT;
         Arc::new(Self {
             state: Mutex::new(ForwarderState {
                 buffer: Vec::with_capacity(max_buffer_len),
-                max_buffer_len,
-                hard_cap: max_buffer_len * HARD_CAP_MULT,
+                buffered_bytes: 0,
             }),
             notify: Notify::new(),
             client,
@@ -134,6 +155,9 @@ impl LogForwarder {
             region: region.into(),
             jwt_signer,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            max_buffer_len,
+            hard_cap,
+            byte_notify_threshold: BYTE_NOTIFY_THRESHOLD,
         })
     }
 
@@ -173,7 +197,16 @@ impl LogForwarder {
             if state.buffer.is_empty() {
                 return;
             }
-            std::mem::take(&mut state.buffer)
+            // mem::replace with a fresh Vec keeps the grown capacity
+            // across flushes — std::mem::take would drop it and force
+            // the buffer to reallocate on every flush. The replacement
+            // capacity is the larger of max_buffer_len (the typical
+            // steady-state) and whatever the old buffer had grown to
+            // (preserved from a prior flood).
+            let replacement_cap = state.buffer.capacity().max(self.max_buffer_len);
+            let entries = std::mem::replace(&mut state.buffer, Vec::with_capacity(replacement_cap));
+            state.buffered_bytes = 0;
+            entries
         };
 
         let count = entries.len();
@@ -219,6 +252,17 @@ impl LogForwarder {
 
 impl LogSink for LogForwarder {
     fn push(&self, record: LogRecord, ctx: AppLogContext) {
+        // Approximate byte count for this entry. Counts the message body
+        // (the dominant contributor) plus a fixed per-entry envelope and
+        // a rough label size. We don't JSON-quote-account or count the
+        // other fields precisely — a slight over-estimate triggers an
+        // earlier flush (harmless), and an under-estimate is bounded by
+        // the server-side 1 MiB cap.
+        let mut byte_delta = record.message.len() + BYTE_OVERHEAD_PER_ENTRY;
+        for (k, v) in &record.labels {
+            byte_delta += k.len() + v.len() + 6;
+        }
+
         let entry = WireEntry {
             tenant_id: ctx.tenant_id,
             deployment_id: ctx.deployment_id,
@@ -231,7 +275,7 @@ impl LogSink for LogForwarder {
         };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.buffer.len() >= state.hard_cap {
+        if state.buffer.len() >= self.hard_cap {
             tracing::warn!(
                 buffer_len = state.buffer.len(),
                 "log_forwarder: dropping emit_log past hard cap"
@@ -239,11 +283,16 @@ impl LogSink for LogForwarder {
             return;
         }
 
-        let should_notify = {
-            state.buffer.push(entry);
-            state.buffer.len() >= state.max_buffer_len
-        };
-        if should_notify {
+        state.buffer.push(entry);
+        state.buffered_bytes += byte_delta;
+
+        // Signal an early flush if either the entry count OR the byte
+        // count crosses its threshold. The byte check protects against
+        // bursts of large messages (e.g. stack traces) that would
+        // otherwise push a single 1 MiB+ batch at the control plane.
+        if state.buffer.len() >= self.max_buffer_len
+            || state.buffered_bytes > self.byte_notify_threshold
+        {
             self.notify.notify_one();
         }
     }
@@ -492,5 +541,83 @@ mod tests {
         assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
         let received = server.received_requests().await.expect("received");
         assert_eq!(received.len(), 1, "expected exactly one final flush");
+    }
+
+    #[tokio::test]
+    async fn push_signals_early_when_bytes_exceed_threshold() {
+        // 10 × 100 KiB messages = ~1 MiB total — crosses the 768 KiB
+        // (BYTE_NOTIFY_THRESHOLD) byte threshold around the 8th push. The
+        // 1s ticker would not have fired by then, so notify.notified()
+        // resolving within 100ms confirms the byte-based early signal.
+        let f = forwarder();
+        let big = "x".repeat(100 * 1024);
+        for _ in 0..10 {
+            f.push(record(LogLevel::Info, &big), ctx());
+        }
+        // Confirm the bytes actually crossed the threshold. Scope the
+        // lock so the guard is dropped before the await on notify
+        // (clippy::await_holding_lock).
+        {
+            let state = f.state.lock().unwrap();
+            assert!(
+                state.buffered_bytes > f.byte_notify_threshold,
+                "buffered_bytes = {}, want > {} (test premise broken)",
+                state.buffered_bytes,
+                f.byte_notify_threshold
+            );
+        }
+
+        // notify.notified() resolves once the notify_one() has fired. Bound
+        // it with a 100ms timeout — well under the 1s ticker — to keep the
+        // test fast and to fail loudly if the signal never fires.
+        tokio::time::timeout(Duration::from_millis(100), f.notify.notified())
+            .await
+            .expect("notify should fire before the 1s ticker once bytes > 768 KiB");
+    }
+
+    #[tokio::test]
+    async fn flush_now_preserves_buffer_capacity() {
+        // Grow the buffer past the initial Vec::with_capacity(max_buffer_len)
+        // ceiling, then flush. The replacement buffer must retain the grown
+        // capacity — `mem::take` would have dropped it (cleanup #5b).
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(server.uri(), "w_test", "test-region", signer);
+
+        // Push 500 small entries — well under hard_cap (1000) and well
+        // over max_buffer_len (100) so Vec reallocates beyond its initial
+        // capacity.
+        for i in 0..500 {
+            f.push(record(LogLevel::Info, &format!("m{i}")), ctx());
+        }
+        let cap_before = f.state.lock().unwrap().buffer.capacity();
+        assert!(
+            cap_before > f.max_buffer_len,
+            "buffer should have grown past initial capacity ({}); got {}",
+            f.max_buffer_len,
+            cap_before
+        );
+
+        f.flush_now().await;
+
+        let cap_after = f.state.lock().unwrap().buffer.capacity();
+        assert!(
+            cap_after >= cap_before,
+            "buffer capacity must be preserved across flush; before={cap_before}, after={cap_after}"
+        );
     }
 }
