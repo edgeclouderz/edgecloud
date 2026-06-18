@@ -146,7 +146,9 @@ impl Preprocessor {
         let source_path = std::env::temp_dir().join(&temp_name);
         let temp_path_str = source_path
             .to_str()
-            .ok_or_else(|| PreprocessError::ClangFailed("temp path is not valid UTF-8".to_string()))?
+            .ok_or_else(|| {
+                PreprocessError::ClangFailed("temp path is not valid UTF-8".to_string())
+            })?
             .to_string();
 
         {
@@ -184,7 +186,10 @@ impl Preprocessor {
 
     /// Best-effort `clang --version` probe. Used for `PreprocessorInfo`.
     pub fn clang_version(&self) -> Option<String> {
-        let output = Command::new(&self.clang_path).arg("--version").output().ok()?;
+        let output = Command::new(&self.clang_path)
+            .arg("--version")
+            .output()
+            .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -282,10 +287,8 @@ mod tests {
     fn test_discover_with_returns_none_when_only_wasi_sdk_path_set_but_no_file() {
         // Even with WASI_SDK_PATH set, if the clang binary doesn't exist
         // at the expected path, discover returns None.
-        let result = Preprocessor::discover_with(
-            |_| None,
-            Some("/this/path/does/not/exist".to_string()),
-        );
+        let result =
+            Preprocessor::discover_with(|_| None, Some("/this/path/does/not/exist".to_string()));
         assert!(result.is_none());
     }
 
@@ -312,10 +315,8 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("clang's grandparent dir")
             .to_path_buf();
-        let result = Preprocessor::discover_with(
-            |_| None,
-            Some(sdk_dir.to_string_lossy().to_string()),
-        );
+        let result =
+            Preprocessor::discover_with(|_| None, Some(sdk_dir.to_string_lossy().to_string()));
         let p = result.expect("expected fallback to WASI_SDK_PATH");
         assert!(p.clang_path().starts_with(&sdk_dir));
         assert!(p.clang_path().ends_with("clang"));
