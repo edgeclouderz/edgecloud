@@ -99,11 +99,80 @@ fn derive_app_name(path: &str) -> String {
     stem.to_string()
 }
 
+/// Path to the user's edgeCloud config file (`~/.config/edgecloud/config.toml`
+/// on Linux/macOS, platform equivalent elsewhere).
+fn config_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|p| p.join("edgecloud").join("config.toml"))
+}
+
+/// Read the API key from `EDGE_API_KEY` env var, falling back to
+/// `~/.config/edgecloud/config.toml` `[default].api_key`. The error
+/// message stays accurate after this fallback — `edge auth login` writes
+/// that file.
+fn read_api_key() -> Result<String> {
+    if let Ok(k) = std::env::var("EDGE_API_KEY") {
+        if !k.is_empty() {
+            return Ok(k);
+        }
+    }
+    if let Some(path) = config_path() {
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            #[derive(serde::Deserialize)]
+            struct Cfg {
+                default: DefaultSection,
+            }
+            #[derive(serde::Deserialize)]
+            struct DefaultSection {
+                api_key: Option<String>,
+            }
+            if let Ok(cfg) = toml::from_str::<Cfg>(&content) {
+                if let Some(k) = cfg.default.api_key {
+                    if !k.is_empty() {
+                        return Ok(k);
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("EDGE_API_KEY not set — run `edge auth signup` or `edge auth login` first")
+}
+
+/// Read the API URL from `EDGE_API_URL` env var, falling back to
+/// `~/.config/edgecloud/config.toml` `[default].api`, then to
+/// [`DEFAULT_API_URL`].
+fn read_api_url() -> String {
+    if let Ok(u) = std::env::var("EDGE_API_URL") {
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    if let Some(path) = config_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            #[derive(serde::Deserialize)]
+            struct Cfg {
+                default: DefaultSection,
+            }
+            #[derive(serde::Deserialize)]
+            struct DefaultSection {
+                api: Option<String>,
+            }
+            if let Ok(cfg) = toml::from_str::<Cfg>(&content) {
+                if let Some(u) = cfg.default.api {
+                    if !u.is_empty() {
+                        return u;
+                    }
+                }
+            }
+        }
+    }
+    DEFAULT_API_URL.to_string()
+}
+
 async fn upload_to_edgecloud(file_path: &str, source: &str) -> Result<MigrationReport> {
-    let api_url = std::env::var("EDGE_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-    let api_key = std::env::var("EDGE_API_KEY")
-        .context("EDGE_API_KEY not set — run `edge auth login` first")?;
+    let api_url = read_api_url();
+    let api_key = read_api_key()?;
 
     let client = reqwest::Client::new();
     let form = reqwest::multipart::Form::new()
