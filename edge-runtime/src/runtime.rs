@@ -216,14 +216,25 @@ impl HttpClientHost for RuntimeState {
                 // guest should not make — but if it does, they'd see Closed).
                 #[cfg(feature = "http-client")]
                 {
-                    let mut outgoing = self.outgoing_streams.lock().unwrap();
-                    let entry = outgoing
-                        .get_mut(&handle.rep())
-                        .expect("chunked body: resource entry missing");
-                    let adapter = entry
-                        .adapter
-                        .take()
-                        .expect("chunked body: adapter already consumed");
+                    let mut outgoing = self
+                        .outgoing_streams
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let adapter = match outgoing.get_mut(&handle.rep()) {
+                        Some(entry) => match entry.adapter.take() {
+                            Some(a) => a,
+                            None => {
+                                return Some(self.chunked_body_error_response(
+                                    "chunked body: adapter already consumed",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Some(self.chunked_body_error_response(
+                                "chunked body: resource entry missing",
+                            ));
+                        }
+                    };
                     http_client::BodySource::Streamed(adapter)
                 }
                 #[cfg(not(feature = "http-client"))]
@@ -259,7 +270,7 @@ impl HttpClientHost for RuntimeState {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.incoming_streams
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(rep, IncomingEntry { stream });
                     let handle = wasmtime::component::Resource::<
                         crate::edge::cloud::streams::Incoming,
@@ -280,6 +291,22 @@ impl HttpClientHost for RuntimeState {
             body,
             error: resp.error,
         })
+    }
+}
+
+impl RuntimeState {
+    /// Build a 502 Bad Gateway response for a chunked-body resolution
+    /// failure (stale `Outgoing` handle, already-consumed adapter, etc.).
+    /// Used by `HttpClientHost::fetch` to return a meaningful error to
+    /// the guest instead of panicking the worker.
+    #[cfg(feature = "http-client")]
+    fn chunked_body_error_response(&self, msg: &str) -> Response {
+        Response {
+            status: 502,
+            headers: Vec::new(),
+            body: ResponseBodySource::None,
+            error: Some(msg.to_string()),
+        }
     }
 }
 
@@ -568,7 +595,15 @@ mod streams_impl {
             self_: Resource<Incoming>,
             _max_bytes: u32,
         ) -> Result<Vec<u8>, WitStreamError> {
-            let mut incoming = self.incoming_streams.lock().unwrap();
+            // Recover from poisoned mutexes: a panic elsewhere in the
+            // worker must not take down every subsequent stream op on
+            // this RuntimeState. The lock is still held across
+            // block_on_timeout — that's a separate refactor (see plan
+            // follow-up "clone the entry, drop the guard, await on clone").
+            let mut incoming = self
+                .incoming_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = incoming
                 .get_mut(&self_.rep())
                 .ok_or(WitStreamError::Closed)?;
@@ -576,13 +611,21 @@ mod streams_impl {
         }
 
         fn cancel(&mut self, self_: Resource<Incoming>) {
-            if let Some(entry) = self.incoming_streams.lock().unwrap().get_mut(&self_.rep()) {
+            if let Some(entry) = self
+                .incoming_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&self_.rep())
+            {
                 entry.stream.cancel();
             }
         }
 
         fn drop(&mut self, rep: Resource<Incoming>) -> wasmtime::Result<()> {
-            self.incoming_streams.lock().unwrap().remove(&rep.rep());
+            self.incoming_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&rep.rep());
             Ok(())
         }
     }
@@ -592,7 +635,7 @@ mod streams_impl {
             let rep = self.next_stream_rep.fetch_add(1, Ordering::Relaxed);
             self.outgoing_streams
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(rep, OutgoingEntry::new(DEFAULT_STREAM_CAPACITY));
             Resource::new_own(rep)
         }
@@ -602,7 +645,10 @@ mod streams_impl {
             self_: Resource<Outgoing>,
             bytes: Vec<u8>,
         ) -> Result<(), WitStreamError> {
-            let mut outgoing = self.outgoing_streams.lock().unwrap();
+            let mut outgoing = self
+                .outgoing_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = outgoing
                 .get_mut(&self_.rep())
                 .ok_or(WitStreamError::Closed)?;
@@ -610,7 +656,10 @@ mod streams_impl {
         }
 
         fn finish(&mut self, self_: Resource<Outgoing>) -> Result<(), WitStreamError> {
-            let mut outgoing = self.outgoing_streams.lock().unwrap();
+            let mut outgoing = self
+                .outgoing_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let entry = outgoing
                 .get_mut(&self_.rep())
                 .ok_or(WitStreamError::Closed)?;
@@ -618,7 +667,10 @@ mod streams_impl {
         }
 
         fn drop(&mut self, rep: Resource<Outgoing>) -> wasmtime::Result<()> {
-            self.outgoing_streams.lock().unwrap().remove(&rep.rep());
+            self.outgoing_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&rep.rep());
             Ok(())
         }
     }

@@ -498,8 +498,14 @@ impl HttpServer {
                                 let (ch_tx, ch_rx) = tokio::sync::oneshot::channel();
                                 let (stream_tx, stream_rx) =
                                     tokio::sync::oneshot::channel::<StreamingResponseParts>();
-                                responses.lock().unwrap().insert(id, ch_tx);
-                                streaming_responses.lock().unwrap().insert(id, stream_tx);
+                                responses
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(id, ch_tx);
+                                streaming_responses
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(id, stream_tx);
 
                                 let tx = tx.clone();
                                 let meter = meter.clone();
