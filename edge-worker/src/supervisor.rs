@@ -137,6 +137,22 @@ impl Supervisor {
             }
         };
 
+        // Spawn the per-app epoch ticker. The engine clock is global, but
+        // advancing it in a per-app task keeps a misbehaving app's deadline
+        // work isolated — when the app stops, the ticker aborts with it.
+        let ticker_engine = engine.clone();
+        let epoch_tick_ms = self.config.epoch_tick_ms;
+        let ticker = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(epoch_tick_ms));
+            // The first tick fires immediately; consume it so the deadline
+            // budget starts fresh on the first interval.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                ticker_engine.increment_epoch();
+            }
+        });
+
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -152,6 +168,8 @@ impl Supervisor {
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
         let state_clone = self.state.clone();
+        let max_memory_mb = self.config.max_memory_mb;
+        let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
 
         // Spawn the per-app task and store the JoinHandle so we can
@@ -164,6 +182,8 @@ impl Supervisor {
                 state_clone,
                 app_name_str.clone(),
                 shutdown_rx,
+                max_memory_mb,
+                epoch_deadline_ticks,
                 health_check_timeout_secs,
             )
             .await;
@@ -181,6 +201,7 @@ impl Supervisor {
             shutdown_tx: Some(shutdown_tx),
             instance_pre,
             handle: Some(std::sync::Arc::new(handle)),
+            ticker: Some(ticker),
         }));
 
         self.state
@@ -201,18 +222,19 @@ impl Supervisor {
             state.apps.get(app_name).cloned()
         };
 
-        let (port, handle) = if let Some(inst) = instance {
-            // Extract port, handle, and sender while locked.
+        let (port, handle, ticker) = if let Some(inst) = instance {
+            // Extract port, handle, ticker, and sender while locked.
             let mut inst = inst.lock().await;
             inst.status = AppInstanceStatus::Stopping;
             let port = inst.port;
             let handle = inst.handle.clone();
+            let ticker = inst.ticker.take();
             let tx = inst.shutdown_tx.take();
             drop(inst); // release lock before sending
             if let Some(tx) = tx {
                 let _ = tx.send(());
             }
-            (port, handle)
+            (port, handle, ticker)
         } else {
             return Ok(()); // already gone
         };
@@ -224,6 +246,15 @@ impl Supervisor {
         {
             let mut pool = self.port_pool.lock().await;
             pool.release(port);
+        }
+
+        // Abort the epoch ticker so the engine clock stops advancing for
+        // this app. The ticker's task is a tight loop that holds a clone
+        // of the engine; without abort, it would run forever (or until
+        // the engine is dropped), wasting CPU and incrementing the epoch
+        // for stopped apps.
+        if let Some(t) = ticker {
+            t.abort();
         }
 
         // Propagate any panic from the app task.
@@ -253,6 +284,17 @@ impl Supervisor {
     /// backoff restart (max 5 restarts, then gives up). Long-running apps
     /// (HTTP servers) that return from handle() keep running — only an explicit
     /// process.exit from the guest means "stop".
+    //
+    // The extra parameters come from two merged features: PR #64 follow-up
+    // adds per-invocation memory + epoch limits (max_memory_mb,
+    // epoch_deadline_ticks); origin/main adds a host-side timeout
+    // (health_check_timeout_secs) for hung-app detection. They are
+    // complementary: the wasmtime limits terminate the *guest* at the
+    // engine layer, the timeout terminates the *host* task when the
+    // guest doesn't yield. Refactoring into a struct is left for a future
+    // PR; the clippy lint here keeps the function signature honest about
+    // what it actually depends on.
+    #[allow(clippy::too_many_arguments)]
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
@@ -260,6 +302,8 @@ impl Supervisor {
         state: Arc<RwLock<WorkerState>>,
         app_name: String,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        max_memory_mb: u64,
+        epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
     ) {
         let mut restart_count = 0u32;
@@ -275,10 +319,23 @@ impl Supervisor {
                     break;
                 }
 
-                // Run the component
+                // Run the component. Two layered defenses:
+                //   1. Inside execute_app, wasmtime Store limits + epoch
+                //      deadline bound the guest at the engine layer (memory
+                //      + CPU).
+                //   2. tokio::time::timeout bounds the host task: if the
+                //      guest traps in a syscall that doesn't yield (or the
+                //      epoch ticker is starved), the host marks the app as
+                //      Hung and restarts after backoff.
                 result = tokio::time::timeout(
                     Duration::from_secs(health_check_timeout_secs),
-                    Self::execute_app(&instance_pre, &meter, env.clone())
+                    Self::execute_app(
+                        &instance_pre,
+                        &meter,
+                        env.clone(),
+                        max_memory_mb,
+                        epoch_deadline_ticks,
+                    ),
                 ) => {
                     match result {
                         Ok(Ok(true)) => {
@@ -361,6 +418,8 @@ impl Supervisor {
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
         env: HashMap<String, String>,
+        max_memory_mb: u64,
+        epoch_deadline_ticks: u64,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -368,10 +427,17 @@ impl Supervisor {
         let runtime_state =
             edge_runtime::RuntimeState::with_env_and_meter(env, Some(Arc::clone(meter)));
 
-        // Create a store with per-invocation state
-        // Memory limits (256MB) are enforced via wasmtime's ResourceLimiter mechanism
-        // (Store::limiter with StaticLimiter pattern in edge-runtime's store.rs).
-        let mut store = edge_runtime::create_store(engine, 256, runtime_state);
+        // Create a store with per-invocation state. The memory cap is plumbed
+        // through Config (APP_MAX_MEMORY_MB); the previous code hardcoded
+        // 256 MiB, which made the env-var knob decorative.
+        let mut store = edge_runtime::create_store(engine, max_memory_mb, runtime_state);
+
+        // Set the per-invocation epoch deadline. The engine's epoch clock is
+        // advanced by the ticker spawned in start_app; once it crosses this
+        // deadline, wasmtime interrupts the guest with an epoch trap. This
+        // is the only thing that bounds CPU usage in wasmtime — without it
+        // a tight loop in the guest can hang the worker indefinitely.
+        store.set_epoch_deadline(epoch_deadline_ticks);
 
         // Instantiate
         let instance = instance_pre.instantiate(&mut store)?;
