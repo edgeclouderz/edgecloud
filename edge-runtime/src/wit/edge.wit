@@ -19,6 +19,12 @@ interface streams {
 
   // host -> guest read direction (e.g. response body, large request body).
   resource incoming {
+    // Read the next chunk. The host delivers the chunk at whatever size the
+    // producer placed on the channel (bounded by the host's backpressure
+    // buffer — default 8 chunks at the producer's natural chunk size). The
+    // `max-bytes` parameter is ADVISORY and MAY be ignored by the host;
+    // chunk-splitting is not implemented in v1. EOF is signaled by
+    // `stream-error::closed`.
     read-chunk: func(max-bytes: u32) -> result<list<u8>, stream-error>;
     cancel: func();
   }
