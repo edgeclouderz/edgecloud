@@ -119,17 +119,20 @@ async fn main() -> anyhow::Result<()> {
     // Start the heartbeat task — exits cleanly when it receives the shutdown signal.
     // Clone the sender so the original stays available for signal handlers.
     let shutdown_tx_for_heartbeat = shutdown_tx.clone();
+    // Subscribe ONCE, outside the loop. broadcast::Receiver::recv() only sees
+    // messages sent after the subscription was created; re-subscribing inside
+    // the loop loses any signal sent between the previous recv() returning
+    // and the next subscribe() call. (This was the bug fix for finding #12.)
+    let mut shutdown_rx_for_heartbeat = shutdown_tx_for_heartbeat.subscribe();
     tokio::spawn(async move {
         let mut ticker = interval(heartbeat_interval);
         // Skip the first tick which fires immediately on creation.
         ticker.tick().await;
         loop {
-            // Get a fresh receiver each iteration — broadcast lets us do this.
-            let mut shutdown_rx = shutdown_tx_for_heartbeat.subscribe();
             tokio::select! {
                 // `biased` ensures shutdown always wins when both are ready.
                 biased;
-                _ = shutdown_rx.recv() => {
+                _ = shutdown_rx_for_heartbeat.recv() => {
                     tracing::info!("heartbeat task received shutdown signal, stopping");
                     break;
                 }
@@ -166,14 +169,41 @@ async fn main() -> anyhow::Result<()> {
     // Single signal handler for SIGTERM and SIGINT — whichever fires first
     // initiates graceful shutdown and consumes the log-forwarder JoinHandle.
     // The other signal is ignored (the process exits before it can fire).
+    //
+    // Some restricted runtimes (seccomp policies, certain sandboxed
+    // environments) reject one of the signal handlers. We try both and
+    // fall back to whichever is available; if neither is, we log and
+    // exit the spawn task — main()'s loop keeps running and the
+    // supervisor (k8s / systemd) is expected to SIGKILL the process
+    // after its grace period. (This replaces the `.expect()` calls that
+    // would panic the spawned task on install failure — finding #9.)
     let shutdown_supervisor = supervisor.clone();
-    let shutdown_tx_s = Arc::new(shutdown_tx.clone());
+    // broadcast::Sender is Clone + Send + Sync, so no Arc is needed.
+    let shutdown_tx_s = shutdown_tx.clone();
     tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(err = %e, "SIGTERM handler unavailable");
+                None
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(err = %e, "SIGINT handler unavailable");
+                None
+            }
+        };
+        if sigterm.is_none() && sigint.is_none() {
+            tracing::error!("no signal handlers available; cannot initiate graceful shutdown");
+            return;
+        }
+        // `biased` so SIGTERM is preferred if both fire in the same poll.
         let signal_name = tokio::select! {
-            _ = sigterm.recv() => "SIGTERM",
-            _ = sigint.recv()  => "SIGINT",
+            biased;
+            _ = async { sigterm.as_mut().unwrap().recv().await }, if sigterm.is_some() => "SIGTERM",
+            _ = async { sigint.as_mut().unwrap().recv().await },  if sigint.is_some()  => "SIGINT",
         };
         tracing::info!(
             signal = signal_name,
@@ -220,11 +250,53 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DrainOutcome is the typed result of waiting for the log forwarder task
+/// to finish after shutdown was signalled. Distinguishing the three
+/// outcomes — clean, panic, timeout — lets operators see when an in-flight
+/// batch is lost instead of silently dropping the JoinError or timeout.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainOutcome {
+    Clean,
+    Panic,
+    Timeout,
+}
+
+/// drain_logs_task waits up to `timeout` for `logs_task` to finish. Pulled
+/// out of graceful_shutdown() so the three outcomes can be unit-tested
+/// without a full worker setup. Logs the outcome; returns the typed result
+/// for callers that want to act on it.
+async fn drain_logs_task(
+    timeout: Duration,
+    logs_task: tokio::task::JoinHandle<()>,
+) -> DrainOutcome {
+    match tokio::time::timeout(timeout, logs_task).await {
+        Ok(Ok(())) => {
+            tracing::info!("log forwarder drained cleanly");
+            DrainOutcome::Clean
+        }
+        Ok(Err(join_err)) => {
+            tracing::error!(
+                err = %join_err,
+                panicked = join_err.is_panic(),
+                "log forwarder task did not exit cleanly; in-flight batch may be lost"
+            );
+            DrainOutcome::Panic
+        }
+        Err(_) => {
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                "log forwarder final flush exceeded timeout; in-flight batch may be lost"
+            );
+            DrainOutcome::Timeout
+        }
+    }
+}
+
 /// Perform graceful shutdown: signal the heartbeat + log-forwarder to stop,
 /// stop all apps, publish a final heartbeat, wait for the log forwarder to
 /// drain its final flush, then exit the process.
 async fn graceful_shutdown(
-    shutdown_tx: Arc<broadcast::Sender<()>>,
+    shutdown_tx: broadcast::Sender<()>,
     supervisor: Arc<Supervisor>,
     logs_task: tokio::task::JoinHandle<()>,
 ) {
@@ -247,12 +319,50 @@ async fn graceful_shutdown(
         tracing::error!(err = %e, "failed to publish final heartbeat");
     }
 
-    // Wait for the log forwarder to flush its final batch. We can't `await`
-    // a broadcast signal directly, but the spawned task exits within
-    // REQUEST_TIMEOUT (5s) of receiving shutdown — well under any
-    // operator-imposed shutdown deadline.
+    // Wait for the log forwarder to flush its final batch. drain_logs_task
+    // distinguishes clean exit, panic, and timeout so operators can see
+    // when a shutdown loses an in-flight batch.
     tracing::info!("awaiting log forwarder final flush");
-    let _ = tokio::time::timeout(Duration::from_secs(10), logs_task).await;
+    drain_logs_task(Duration::from_secs(10), logs_task).await;
 
     tracing::info!("shutdown complete");
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    //! Unit tests for the drain_logs_task helper. Each test exercises one
+    //! of the three outcomes returned by a JoinHandle wrapped in a
+    //! tokio::time::timeout — clean exit, panic, and timeout. The
+    //! broadcast plumbing around the helper is covered by the integration
+    //! test in tests/shutdown.rs (see follow-up issue C).
+
+    use super::{drain_logs_task, DrainOutcome};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn drain_logs_task_returns_clean_when_task_exits_normally() {
+        let handle = tokio::spawn(async {});
+        let outcome = drain_logs_task(Duration::from_secs(1), handle).await;
+        assert_eq!(outcome, DrainOutcome::Clean);
+    }
+
+    #[tokio::test]
+    async fn drain_logs_task_returns_panic_when_task_panics() {
+        let handle = tokio::spawn(async {
+            panic!("synthetic log forwarder panic");
+        });
+        let outcome = drain_logs_task(Duration::from_secs(1), handle).await;
+        assert_eq!(outcome, DrainOutcome::Panic);
+    }
+
+    #[tokio::test]
+    async fn drain_logs_task_returns_timeout_when_task_runs_too_long() {
+        // A task that sleeps for 10s — against a 50ms timeout, drain_logs_task
+        // must hit the timeout branch and return DrainOutcome::Timeout.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let outcome = drain_logs_task(Duration::from_millis(50), handle).await;
+        assert_eq!(outcome, DrainOutcome::Timeout);
+    }
 }
