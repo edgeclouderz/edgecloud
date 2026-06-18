@@ -100,7 +100,33 @@ func GetTenantID(ctx context.Context) string {
 	return ""
 }
 
+// GetAPIKeyID extracts the API key ID from context. Returns "" if not set.
+func GetAPIKeyID(ctx context.Context) string {
+	if id, ok := ctx.Value(APIKeyIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// GetRole extracts the role from context. Returns "" if not set.
+func GetRole(ctx context.Context) string {
+	if role, ok := ctx.Value(RoleKey).(string); ok {
+		return role
+	}
+	return ""
+}
+
 // WithTenantID returns a new context with tenant ID set. Used for testing.
 func WithTenantID(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, TenantIDKey, tenantID)
+}
+
+// WithAPIKeyID returns a new context with API key ID set. Used for testing.
+func WithAPIKeyID(ctx context.Context, keyID string) context.Context {
+	return context.WithValue(ctx, APIKeyIDKey, keyID)
+}
+
+// WithRole returns a new context with role set. Used for testing.
+func WithRole(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, RoleKey, role)
 }

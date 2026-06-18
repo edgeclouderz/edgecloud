@@ -56,6 +56,21 @@ func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID string) ([]dom
 	return s.apiKeyRepo.ListByTenant(ctx, tenantID)
 }
 
+// APIKeyServiceInterface abstracts API key operations for testing.
+// *APIKeyService satisfies this interface.
+type APIKeyServiceInterface interface {
+	CreateAPIKey(ctx context.Context, tenantID, name, role string) (*domain.APIKey, string, error)
+	ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error)
+	GetByID(ctx context.Context, id string) (*domain.APIKey, error)
+	DeleteAPIKey(ctx context.Context, id string) error
+}
+
+// GetByID returns a single API key by its prefixed ID (e.g. "k_<uuid>").
+// Returns (nil, nil) when no such key exists.
+func (s *APIKeyService) GetByID(ctx context.Context, id string) (*domain.APIKey, error) {
+	return s.apiKeyRepo.GetByID(ctx, id)
+}
+
 func (s *APIKeyService) DeleteAPIKey(ctx context.Context, id string) error {
 	return s.apiKeyRepo.Delete(ctx, id)
 }
