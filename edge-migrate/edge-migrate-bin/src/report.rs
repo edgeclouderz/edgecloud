@@ -2,7 +2,7 @@
 //!
 //! Formats migration reports for terminal display.
 
-use edge_migrate_lib::report::{MigrationReport, MigrationStatus};
+use edge_migrate_lib::report::{MigrationReport, MigrationStatus, TreeMigrationReport};
 
 /// Print the local analysis report (before upload).
 pub fn print_analysis_report(report: &MigrationReport) {
@@ -93,4 +93,40 @@ pub fn print_server_report(report: &MigrationReport) {
             println!("  ❌ Line {}: {}", e.line, e.message);
         }
     }
+}
+
+/// Print the local tree-level analysis report (before upload).
+pub fn print_tree_report(report: &TreeMigrationReport) {
+    println!();
+    println!("=== edge-migrate Tree Analysis ===");
+    println!();
+    println!("App name: {}", report.app_name);
+    println!(
+        "Files: {} total, {} with auto-transformations, {} requiring manual review",
+        report.files_total, report.files_transformed, report.files_manual_review
+    );
+    println!();
+
+    for f in &report.files {
+        let marker = match f.status {
+            MigrationStatus::Success => "✅",
+            MigrationStatus::Partial => "⚠️ ",
+            MigrationStatus::Failed => "❌",
+        };
+        println!(
+            "{}  {} ({} auto, {} review, {} errors)",
+            marker,
+            f.path,
+            f.transformations.len(),
+            f.manual_review.len(),
+            f.errors.len()
+        );
+        for p in &f.manual_review {
+            println!("      ⚠️  Line {}: {} — {}", p.line, p.pattern, p.wasi_equivalent);
+        }
+        for e in &f.errors {
+            println!("      ❌ Line {}: {}", e.line, e.message);
+        }
+    }
+    println!();
 }

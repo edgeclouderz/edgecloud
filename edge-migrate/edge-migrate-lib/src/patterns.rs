@@ -179,3 +179,66 @@ impl PosixPattern {
         }
     }
 }
+
+/// Validate a deployment app name against the public-facing format
+/// `^[a-z0-9][a-z0-9-]{0,62}$`.
+///
+/// Distinct from path-safety checks (no `..`, no `/`). Used by the
+/// `edge-migrate --tree` CLI and the Go control plane's
+/// `IsValidDeploymentAppName` mirror. Keeping the regex in one place
+/// (the shared design doc) — both sides are tested against the same
+/// set of valid / invalid examples.
+pub fn is_valid_deployment_app_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    // First char: lowercase letter or digit.
+    let first = bytes[0];
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    // Remaining chars: lowercase letter, digit, or '-'.
+    for &b in &bytes[1..] {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_deployment_app_name_accepts_valid() {
+        assert!(is_valid_deployment_app_name("a"));
+        assert!(is_valid_deployment_app_name("hello-world"));
+        assert!(is_valid_deployment_app_name("my-app-123"));
+        assert!(is_valid_deployment_app_name("0"));
+        assert!(is_valid_deployment_app_name("a".repeat(63).as_str()));
+    }
+
+    #[test]
+    fn test_is_valid_deployment_app_name_rejects_invalid() {
+        // Empty
+        assert!(!is_valid_deployment_app_name(""));
+        // Too long (64 chars)
+        assert!(!is_valid_deployment_app_name(&"a".repeat(64)));
+        // Uppercase
+        assert!(!is_valid_deployment_app_name("Hello"));
+        assert!(!is_valid_deployment_app_name("HELLO"));
+        // Starts with non-alnum
+        assert!(!is_valid_deployment_app_name("-hello"));
+        assert!(!is_valid_deployment_app_name("_hello"));
+        // Contains invalid chars
+        assert!(!is_valid_deployment_app_name("hello_world"));
+        assert!(!is_valid_deployment_app_name("hello world"));
+        assert!(!is_valid_deployment_app_name("hello.world"));
+        assert!(!is_valid_deployment_app_name("hello/world"));
+        // Path traversal
+        assert!(!is_valid_deployment_app_name("../traversal"));
+        assert!(!is_valid_deployment_app_name("a/../b"));
+    }
+}
