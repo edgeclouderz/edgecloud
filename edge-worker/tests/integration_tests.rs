@@ -113,6 +113,9 @@ impl TestHarness {
             health_check_timeout_secs: 60,
             port_cooldown_secs: 60,
             starting_port: 18_000,
+            max_memory_mb: 256,
+            epoch_tick_ms: 10,
+            epoch_deadline_ticks: 100,
         };
 
         let engine = edge_runtime::create_engine()?;
@@ -322,6 +325,9 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
