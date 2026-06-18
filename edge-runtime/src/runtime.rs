@@ -155,6 +155,10 @@ impl HttpClientHost for RuntimeState {
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let body = req.body.as_deref();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
+        let tracestate = req
+            .trace_context
+            .as_ref()
+            .and_then(|tc| tc.tracestate.as_deref());
         let rt = tokio::runtime::Handle::current();
         let resp = rt.block_on(self.http_client.fetch(
             method,
@@ -163,6 +167,7 @@ impl HttpClientHost for RuntimeState {
             body,
             req.timeout_ms,
             trace_context,
+            tracestate,
         ));
         Some(Response {
             status: resp.status,
@@ -248,6 +253,21 @@ impl ObserveHost for RuntimeState {
     }
     fn emit_log(&mut self, level: String, message: String, labels: Vec<(String, String)>) {
         self.observe.emit_log(&level, &message, &labels);
+    }
+    fn emit_log_record(&mut self, r: crate::edge::cloud::observe::LogRecord) {
+        let record = observe::LogRecord {
+            timestamp_ms: r.timestamp_ms,
+            level: match r.level {
+                crate::edge::cloud::observe::LogLevel::Error => observe::LogLevel::Error,
+                crate::edge::cloud::observe::LogLevel::Warn => observe::LogLevel::Warn,
+                crate::edge::cloud::observe::LogLevel::Info => observe::LogLevel::Info,
+                crate::edge::cloud::observe::LogLevel::Debug => observe::LogLevel::Debug,
+                crate::edge::cloud::observe::LogLevel::Trace => observe::LogLevel::Trace,
+            },
+            message: r.message,
+            labels: r.labels,
+        };
+        self.observe.emit_log_record(&record);
     }
 }
 

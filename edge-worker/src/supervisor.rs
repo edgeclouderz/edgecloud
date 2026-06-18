@@ -98,7 +98,10 @@ impl Supervisor {
             pool.acquire().expect("port pool exhausted")
         };
 
-        // Download artifact (blocking on first request)
+        // Download artifact (blocking on first request).
+        // Note: Downloader::get_artifact verifies SHA-256 against
+        // spec.deployment_hash before returning; on mismatch/empty/malformed it
+        // returns Err, which this arm propagates and the port-release path handles.
         let artifact = match self
             .downloader
             .get_artifact(&spec.deployment_id, &spec.deployment_hash)
@@ -167,6 +170,7 @@ impl Supervisor {
         let state_clone = self.state.clone();
         let max_memory_mb = self.config.max_memory_mb;
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
+        let health_check_timeout_secs = self.config.health_check_timeout_secs;
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -180,6 +184,7 @@ impl Supervisor {
                 shutdown_rx,
                 max_memory_mb,
                 epoch_deadline_ticks,
+                health_check_timeout_secs,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -280,11 +285,15 @@ impl Supervisor {
     /// (HTTP servers) that return from handle() keep running — only an explicit
     /// process.exit from the guest means "stop".
     //
-    // The two extra parameters (max_memory_mb, epoch_deadline_ticks) come
-    // from PR #64 follow-up — they are per-app limits plumbed from Config.
-    // Refactoring them into a single struct is left for a future PR; the
-    // clippy lint here keeps the function signature honest about what it
-    // actually depends on.
+    // The extra parameters come from two merged features: PR #64 follow-up
+    // adds per-invocation memory + epoch limits (max_memory_mb,
+    // epoch_deadline_ticks); origin/main adds a host-side timeout
+    // (health_check_timeout_secs) for hung-app detection. They are
+    // complementary: the wasmtime limits terminate the *guest* at the
+    // engine layer, the timeout terminates the *host* task when the
+    // guest doesn't yield. Refactoring into a struct is left for a future
+    // PR; the clippy lint here keeps the function signature honest about
+    // what it actually depends on.
     #[allow(clippy::too_many_arguments)]
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
@@ -295,6 +304,7 @@ impl Supervisor {
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
+        health_check_timeout_secs: u64,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -309,26 +319,37 @@ impl Supervisor {
                     break;
                 }
 
-                // Run the component
-                result = Self::execute_app(
-                    &instance_pre,
-                    &meter,
-                    env.clone(),
-                    max_memory_mb,
-                    epoch_deadline_ticks,
+                // Run the component. Two layered defenses:
+                //   1. Inside execute_app, wasmtime Store limits + epoch
+                //      deadline bound the guest at the engine layer (memory
+                //      + CPU).
+                //   2. tokio::time::timeout bounds the host task: if the
+                //      guest traps in a syscall that doesn't yield (or the
+                //      epoch ticker is starved), the host marks the app as
+                //      Hung and restarts after backoff.
+                result = tokio::time::timeout(
+                    Duration::from_secs(health_check_timeout_secs),
+                    Self::execute_app(
+                        &instance_pre,
+                        &meter,
+                        env.clone(),
+                        max_memory_mb,
+                        epoch_deadline_ticks,
+                    ),
                 ) => {
                     match result {
-                        Ok(true) => {
+                        Ok(Ok(true)) => {
                             // Component wants to keep running (blocking call returned normally).
                             // Loop back and re-execute — this supports long-running HTTP servers.
                             continue;
                         }
-                        Ok(false) => {
+                        Ok(Ok(false)) => {
                             // Guest explicitly called process.exit — clean exit.
                             tracing::info!("component exited normally");
                             break;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
+                            // Wasm trap or runtime error — treat as crash.
                             restart_count += 1;
                             if restart_count >= max_restarts {
                                 tracing::error!(
@@ -357,6 +378,29 @@ impl Supervisor {
                                 "app crashed, restarting in {:?}",
                                 backoff
                             );
+                            sleep(backoff).await;
+                        }
+                        Err(_elapsed) => {
+                            // Health check timeout — app hung.
+                            restart_count += 1;
+                            let backoff = std::cmp::min(
+                                base_backoff * 2u32.pow(restart_count - 1),
+                                max_backoff,
+                            );
+                            tracing::warn!(
+                                restart_count,
+                                timeout_secs = health_check_timeout_secs,
+                                "app hung (health check timeout), restarting in {:?}",
+                                backoff
+                            );
+                            if restart_count >= max_restarts {
+                                let mut s = state.write().await;
+                                if let Some(inst) = s.apps.get_mut(&app_name) {
+                                    let mut inst = inst.lock().await;
+                                    inst.status = AppInstanceStatus::Hung;
+                                }
+                                break;
+                            }
                             sleep(backoff).await;
                         }
                     }
@@ -437,13 +481,20 @@ impl Supervisor {
                 AppInstanceStatus::Starting => "starting",
                 AppInstanceStatus::Stopping => "stopping",
                 AppInstanceStatus::Crashed { .. } => "crashed",
+                AppInstanceStatus::Hung => "hung",
+            };
+            let exit_code = match &inst.status {
+                AppInstanceStatus::Running
+                | AppInstanceStatus::Starting
+                | AppInstanceStatus::Stopping => None,
+                AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
-                    exit_code: None,
+                    exit_code,
                     request_count: inst.meter.snapshot().request_count,
                 },
             );

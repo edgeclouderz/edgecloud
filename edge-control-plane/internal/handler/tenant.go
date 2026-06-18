@@ -10,10 +10,10 @@ import (
 
 // TenantHandler handles tenant HTTP requests.
 type TenantHandler struct {
-	tenantSvc *service.TenantService
+	tenantSvc service.TenantServiceInterface
 }
 
-func NewTenantHandler(tenantSvc *service.TenantService) *TenantHandler {
+func NewTenantHandler(tenantSvc service.TenantServiceInterface) *TenantHandler {
 	return &TenantHandler{tenantSvc: tenantSvc}
 }
 
