@@ -127,6 +127,7 @@ mod tests {
         let matches = vec![
             PatternMatch {
                 line: 1,
+                column: None,
                 start_byte: 0,
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
@@ -136,6 +137,7 @@ mod tests {
             },
             PatternMatch {
                 line: 2,
+                column: None,
                 start_byte: 0,
                 end_byte: 0,
                 pattern: PosixPattern::Connect,
@@ -154,6 +156,7 @@ mod tests {
         let matches = vec![
             PatternMatch {
                 line: 1,
+                column: None,
                 start_byte: 0,
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
@@ -163,6 +166,7 @@ mod tests {
             },
             PatternMatch {
                 line: 2,
+                column: None,
                 start_byte: 0,
                 end_byte: 0,
                 pattern: PosixPattern::Poll,
@@ -181,6 +185,7 @@ mod tests {
     fn test_is_migratable_all_not_transformable() {
         let matches = vec![PatternMatch {
             line: 1,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::Fork,

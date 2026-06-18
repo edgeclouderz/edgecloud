@@ -18,9 +18,25 @@ pub enum Transformability {
 
 /// A detected POSIX pattern in source code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PatternMatch {
     /// 1-based line number where the pattern was detected.
+    ///
+    /// When the analyzer runs with a preprocessor attached and macro
+    /// expansion is successful, this is the **original** source line
+    /// (1-based), remapped from the expanded source via the
+    /// preprocessor's `line_map`. When the preprocessor is not
+    /// attached, fails, or yields no useful mapping, the value is
+    /// the 1-based line in the (possibly expanded) source actually
+    /// fed to tree-sitter.
     pub line: usize,
+    /// 0-based column (byte offset within the line) where the pattern
+    /// starts. Currently always `None`; populated in M2 by the
+    /// multi-file tree walker so reports include both line and column
+    /// for editor integration. `#[serde(default)]` keeps older reports
+    /// deserializable.
+    #[serde(default)]
+    pub column: Option<usize>,
     /// Start byte offset in the source (for replacement).
     pub start_byte: usize,
     /// End byte offset in the source (for replacement).
@@ -33,6 +49,24 @@ pub struct PatternMatch {
     pub arg_nodes: Vec<String>,
     /// Whether this pattern can be auto-transformed.
     pub transformability: Transformability,
+}
+
+impl Default for PatternMatch {
+    /// Used by struct literals that don't yet populate every field
+    /// (e.g. `..Default::default()`). `line` defaults to 0 — callers
+    /// that go through `analyze()` always get a real value.
+    fn default() -> Self {
+        Self {
+            line: 0,
+            column: None,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::Unknown,
+            snippet: String::new(),
+            arg_nodes: Vec::new(),
+            transformability: Transformability::NotTransformable,
+        }
+    }
 }
 
 /// All known POSIX patterns that edge-migrate can detect.

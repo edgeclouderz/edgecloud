@@ -269,6 +269,7 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::SocketTcp,
@@ -294,6 +295,7 @@ int main() {
         let call_end = source.find("timeout);").unwrap() + 9; // include "timeout);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Poll,
@@ -318,6 +320,7 @@ int main() {
         let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Bind,
@@ -343,6 +346,7 @@ int main() {
         let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Connect,
@@ -368,6 +372,7 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Recv,
@@ -392,6 +397,7 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Send,
@@ -416,6 +422,7 @@ int main() {
         let call_end = source.find("NULL);").unwrap() + 6; // include "NULL);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
             pattern: PosixPattern::Accept,
@@ -433,6 +440,7 @@ int main() {
     fn test_extract_first_arg() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::SocketTcp,
@@ -444,6 +452,7 @@ int main() {
 
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::Bind,
@@ -458,6 +467,7 @@ int main() {
     fn test_extract_second_arg() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::Bind,
@@ -469,6 +479,7 @@ int main() {
 
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::Listen,
@@ -484,6 +495,7 @@ int main() {
     fn test_extract_arg_with_comma_in_string_literal() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
             pattern: PosixPattern::Fopen,

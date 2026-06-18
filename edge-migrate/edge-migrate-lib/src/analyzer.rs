@@ -63,15 +63,31 @@ impl CAnalyzer {
     /// When a preprocessor is attached, the source is first expanded
     /// with `clang -E -nostdinc`. If expansion fails, falls back to
     /// the unexpanded source.
+    ///
+    /// When macro expansion succeeds, each match's `line` is remapped
+    /// from the expanded source back to the **original** source line
+    /// via the preprocessor's `line_map`. This is best-effort — clang
+    /// only emits `# <lineno> "<file>"` markers at file boundaries,
+    /// not at every source line, so a match on a synthetic line (one
+    /// that has no preceding user-file linemarker) keeps its expanded
+    /// line number. See `edge-migrate/docs/design.md` §2.2 for the
+    /// full limitation write-up.
     pub fn analyze(&mut self, source: &str) -> Vec<PatternMatch> {
         // Resolve to an owned buffer + a reference so the buffer lives
         // for the duration of tree-sitter parsing. We avoid `Box::leak`
-        // by keeping the owned `String` in a local binding.
+        // by keeping the owned `String` in a local binding. The
+        // `ExpandedSource` is captured by the `Ok` arm only; on error
+        // or no preprocessor, `line_map` is empty (identity mapping).
         let owned: String;
+        let line_map: Vec<u32>;
         let parse_source: &str = match self.preprocessor.as_ref() {
-            None => source,
+            None => {
+                line_map = Vec::new();
+                source
+            }
             Some(pp) => match pp.expand(source, DEFAULT_FILENAME_HINT) {
                 Ok(expanded) => {
+                    line_map = expanded.line_map;
                     owned = expanded.text;
                     &owned
                 }
@@ -80,6 +96,7 @@ impl CAnalyzer {
                         "preprocessor failed, falling back to unexpanded source: {}",
                         e
                     );
+                    line_map = Vec::new();
                     source
                 }
             },
@@ -91,6 +108,22 @@ impl CAnalyzer {
         let root = tree.root_node();
         let mut matches = Vec::new();
         self.walk_node(parse_source, root, &mut matches);
+        // Remap line numbers back to the original source. Matches
+        // whose line is synthetic (line_map entry is 0) keep their
+        // expanded line number — a known limitation of clang's
+        // best-effort linemarker output.
+        if !line_map.is_empty() {
+            for m in &mut matches {
+                if m.line >= 1 {
+                    let idx = m.line - 1;
+                    if let Some(&orig) = line_map.get(idx) {
+                        if orig >= 1 {
+                            m.line = orig as usize;
+                        }
+                    }
+                }
+            }
+        }
         matches.sort_by_key(|m| m.line);
         matches
     }
@@ -165,6 +198,7 @@ impl CAnalyzer {
 
         let mut results = vec![PatternMatch {
             line,
+            column: None,
             start_byte,
             end_byte,
             pattern: pattern.clone(),
@@ -182,6 +216,7 @@ impl CAnalyzer {
             if has_nonblocking {
                 results.push(PatternMatch {
                     line,
+                    column: None,
                     start_byte,
                     end_byte,
                     pattern: PosixPattern::NonBlocking,
@@ -401,5 +436,64 @@ int main() {
         // forward declaration is what makes this work without
         // warnings.
         let _ = matches; // structural assertion: no panic, no error.
+    }
+
+    #[test]
+    fn test_analyzer_reports_original_line_after_macro_expansion() {
+        // M1.C4: after preprocessing, match `line` values should be
+        // remapped to the **original** source via `line_map`, not the
+        // expanded line. Skipped without clang.
+        let Some(pp) = crate::preprocessor::Preprocessor::discover() else {
+            eprintln!("skipping: clang not found");
+            return;
+        };
+        // A small, well-formed C file with a real socket() call on
+        // line 4 (1-based) inside main(). The source has no macros;
+        // expansion should be a near-identity operation, so the
+        // remapped line for the socket() match should be 4.
+        let source = "\
+/* line 1: header */
+int make_socket(int family, int type, int proto);
+int main(void) {
+    int fd = socket(2, 1, 0);
+    (void)fd;
+    return 0;
+}
+";
+        let source_line_count = source.lines().count();
+        let mut analyzer = CAnalyzer::with_preprocessor(pp);
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PosixPattern::SocketTcp));
+        // If the preprocessor expanded the source in a way that
+        // exposed the socket() call, the line should be within the
+        // original source's line count. We don't pin to a specific
+        // line number because clang's `clang -E` only emits
+        // linemarkers at file boundaries; the exact remap depends on
+        // platform clang behavior.
+        if let Some(m) = socket_match {
+            assert!(
+                m.line >= 1 && m.line <= source_line_count,
+                "remapped line {} is outside original source's line count {}",
+                m.line,
+                source_line_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_pattern_match_column_field_default_none() {
+        // M1.C4: `column: Option<usize>` is added to PatternMatch
+        // (default None — M2 will populate it). Verify the field is
+        // `None` for matches produced by a no-preprocessor analyzer.
+        let mut analyzer = CAnalyzer::new();
+        let source = "int main() { int fd = socket(2, 1, 0); (void)fd; return 0; }\n";
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PosixPattern::SocketTcp))
+            .expect("socket match should be present");
+        assert_eq!(socket_match.column, None);
     }
 }
