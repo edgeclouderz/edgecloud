@@ -178,9 +178,17 @@ func main() {
 		}
 	}()
 
+	// rootCtx is the parent context for every background goroutine spawned
+	// by main(); cancelling it makes them exit cleanly when the HTTP server
+	// shuts down. Using context.Background() here would leak the goroutines
+	// across reloads/restarts — the goroutines would only exit when main()
+	// returned, by which point the DB and NATS connections are already
+	// closed and the next iteration of the loop would error.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+
 	// Start NATS heartbeat subscriber for worker lifecycle management
 	go func() {
-		if err := workerSvc.SubscribeHeartbeats(context.Background()); err != nil {
+		if err := workerSvc.SubscribeHeartbeats(rootCtx); err != nil {
 			log.Printf("Worker heartbeat subscription error: %v", err)
 		}
 	}()
@@ -190,7 +198,7 @@ func main() {
 	logGC := service.NewLogGCService(logEntryRepo)
 	logGCInterval := parseDurationEnv("LOG_GC_INTERVAL", time.Hour)
 	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
-	go logGC.Run(context.Background(), logGCInterval, logRetention)
+	go logGC.Run(rootCtx, logGCInterval, logRetention)
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
@@ -201,20 +209,27 @@ func main() {
 	if err := srv.Shutdown(context.Background()); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+	// Cancel the root context so the background goroutines (log GC, NATS
+	// heartbeat subscriber) exit before main() returns and closes the DB
+	// and NATS connections out from under them.
+	rootCancel()
 	log.Println("Server exited")
 }
 
 // parseDurationEnv reads a duration-valued env var or returns the default.
-// On a malformed value it logs a warning and returns the default — the GC
-// service should never crash the control plane because of a typo.
+// On a missing, malformed, or non-positive value it logs a warning and
+// returns the default — the GC service should never busy-loop or wipe
+// the logs table because of an operator typo. Non-positive values
+// (including zero and negative durations) are rejected in addition to
+// malformed strings; LogGCService.Run also defends against them.
 func parseDurationEnv(envName string, def time.Duration) time.Duration {
 	v := os.Getenv(envName)
 	if v == "" {
 		return def
 	}
 	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Printf("%s=%q is not a valid duration; using default %s", envName, v, def)
+	if err != nil || d <= 0 {
+		log.Printf("%s=%q is not a valid positive duration; using default %s", envName, v, def)
 		return def
 	}
 	return d

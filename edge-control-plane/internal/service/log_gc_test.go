@@ -200,3 +200,75 @@ func TestLogGC_RepoErrorDoesNotStopLoop(t *testing.T) {
 		t.Errorf("DeleteOlderThan call count = %d, want >= 2 (loop must continue after errors)", got)
 	}
 }
+
+// TestLogGC_ZeroIntervalRefusesToRun: a misconfigured LOG_GC_INTERVAL=0
+// must not busy-loop. Run should return immediately without touching the
+// repo and without scheduling a ticker. This locks in the defense-in-depth
+// guard alongside parseDurationEnv in main.go.
+func TestLogGC_ZeroIntervalRefusesToRun(t *testing.T) {
+	repo := &mockLogGCRepo{}
+	svc := NewLogGCService(repo)
+
+	done := make(chan struct{})
+	go func() {
+		svc.Run(context.Background(), 0, 1*time.Hour)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return for interval=0; should refuse to start")
+	}
+	if got := repo.callCount(); got != 0 {
+		t.Errorf("DeleteOlderThan call count = %d, want 0 (zero interval must not run)", got)
+	}
+}
+
+// TestLogGC_NegativeRetentionRefusesToRun: a misconfigured LOG_RETENTION=-1h
+// must not run — a negative retention cutoff would land in the future, and
+// the resulting "delete every row older than <future>" would wipe the table.
+// This guards the boundary in addition to parseDurationEnv.
+func TestLogGC_NegativeRetentionRefusesToRun(t *testing.T) {
+	repo := &mockLogGCRepo{}
+	svc := NewLogGCService(repo)
+
+	done := make(chan struct{})
+	go func() {
+		svc.Run(context.Background(), time.Hour, -1*time.Hour)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return for retention=-1h; should refuse to start")
+	}
+	if got := repo.callCount(); got != 0 {
+		t.Errorf("DeleteOlderThan call count = %d, want 0 (negative retention must not run)", got)
+	}
+}
+
+// TestLogGC_PreemptsOnCancelledContext: if the context is already cancelled
+// when a sweep fires (e.g. main() is mid-shutdown), runOnce must skip the
+// DELETE roundtrip. The check is at the top of runOnce so the immediate-
+// first-sweep path also honors it.
+func TestLogGC_PreemptsOnCancelledContext(t *testing.T) {
+	repo := &mockLogGCRepo{}
+	svc := NewLogGCService(repo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before Run starts
+
+	done := make(chan struct{})
+	go func() {
+		svc.Run(ctx, 10*time.Millisecond, 1*time.Hour)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit; should short-circuit on pre-cancelled ctx")
+	}
+	if got := repo.callCount(); got != 0 {
+		t.Errorf("DeleteOlderThan call count = %d, want 0 (pre-cancelled ctx must skip DELETE)", got)
+	}
+}
