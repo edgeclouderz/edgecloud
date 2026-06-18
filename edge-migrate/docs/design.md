@@ -1,8 +1,10 @@
 # edge-migrate Design
 
-> **Status:** Draft v0.1
-> **Date:** 2026-06-15
+> **Status:** Draft v0.2
+> **Date:** 2026-06-18
 > **Owner:** edgeCloud team
+>
+> **v0.2 changes:** Added §2.2 paragraph on the C preprocessor (always-on when `clang` is reachable, silent fallback to unexpanded source). The `MigrationReport` and `TransformResult` now carry a `preprocessor: Option<PreprocessorInfo>` field.
 
 ---
 
@@ -43,11 +45,44 @@ Crate lives under `edgeCloud/edge-migrate/` as its own workspace member. Install
 
 | Language | Phase 1 Support |
 |----------|----------------|
-| C | ✅ Full analysis + auto-transform for safe patterns |
+| C | ✅ Full analysis + auto-transform for safe patterns (with preprocessor expansion — see below) |
 | Rust | Analysis-only (`std::net` detection + suggestions) |
 | Other | Future extension |
 
 Safe patterns are defined in §4.
+
+**C preprocessor expansion.** POSIX patterns are routinely hidden behind
+project-internal macros: `#define socket(f, t, p) make_socket(f, t, p)` is
+indistinguishable from a user-defined function to a tree-sitter parse. To
+catch these, the analyzer runs the source through `clang -E -nostdinc`
+before tree-sitter analysis whenever a `Preprocessor` is attached.
+
+A preprocessor is **always-on when `clang` is reachable** (PATH lookup,
+falling back to `$WASI_SDK_PATH/bin/clang`). When reachable, patterns
+hidden behind macros become visible to the analyzer; report `line`
+fields are remapped to the **original** source line via the
+preprocessor's `line_map`. When `clang` is not reachable, the analyzer
+**silently falls back to the unexpanded source** — analysis never fails
+because the preprocessor is missing. A `tracing::warn!` is logged on
+fallback.
+
+**Limitations** (documented for honesty):
+
+- `clang -E` emits `# <lineno> "<file>"` linemarkers only at file
+  boundaries, not at every source line. The remap is therefore
+  best-effort: matches on synthetic lines (no preceding user-file
+  linemarker) keep their expanded line number. For most real-world
+  C code this is invisible because the re-entry linemarker for the
+  user file is emitted near the top of the expanded source.
+- `-nostdinc` means project-internal headers are not auto-included.
+  A future `--include-dir` flag will close this gap; tracked as a
+  follow-up issue.
+- The macro count in the report is a best-effort estimate from
+  counting `#define` directives in the original source, not an
+  authoritative expansion count from clang.
+
+Preprocessor metadata (clang version, files processed, macro count)
+is attached to `MigrationReport.preprocessor` and `TransformResult.preprocessor`.
 
 ### 2.3 Source Upload Model
 
@@ -91,7 +126,15 @@ Manual review required (1):
 
 Auto-transformable patterns: 3
   Total patterns detected: 4
+
+Preprocessor: 1 files processed, 3 macros expanded
+  (Apple clang version 17.0.0 (clang-1700.3.19.1))
 ```
+
+The `Preprocessor` line is omitted when no preprocessor is reachable or
+the analyzer falls back to the unexpanded source. It is informational
+only — the transformation result does not depend on the preprocessor
+having run.
 
 ### 3.2 Failure
 
