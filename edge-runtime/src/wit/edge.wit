@@ -156,9 +156,14 @@ interface http-server {
 
   // Buffered response — existing call. Body is fully delivered.
   respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<_, string>;
-  // Streaming response — Content-Length is REQUIRED in headers. The host drains
-  // the outgoing stream and writes chunks with timeout_at(deadline, write_all).
-  // Chunked transfer encoding is not implemented in v1; deferred to v2.
+  // Streaming response — Content-Length is REQUIRED in headers and must be
+  // a valid non-negative integer. Compression (Content-Encoding) is NOT
+  // supported on this path in v1; use `respond` for pre-compressed bodies.
+  // The host drains the outgoing stream and writes chunks with
+  // timeout_at(deadline, write_all). Chunked transfer encoding is not
+  // implemented in v1; deferred to v2. The host strips hop-by-hop and
+  // host-reserved headers (Connection, Keep-Alive, Proxy-*, TE, Trailer,
+  // Transfer-Encoding, Upgrade, Date, Server) from the guest's set.
   respond-stream: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body-stream: outgoing) -> result<_, string>;
 
   start: func(port: u16, host: option<string>) -> result<_, string>;

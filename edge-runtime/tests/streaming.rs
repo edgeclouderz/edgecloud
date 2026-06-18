@@ -471,3 +471,266 @@ async fn test_streaming_response_stalled_guest_is_timed_out() {
     // Cleanup: the writer is held by writer_task; let it finish.
     let _ = writer_task.await;
 }
+
+/// F3 regression: `respond_stream` without a Content-Length header must
+/// return an error (the host cannot default-inject CL because the
+/// adapter does not expose its total byte count).
+#[tokio::test]
+async fn test_streaming_response_rejects_missing_content_length() {
+    use edge_runtime::interfaces::http_server::{HttpServer, IncomingRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_connection_timeout(2)
+        .with_max_body_size(64 * 1024);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(b"GET /streamed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let req: IncomingRequest = tokio::time::timeout(Duration::from_secs(2), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll ok")
+        .expect("some request");
+    let req_id = req.id;
+
+    let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
+    let OutgoingEntry { stream, adapter } = entry;
+    let adapter = adapter.expect("adapter present");
+
+    // No Content-Length in the header set. Validation runs in the per-
+    // connection task, so respond_stream returns Ok on the oneshot send.
+    // The server tears the connection down before writing the head.
+    let _ = server
+        .respond_stream(
+            req_id,
+            200,
+            vec![("Content-Type".to_string(), "text/plain".to_string())],
+            adapter,
+        )
+        .await
+        .expect("respond_stream send");
+
+    // Read everything the server sends. We expect EOF with no bytes —
+    // the server tore the connection down without sending a response.
+    let mut drain = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut drain))
+        .await
+        .expect("read timed out — server should close the connection on validation error")
+        .expect("read ok");
+    assert_eq!(
+        read,
+        0,
+        "expected no bytes on the wire after Content-Length validation; got: {:?}",
+        String::from_utf8_lossy(&drain)
+    );
+    drop(stream);
+}
+
+/// F3 regression: a Content-Length value that does not parse as a positive
+/// integer must also be rejected.
+#[tokio::test]
+async fn test_streaming_response_rejects_invalid_content_length() {
+    use edge_runtime::interfaces::http_server::{HttpServer, IncomingRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_connection_timeout(2)
+        .with_max_body_size(64 * 1024);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(b"GET /streamed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let req: IncomingRequest = tokio::time::timeout(Duration::from_secs(2), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll ok")
+        .expect("some request");
+    let req_id = req.id;
+
+    let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
+    let OutgoingEntry { stream, adapter } = entry;
+    let adapter = adapter.expect("adapter present");
+
+    let _ = server
+        .respond_stream(
+            req_id,
+            200,
+            vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("Content-Length".to_string(), "not-a-number".to_string()),
+            ],
+            adapter,
+        )
+        .await
+        .expect("respond_stream send");
+
+    let mut drain = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut drain))
+        .await
+        .expect("read timed out — server should close the connection on validation error")
+        .expect("read ok");
+    assert_eq!(
+        read,
+        0,
+        "expected no bytes on the wire after invalid-Content-Length rejection; got: {:?}",
+        String::from_utf8_lossy(&drain)
+    );
+    drop(stream);
+}
+
+/// F3 regression: hop-by-hop / host-reserved headers in the guest's set
+/// must be stripped before the head is written to the socket. Here
+/// `Connection: close` is what the client already sent, and `Server`
+/// would otherwise let a guest spoof the server identity.
+#[tokio::test]
+async fn test_streaming_response_strips_hop_byhop_headers() {
+    use edge_runtime::interfaces::http_server::{HttpServer, IncomingRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_connection_timeout(5)
+        .with_max_body_size(64 * 1024);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(b"GET /strip HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let req: IncomingRequest = tokio::time::timeout(Duration::from_secs(2), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll ok")
+        .expect("some request");
+    let req_id = req.id;
+
+    let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
+    let OutgoingEntry {
+        mut stream,
+        adapter,
+    } = entry;
+    let adapter = adapter.expect("adapter present");
+
+    let writer = tokio::spawn(async move {
+        stream.write_chunk(b"ok".to_vec()).await.unwrap();
+        stream.finish().await.unwrap();
+    });
+
+    // Include a hop-by-hop header (Transfer-Encoding) and a spoofing-risk
+    // header (Server). Neither should appear on the wire.
+    server
+        .respond_stream(
+            req_id,
+            200,
+            vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("Content-Length".to_string(), "2".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                ("Server".to_string(), "spoofed/1.0".to_string()),
+            ],
+            adapter,
+        )
+        .await
+        .expect("respond_stream ok");
+
+    let mut drain = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut drain))
+        .await
+        .expect("read timed out");
+    let s = std::str::from_utf8(&drain).expect("utf-8");
+    let head_end = s.find("\r\n\r\n").expect("head end");
+    let head = &s[..head_end];
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "Transfer-Encoding should be stripped; got: {head}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("server:"),
+        "Server header should be stripped; got: {head}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("content-length: 2"),
+        "Content-Length should be preserved; got: {head}"
+    );
+    writer.await.unwrap();
+}
+
+/// F4 regression: `Content-Encoding: gzip` (or any other compression
+/// header) on `respond_stream` must be rejected — v1 does not implement
+/// streaming compression. Use `respond` for pre-compressed bodies.
+#[tokio::test]
+async fn test_streaming_response_rejects_content_encoding() {
+    use edge_runtime::interfaces::http_server::{HttpServer, IncomingRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_connection_timeout(2)
+        .with_max_body_size(64 * 1024);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(b"GET /streamed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let req: IncomingRequest = tokio::time::timeout(Duration::from_secs(2), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll ok")
+        .expect("some request");
+    let req_id = req.id;
+
+    let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
+    let OutgoingEntry { stream, adapter } = entry;
+    let adapter = adapter.expect("adapter present");
+
+    let _ = server
+        .respond_stream(
+            req_id,
+            200,
+            vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("Content-Length".to_string(), "100".to_string()),
+                ("Content-Encoding".to_string(), "gzip".to_string()),
+            ],
+            adapter,
+        )
+        .await
+        .expect("respond_stream send");
+
+    let mut drain = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut drain))
+        .await
+        .expect("read timed out — server should close the connection on Content-Encoding")
+        .expect("read ok");
+    assert_eq!(
+        read,
+        0,
+        "expected no bytes on the wire after Content-Encoding rejection; got: {:?}",
+        String::from_utf8_lossy(&drain)
+    );
+    drop(stream);
+}
