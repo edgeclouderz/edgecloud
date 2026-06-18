@@ -433,6 +433,63 @@ async fn test_stop_all_apps() {
     assert!(state.apps.is_empty(), "all apps should be stopped");
 }
 
+// ---------------------------------------------------------------------------
+// PR #96: build_supervisor helper + queue-group pinning regression test.
+// (Kept here after main's hash + cache tests to avoid an interleaved
+// conflict during rebase.)
+// ---------------------------------------------------------------------------
+
+/// Build a Supervisor that connects to `nats_url`. Shared helper for both
+/// the single-worker `TestHarness` and the multi-worker queue-group test.
+async fn build_supervisor(
+    nats_url: &str,
+    worker_id: &str,
+    region: &str,
+    queue_group: &str,
+    consumer_name: &str,
+    control_plane_url: &str,
+) -> anyhow::Result<Arc<Supervisor>> {
+    let config = Config {
+        worker_id: worker_id.to_string(),
+        region: region.to_string(),
+        nats_url: nats_url.to_string(),
+        control_plane_url: control_plane_url.to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
+        heartbeat_interval_secs: 30,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        queue_group: queue_group.to_string(),
+        consumer_name: consumer_name.to_string(),
+    };
+
+    let engine = edge_runtime::create_engine()?;
+    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+    let downloader = Arc::new(Downloader::new(
+        config.control_plane_url.clone(),
+        config.cache_dir.clone(),
+    ));
+    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
+        config.starting_port,
+        config.port_cooldown_secs,
+    )));
+
+    let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
+    Ok(Arc::new(Supervisor {
+        config,
+        state,
+        downloader,
+        port_pool,
+        nats,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Artifact hash verification + cache-path integration tests (from main).
+// Pre-pended before PR #96's queue-group pinning test to preserve original
+// ordering without interleaving.
+// ---------------------------------------------------------------------------
+
 /// Positive-path: when AppSpec.deployment_hash matches the artifact's SHA-256,
 /// the app starts normally. Guards against a future regression where the hash
 /// check accidentally blocks valid starts.
@@ -733,4 +790,143 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         !cache_path.exists(),
         "no cache file should be written for a failed download"
     );
+}
+
+/// Issue #86 regression test: two workers in the same region joined to the
+/// same queue group must NOT both start the same app when a single
+/// `TaskMessage` is published. NATS queue-group delivery guarantees
+/// exactly-one delivery across consumers in the group.
+#[tokio::test]
+async fn test_queue_group_pinning() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    timeout(Duration::from_secs(120), test_queue_group_pinning_inner())
+        .await
+        .expect("test_queue_group_pinning timed out")
+        .expect("test_queue_group_pinning failed");
+}
+
+async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
+    // Single NATS container, shared by both workers and the publisher.
+    let (nats_container, nats_url) = nats_container().await;
+
+    let region = "test-region";
+    let queue_group = "test-pinning-group";
+
+    // Two workers — same region, same queue group, distinct consumer names.
+    let sup_a = build_supervisor(
+        &nats_url,
+        "w_pinning_a",
+        region,
+        queue_group,
+        "consumer-a",
+        "http://localhost:9999",
+    )
+    .await?;
+    let sup_b = build_supervisor(
+        &nats_url,
+        "w_pinning_b",
+        region,
+        queue_group,
+        "consumer-b",
+        "http://localhost:9999",
+    )
+    .await?;
+
+    // Each supervisor gets its own shutdown channel — the test triggers
+    // shutdown at the end and waits for both loops to exit.
+    let (shutdown_tx_a, _) = tokio::sync::broadcast::channel::<()>(1);
+    let (shutdown_tx_b, _) = tokio::sync::broadcast::channel::<()>(1);
+
+    let sup_a_clone = sup_a.clone();
+    let shutdown_rx_a = shutdown_tx_a.subscribe();
+    let handle_a = tokio::spawn(async move {
+        let _ = sup_a_clone.run_consume_loop(shutdown_rx_a).await;
+    });
+
+    let sup_b_clone = sup_b.clone();
+    let shutdown_rx_b = shutdown_tx_b.subscribe();
+    let handle_b = tokio::spawn(async move {
+        let _ = sup_b_clone.run_consume_loop(shutdown_rx_b).await;
+    });
+
+    // Give both consume loops a moment to subscribe before publishing.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Publish a single TaskMessage via plain NATS — JetStream's stream
+    // (subjects = `edgecloud.tasks.>`) captures it.
+    let publisher = async_nats::connect(&nats_url).await?;
+    let payload = serde_json::json!({
+        "type": "task_update",
+        "timestamp": "2026-06-15T00:00:00Z",
+        "tenant_id": "t_test",
+        "apps": {
+            "pinned-app": {
+                "deployment_id": "d_pinned_001",
+                "deployment_hash": "abc123",
+                "env": {},
+                "allowlist": []
+            }
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    publisher
+        .publish(format!("edgecloud.tasks.{}", region), payload_bytes.into())
+        .await?;
+
+    // Wait for the message to be processed by exactly one worker.
+    let started =
+        wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "pinned-app", 15).await;
+    assert!(
+        started.is_some(),
+        "exactly one worker should have started pinned-app"
+    );
+
+    // Give the OTHER worker a chance to also start the app (it shouldn't).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let apps_a = sup_a.state.read().await.apps.len();
+    let apps_b = sup_b.state.read().await.apps.len();
+    let total = apps_a + apps_b;
+    assert_eq!(
+        total, 1,
+        "exactly one worker should host pinned-app (a={}, b={})",
+        apps_a, apps_b
+    );
+
+    // Signal shutdown and wait for consume loops to exit cleanly.
+    let _ = shutdown_tx_a.send(());
+    let _ = shutdown_tx_b.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_b).await;
+
+    drop(nats_container);
+    Ok(())
+}
+
+/// Wait until `app_name` is `Running` in any of `supervisors`. Returns
+/// which supervisor saw it (Some(index)) or None if none did within the
+/// timeout.
+async fn wait_for_either_app_running(
+    supervisors: &[Arc<Supervisor>],
+    app_name: &str,
+    timeout_secs: u64,
+) -> Option<usize> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        for (i, sup) in supervisors.iter().enumerate() {
+            let state = sup.state.read().await;
+            if let Some(inst) = state.apps.get(app_name) {
+                let inst = inst.lock().await;
+                if matches!(inst.status, AppInstanceStatus::Running) {
+                    return Some(i);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
