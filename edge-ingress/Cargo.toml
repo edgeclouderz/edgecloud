@@ -1,0 +1,33 @@
+[package]
+name = "edge-ingress"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "edge_ingress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "edge-ingress"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.45", features = ["full"] }
+async-nats = "0.49"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["nats"] }
+wiremock = "0.6"
