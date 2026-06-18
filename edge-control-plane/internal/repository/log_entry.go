@@ -57,11 +57,13 @@ func (r *LogEntryRepository) InsertBatch(ctx context.Context, entries []domain.L
 			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7,
 		)
-		// labels may be nil when the caller omitted them; sqlx passes nil
-		// as SQL NULL, but we want '{}' to match the column DEFAULT. Use
-		// the column DEFAULT by passing nil only when empty.
+		// labels may be nil (omitted) or sent as JSON null / an empty
+		// array; the JSONB column is NOT NULL with DEFAULT '{}'::jsonb,
+		// so we normalize all "empty-ish" inputs to '{}' for predictable
+		// downstream behavior (labels->>'key' works on every row).
 		labels := e.Labels
-		if len(labels) == 0 {
+		s := string(labels)
+		if len(labels) == 0 || s == "null" || s == "[]" {
 			labels = []byte("{}")
 		}
 		args = append(args,

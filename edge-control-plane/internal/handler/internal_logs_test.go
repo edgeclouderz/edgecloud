@@ -48,6 +48,13 @@ const (
 // 24-hour TTL (matching production).
 func validToken(t *testing.T, tenantID, workerID string) string {
 	t.Helper()
+	return validTokenWithRegion(t, tenantID, workerID, "fra")
+}
+
+// validTokenWithRegion is the variant used by TestIngestLogs_RegionFromJWT —
+// it lets the test pin a specific region on the JWT.
+func validTokenWithRegion(t *testing.T, tenantID, workerID, region string) string {
+	t.Helper()
 	claims := &middleware.WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    testJWTIssuer,
@@ -55,6 +62,7 @@ func validToken(t *testing.T, tenantID, workerID string) string {
 		},
 		WorkerID: workerID,
 		TenantID: tenantID,
+		Region:   region,
 		Apps:     []string{},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -79,10 +87,10 @@ func newIngestLogsServer(repo *mockLogEntryRepo) http.Handler {
 }
 
 // postLogs is a small helper that serializes entries as JSON and sends the
-// request through the test server. `overrideTenant` and `overrideWorker` let
-// us forge an entry with a different identity from the JWT — used to test the
-// tenant/worker overwrite behavior.
-func postLogs(t *testing.T, server http.Handler, token string, entries []domain.LogEntry, overrideTenant, overrideWorker string) *httptest.ResponseRecorder {
+// request through the test server. `overrideTenant`, `overrideWorker`, and
+// `overrideRegion` let us forge an entry with a different identity from the
+// JWT — used to test the tenant/worker/region overwrite behavior.
+func postLogs(t *testing.T, server http.Handler, token string, entries []domain.LogEntry, overrideTenant, overrideWorker, overrideRegion string) *httptest.ResponseRecorder {
 	t.Helper()
 	for i := range entries {
 		if overrideTenant != "" {
@@ -90,6 +98,9 @@ func postLogs(t *testing.T, server http.Handler, token string, entries []domain.
 		}
 		if overrideWorker != "" {
 			entries[i].WorkerID = overrideWorker
+		}
+		if overrideRegion != "" {
+			entries[i].Region = overrideRegion
 		}
 	}
 	body, err := json.Marshal(IngestLogsRequest{Entries: entries})
@@ -121,7 +132,7 @@ func TestIngestLogs_HappyPath(t *testing.T) {
 		{DeploymentID: "d_2", AppName: "app2", Level: "error", Message: "boom"},
 	}
 
-	rec := postLogs(t, server, token, entries, "", "")
+	rec := postLogs(t, server, token, entries, "", "", "")
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
 	}
@@ -147,7 +158,7 @@ func TestIngestLogs_EmptyEntries(t *testing.T) {
 	server := newIngestLogsServer(repo)
 	token := validToken(t, "t_real", "w_fra_abc123")
 
-	rec := postLogs(t, server, token, []domain.LogEntry{}, "", "")
+	rec := postLogs(t, server, token, []domain.LogEntry{}, "", "", "")
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}
@@ -180,7 +191,7 @@ func TestIngestLogs_AuthMissing(t *testing.T) {
 	server := newIngestLogsServer(repo)
 
 	// No Authorization header — WorkerAuth should reject before the handler runs.
-	rec := postLogs(t, server, "", []domain.LogEntry{{AppName: "x"}}, "", "")
+	rec := postLogs(t, server, "", []domain.LogEntry{{AppName: "x"}}, "", "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
@@ -195,7 +206,7 @@ func TestIngestLogs_AuthInvalid(t *testing.T) {
 
 	// Sign with a different secret than the server expects.
 	bad := validTokenWithSecret(t, "t_real", "w_fra_abc123", "wrong-secret")
-	rec := postLogs(t, server, bad, []domain.LogEntry{{AppName: "x"}}, "", "")
+	rec := postLogs(t, server, bad, []domain.LogEntry{{AppName: "x"}}, "", "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
@@ -209,10 +220,10 @@ func TestIngestLogs_BatchTooLarge(t *testing.T) {
 	server := newIngestLogsServer(repo)
 	token := validToken(t, "t_real", "w_fra_abc123")
 
-	// Build a JSON body whose total size exceeds MaxLogBatchSize+1. The
-	// JSON prefix is valid so the decoder actually tries to read past the
-	// cap; if we sent raw garbage the test would hit a JSON syntax error
-	// instead and never reach the size check.
+	// Build a JSON body whose total size exceeds MaxLogBatchSize. The JSON
+	// prefix is valid so the decoder actually tries to read past the cap;
+	// if we sent raw garbage the test would hit a JSON syntax error instead
+	// and never reach the size check.
 	prefix := []byte(`{"entries":[{"message":"`)
 	padding := bytes.Repeat([]byte("x"), MaxLogBatchSize+1)
 	suffix := []byte(`"}]}`)
@@ -235,6 +246,103 @@ func TestIngestLogs_BatchTooLarge(t *testing.T) {
 	}
 }
 
+// TestIngestLogs_RegionFromJWT confirms the handler overwrites the body-
+// supplied region with the JWT's region. A worker that lies about region
+// in the body must be ignored — the JWT is the source of truth.
+func TestIngestLogs_RegionFromJWT(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validTokenWithRegion(t, "t_real", "w_fra_real", "fra")
+
+	// Body claims region "us-east-1"; JWT carries "fra". Handler must use "fra".
+	entries := []domain.LogEntry{{AppName: "x", Message: "m", Region: "us-east-1"}}
+	rec := postLogs(t, server, token, entries, "", "", "us-east-1")
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if repo.calls != 1 {
+		t.Fatalf("repo called %d times, want 1", repo.calls)
+	}
+	if got := repo.lastEntries[0].Region; got != "fra" {
+		t.Errorf("Region = %q, want %q (body value us-east-1 must be overwritten)", got, "fra")
+	}
+}
+
+// TestIngestLogs_UnknownFieldAccepted verifies the lenient-decode behavior:
+// a struct drift on the worker side (a new field the control plane doesn't
+// know) is now accepted (was rejected with 400 under DisallowUnknownFields).
+// Syntactically broken bodies still 400 — see TestIngestLogs_BadJSON.
+func TestIngestLogs_UnknownFieldAccepted(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validToken(t, "t_real", "w_fra_real")
+
+	body := []byte(`{"entries":[{"deployment_id":"d_1","app_name":"x","level":"info","message":"m","future_field":"new"}]}`)
+	req := httptest.NewRequest("POST", "/api/internal/logs", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if repo.calls != 1 {
+		t.Errorf("repo should be called once for the valid entry, got %d", repo.calls)
+	}
+}
+
+// TestIngestLogs_BadJSON verifies that syntactically broken JSON still 400s
+// — the lenient-decode change accepts unknown fields but not garbage.
+func TestIngestLogs_BadJSON(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validToken(t, "t_real", "w_fra_real")
+
+	req := httptest.NewRequest("POST", "/api/internal/logs", bytes.NewReader([]byte(`{"entries": [garbage`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo should not be called on bad JSON, got %d calls", repo.calls)
+	}
+}
+
+// TestIngestLogs_TooManyEntries caps the row count per batch — a worker that
+// submits many tiny entries in a 1 MiB body cannot blow past MaxEntries.
+func TestIngestLogs_TooManyEntries(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validToken(t, "t_real", "w_fra_real")
+
+	entries := make([]domain.LogEntry, MaxEntries+1)
+	for i := range entries {
+		entries[i] = domain.LogEntry{
+			DeploymentID: "d_1",
+			AppName:      "x",
+			Level:        "info",
+			Message:      "m",
+		}
+	}
+	rec := postLogs(t, server, token, entries, "", "", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "too many entries") {
+		t.Errorf("expected error to mention 'too many entries', got: %s", rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo should not be called when entry count exceeds cap, got %d calls", repo.calls)
+	}
+}
+
 func TestIngestLogs_RepoError(t *testing.T) {
 	repo := &mockLogEntryRepo{
 		insertBatchFunc: func(ctx context.Context, entries []domain.LogEntry) error {
@@ -244,7 +352,7 @@ func TestIngestLogs_RepoError(t *testing.T) {
 	server := newIngestLogsServer(repo)
 	token := validToken(t, "t_real", "w_fra_abc123")
 
-	rec := postLogs(t, server, token, []domain.LogEntry{{AppName: "x"}}, "", "")
+	rec := postLogs(t, server, token, []domain.LogEntry{{AppName: "x"}}, "", "", "")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -264,7 +372,7 @@ func TestIngestLogs_TenantIDAndWorkerOverwritten(t *testing.T) {
 	// Body tries to attribute the log to a different tenant and a different
 	// worker. The handler must refuse these and use the JWT identity.
 	entries := []domain.LogEntry{{AppName: "x", Message: "leak attempt"}}
-	rec := postLogs(t, server, token, entries, "t_evil", "w_fra_evil")
+	rec := postLogs(t, server, token, entries, "t_evil", "w_fra_evil", "us-east-1")
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
@@ -292,6 +400,7 @@ func validTokenWithSecret(t *testing.T, tenantID, workerID, secret string) strin
 		},
 		WorkerID: workerID,
 		TenantID: tenantID,
+		Region:   "fra",
 		Apps:     []string{},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
