@@ -4,10 +4,10 @@ use anyhow::Context;
 use std::path::PathBuf;
 
 // `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
-// env vars but not yet consumed by the supervisor — the wiring is tracked as a
-// follow-up to PR #61. Allow dead code on these fields so `clippy -D warnings`
-// stays green; remove the allow once the supervisor reads them.
-#[allow(dead_code)]
+// env vars and consumed by the supervisor (PR #64 follow-up). They plumb
+// per-app wasmtime limits: StoreLimits for memory, and an epoch ticker +
+// deadline for CPU budgets. The previous PR deferred the wiring; this PR
+// closes the loop and removes the dead_code allow.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub worker_id: String,
@@ -172,5 +172,84 @@ mod tests {
         let err = parse_env_u64("EDGE_TEST_VAR", 42).unwrap_err();
         // u64 can't represent -1, so we expect a parse error.
         assert!(format!("{:#}", err).contains("EDGE_TEST_VAR"));
+    }
+
+    /// `Config::from_env` requires WORKER_ID, REGION, and CONTROL_PLANE_URL
+    /// to be set. Tests that exercise the full `from_env` path need to set
+    /// all three; missing any of them produces a clear error.
+    ///
+    /// These tests set env vars directly under a single manual ENV_LOCK
+    /// acquisition. The existing EnvGuard helper takes the lock internally
+    /// and is non-reentrant, so creating more than one EnvGuard per test
+    /// deadlocks. Direct mutation under a held lock is the only safe
+    /// pattern for tests that need several env vars.
+    fn lock_and_set(vars: &[(&str, Option<&str>)]) -> std::sync::MutexGuard<'static, ()> {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in vars {
+            match v {
+                Some(s) => unsafe { std::env::set_var(k, s) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        lock
+    }
+
+    /// `Config::from_env` reads APP_MAX_MEMORY_MB and passes it to the
+    /// supervisor's create_store call. Without this test, the field could
+    /// regress to a hardcoded 256 (the previous behavior) and the
+    /// env-var knob would become decorative.
+    #[test]
+    fn config_from_env_reads_max_memory_mb() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_abc")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("APP_MAX_MEMORY_MB", Some("64")),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_eq!(cfg.max_memory_mb, 64, "APP_MAX_MEMORY_MB should be 64");
+    }
+
+    /// EPOCH_TICK_MS and EPOCH_DEADLINE_TICKS together define the per-app
+    /// CPU budget. The supervisor spawns a ticker at EPOCH_TICK_MS and
+    /// sets a deadline of EPOCH_DEADLINE_TICKS — defaults of 10 ms and
+    /// 100 ticks yield a ~1 s budget per call.
+    #[test]
+    fn config_from_env_reads_epoch_fields() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_abc")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("EPOCH_TICK_MS", Some("5")),
+            ("EPOCH_DEADLINE_TICKS", Some("50")),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_eq!(cfg.epoch_tick_ms, 5, "EPOCH_TICK_MS should be 5");
+        assert_eq!(
+            cfg.epoch_deadline_ticks, 50,
+            "EPOCH_DEADLINE_TICKS should be 50"
+        );
+    }
+
+    /// When the env vars are unset, the defaults (256 / 10 / 100) take
+    /// effect. Pinning the defaults in a test catches accidental
+    /// regressions where a future refactor changes the fallback.
+    #[test]
+    fn config_from_env_uses_defaults_when_unset() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_abc")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("APP_MAX_MEMORY_MB", None),
+            ("EPOCH_TICK_MS", None),
+            ("EPOCH_DEADLINE_TICKS", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_eq!(cfg.max_memory_mb, 256, "default max_memory_mb is 256");
+        assert_eq!(cfg.epoch_tick_ms, 10, "default epoch_tick_ms is 10");
+        assert_eq!(
+            cfg.epoch_deadline_ticks, 100,
+            "default epoch_deadline_ticks is 100"
+        );
     }
 }
