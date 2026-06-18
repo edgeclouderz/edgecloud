@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         worker_id = %config.worker_id,
         region = %config.region,
+        worker_addr = %config.worker_addr,
         "configuration loaded"
     );
 
