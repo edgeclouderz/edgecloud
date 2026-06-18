@@ -8,6 +8,7 @@
 //! Silent fallback: when `clang` is not reachable, `Preprocessor::discover`
 //! returns `None` and the analyzer uses the unexpanded source as-is.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,7 +45,7 @@ pub struct ExpandedSource {
 }
 
 /// Summary of preprocessing metadata, attached to reports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreprocessorInfo {
     /// Version reported by `clang --version` (best-effort).
     pub clang_version: Option<String>,

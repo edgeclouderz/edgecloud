@@ -4,6 +4,7 @@
 //! generating transformed source code and a transformation report.
 
 use crate::patterns::{PatternMatch, PosixPattern, Transformability};
+use crate::preprocessor::PreprocessorInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 
@@ -40,6 +41,12 @@ pub struct TransformResult {
     pub manual_review: Vec<PatternMatch>,
     /// Errors that occurred during transformation.
     pub errors: Vec<TransformError>,
+    /// Preprocessor metadata, when a preprocessor was used during
+    /// analysis. `None` when no preprocessor was attached, when the
+    /// preprocessor was not discovered, or when the analyzer fell
+    /// back to the unexpanded source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessor: Option<PreprocessorInfo>,
 }
 
 /// WASI header includes to prepend to the transformed source.
@@ -62,7 +69,15 @@ impl Transformer {
     /// BETWEEN the current match's end and the PREVIOUS match's end (in
     /// original source coordinates). After all matches, append any remaining
     /// original content from byte 0 to the first match's start.
-    pub fn transform(source: &str, matches: Vec<PatternMatch>) -> TransformResult {
+    ///
+    /// `preprocessor_info` is attached to the result so callers (the CLI
+    /// bin, the control plane) can report "Preprocessor: expanded N macros"
+    /// back to the user. Pass `None` when no preprocessor was used.
+    pub fn transform(
+        source: &str,
+        matches: Vec<PatternMatch>,
+        preprocessor_info: Option<PreprocessorInfo>,
+    ) -> TransformResult {
         let mut transformations_applied = Vec::new();
         let mut manual_review = Vec::new();
 
@@ -131,6 +146,7 @@ impl Transformer {
             transformations_applied,
             manual_review,
             errors: Vec::new(),
+            preprocessor: preprocessor_info,
         }
     }
 
@@ -277,7 +293,7 @@ int main() {
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert_eq!(result.manual_review.len(), 0);
         assert!(result.transformed_source.contains("wasi_socket_tcp_create"));
@@ -303,7 +319,7 @@ int main() {
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
             transformability: Transformability::NotTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 0);
         assert_eq!(result.manual_review.len(), 1);
     }
@@ -328,7 +344,7 @@ int main() {
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
@@ -354,7 +370,7 @@ int main() {
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_socket_tcp_start_connect"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_finish_connect"));
@@ -380,7 +396,7 @@ int main() {
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_input_stream_read"));
     }
@@ -405,7 +421,7 @@ int main() {
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_output_stream_write"));
     }
@@ -430,7 +446,7 @@ int main() {
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
             transformability: Transformability::BestEffort,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
         assert!(result.transformed_source.contains("wasi_poll_pollable_block"));
@@ -524,7 +540,7 @@ int main() {
 "#;
         let mut analyzer = crate::analyzer::CAnalyzer::new();
         let matches = analyzer.analyze(source);
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
 
         // Smoke checks: key WASI markers must be present
         assert!(result.transformed_source.contains("wasi_socket_tcp_create"));

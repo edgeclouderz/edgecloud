@@ -14,28 +14,42 @@ pub fn print_analysis_report(report: &MigrationReport) {
 
     if report.patterns_detected.is_empty() {
         println!("No POSIX patterns detected.");
-        return;
-    }
-
-    println!("Patterns detected: {}", report.patterns_detected.len());
-    println!();
-
-    if !report.patterns_transformed.is_empty() {
-        println!("Auto-transformable ({}):", report.patterns_transformed.len());
-        for p in &report.patterns_transformed {
-            println!("  ✅ Line {}: {} → {}", p.line, p.pattern, p.wasi_equivalent);
-        }
+    } else {
+        println!("Patterns detected: {}", report.patterns_detected.len());
         println!();
+
+        if !report.patterns_transformed.is_empty() {
+            println!("Auto-transformable ({}):", report.patterns_transformed.len());
+            for p in &report.patterns_transformed {
+                println!("  ✅ Line {}: {} → {}", p.line, p.pattern, p.wasi_equivalent);
+            }
+            println!();
+        }
+
+        if !report.patterns_manual_review.is_empty() {
+            println!(
+                "Manual review required ({}):",
+                report.patterns_manual_review.len()
+            );
+            for p in &report.patterns_manual_review {
+                println!("  ⚠️  Line {}: {}", p.line, p.pattern);
+                println!("      WASI equivalent: {}", p.wasi_equivalent);
+            }
+            println!();
+        }
     }
 
-    if !report.patterns_manual_review.is_empty() {
+    // The preprocessor summary is useful even when no patterns
+    // are detected — it tells the developer that macros were
+    // expanded (and how many) so they're not surprised by a
+    // count that differs from "manual count of #define".
+    if let Some(pp) = &report.preprocessor {
         println!(
-            "Manual review required ({}):",
-            report.patterns_manual_review.len()
+            "Preprocessor: {} files processed, {} macros expanded",
+            pp.files_processed, pp.macros_expanded
         );
-        for p in &report.patterns_manual_review {
-            println!("  ⚠️  Line {}: {}", p.line, p.pattern);
-            println!("      WASI equivalent: {}", p.wasi_equivalent);
+        if let Some(v) = &pp.clang_version {
+            println!("  ({})", v);
         }
         println!();
     }

@@ -3,6 +3,7 @@
 //! Defines the structured report format returned by the migration pipeline.
 
 use crate::patterns::PatternMatch;
+use crate::preprocessor::PreprocessorInfo;
 use serde::{Deserialize, Serialize};
 
 /// Overall migration status.
@@ -60,6 +61,12 @@ pub struct MigrationReport {
     pub patterns_manual_review: Vec<PatternInfo>,
     /// Errors encountered.
     pub errors: Vec<ErrorInfo>,
+    /// Preprocessor metadata, when a preprocessor was used during
+    /// analysis. `None` when no preprocessor was attached, when the
+    /// preprocessor was not discovered, or when the analyzer fell
+    /// back to the unexpanded source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessor: Option<PreprocessorInfo>,
 }
 
 impl MigrationReport {
@@ -113,7 +120,19 @@ impl MigrationReport {
             patterns_transformed,
             patterns_manual_review,
             errors: Vec::new(),
+            preprocessor: None,
         }
+    }
+
+    /// Create a report with preprocessor metadata attached.
+    pub fn from_pattern_matches_with_preprocessor(
+        app_name: &str,
+        matches: Vec<PatternMatch>,
+        preprocessor: PreprocessorInfo,
+    ) -> Self {
+        let mut report = Self::from_pattern_matches(app_name, matches);
+        report.preprocessor = Some(preprocessor);
+        report
     }
 }
 
@@ -196,5 +215,40 @@ mod tests {
         let report = MigrationReport::from_pattern_matches("hello_world", matches);
         assert!(!report.is_migratable());
         assert!(matches!(report.status, MigrationStatus::Failed));
+    }
+
+    #[test]
+    fn test_report_with_preprocessor_attaches_info() {
+        let matches = vec![PatternMatch {
+            line: 1,
+            column: None,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::SocketTcp,
+            snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            transformability: Transformability::AutoTransformable,
+        }];
+        let pp = PreprocessorInfo {
+            clang_version: Some("clang version 17.0.0".to_string()),
+            files_processed: 1,
+            macros_expanded: 3,
+        };
+        let report = MigrationReport::from_pattern_matches_with_preprocessor(
+            "hello_world",
+            matches,
+            pp,
+        );
+        let attached = report.preprocessor.expect("preprocessor info should be set");
+        assert_eq!(attached.files_processed, 1);
+        assert_eq!(attached.macros_expanded, 3);
+        assert_eq!(attached.clang_version.as_deref(), Some("clang version 17.0.0"));
+    }
+
+    #[test]
+    fn test_report_default_has_no_preprocessor() {
+        let matches = vec![];
+        let report = MigrationReport::from_pattern_matches("hello_world", matches);
+        assert!(report.preprocessor.is_none());
     }
 }
