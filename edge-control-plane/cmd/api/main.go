@@ -74,8 +74,10 @@ func main() {
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 
-	// Initialize middleware
-	authMiddleware := middleware.NewAuthMiddleware(apiKeyRepo)
+	// Initialize middleware. The auth path delegates to APIKeyService
+	// (which dispatches to the algorithm-specific verifier) rather than
+	// calling the repo directly — see middleware/auth.go for why.
+	authMiddleware := middleware.NewAuthMiddleware(apiKeySvc)
 
 	// Setup router
 	mux := http.NewServeMux()
