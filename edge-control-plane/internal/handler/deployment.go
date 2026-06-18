@@ -17,10 +17,10 @@ import (
 // DeploymentHandler handles deployment HTTP requests.
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
-	workerSvc     *service.WorkerService
+	workerSvc     service.AppTargetLookup
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService) *DeploymentHandler {
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
 	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc}
 }
 
@@ -138,6 +138,13 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(deployment)
 }
 
+// containsPathTraversal blocks the *decoded* traversal shapes ("/", "\\",
+// ".."). The caller is responsible for passing a value that has already
+// been percent-decoded — e.g. http.Request.PathValue (used by AppIngress
+// and Deploy), or an explicit url.PathUnescape for body fields. Encoding
+// bypasses (e.g. %2F, %2E%2E) are intentionally not caught here because
+// the input is already decoded by the time this helper sees it; the
+// helper's job is to reject post-decode traversal, not to decode.
 func containsPathTraversal(s string) bool {
 	if s == "" {
 		return true
