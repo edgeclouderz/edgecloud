@@ -5,10 +5,12 @@
 
 pub mod analyzer;
 pub mod patterns;
+pub mod preprocessor;
 pub mod report;
 pub mod transformer;
 
 pub use analyzer::CAnalyzer;
 pub use patterns::{PatternMatch, PosixPattern, Transformability};
+pub use preprocessor::{ExpandedSource, PreprocessError, Preprocessor, PreprocessorInfo};
 pub use report::MigrationReport;
 pub use transformer::{TransformResult, Transformer};
