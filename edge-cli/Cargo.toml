@@ -23,6 +23,7 @@ tree-sitter-c = "0.21"
 syn = "2.0"
 walkdir = "2.5"
 dirs = "5.0"
+edge-config = { path = "../edge-config" }
 
 [features]
 default = ["network"]

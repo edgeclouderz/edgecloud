@@ -1,10 +1,79 @@
 //! HTTP client for the edgeCloud control plane API.
 
 use anyhow::Result;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ApiKey;
+
+/// Distinguishes a credential rejection (4xx — the server explicitly
+/// said "this key is bad") from a transient error (5xx, network
+/// failure, timeout). Used by flows that need to react differently
+/// to each, e.g. `edge auth login` exits 1 on `Rejected` but tolerates
+/// `Transient` so users can work offline.
+#[derive(Debug)]
+pub enum ApiError {
+    /// 4xx — the server rejected the request as invalid (typically
+    /// 401 for an invalid/missing API key, 403 for insufficient role,
+    /// 400 for malformed input).
+    Rejected { status: StatusCode, body: String },
+    /// 5xx, timeout, DNS failure, or any other transient problem.
+    Transient { source: anyhow::Error },
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Rejected { status, body } => {
+                write!(f, "rejected by server: {status} {body}")
+            }
+            ApiError::Transient { source } => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(source: anyhow::Error) -> Self {
+        ApiError::Transient { source }
+    }
+}
+
+impl From<reqwest::Error> for ApiError {
+    fn from(source: reqwest::Error) -> Self {
+        ApiError::Transient {
+            source: anyhow::anyhow!("{source}"),
+        }
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(source: serde_json::Error) -> Self {
+        ApiError::Transient {
+            source: anyhow::anyhow!("invalid response body: {source}"),
+        }
+    }
+}
+
+/// Inspect a response and split 2xx (return `Ok`) from 4xx (`Rejected`)
+/// and the rest (`Transient`, after reading whatever body is
+/// available). The body is read once on the non-2xx path.
+fn check_response(resp: Response) -> Result<Response, ApiError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().unwrap_or_default();
+    if status.is_client_error() {
+        Err(ApiError::Rejected { status, body })
+    } else {
+        Err(ApiError::Transient {
+            source: anyhow::anyhow!("server returned {status}: {body}"),
+        })
+    }
+}
 
 /// HTTP client for all control plane API calls.
 pub struct ApiClient {
@@ -67,6 +136,16 @@ impl ApiClient {
         Ok(client)
     }
 
+    /// Create a new API client that loads the API key ONLY from the
+    /// config file (skipping `EDGE_API_KEY`). Used by flows that just
+    /// wrote a key to disk and need to validate the on-disk value
+    /// without an ambient env var shadowing it.
+    pub fn new_from_config_only(base_url: String) -> Result<Self> {
+        let mut client = Self::new_anonymous(base_url)?;
+        client.api_key = ApiKey::load_without_env()?;
+        Ok(client)
+    }
+
     /// Create a client that does not require an API key. The internal
     /// `api_key` field is set to an empty placeholder; callers must not
     /// use [`auth_header`](Self::auth_header) on a client built this way.
@@ -119,9 +198,12 @@ impl ApiClient {
             .multipart(form)
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("deploy failed: {} {}", resp.status(), resp.text()?);
-        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("deploy failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
 
         let body: DeployResponse = serde_json::from_str(&resp.text()?)?;
         Ok(body)
@@ -136,9 +218,12 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("status failed: {} {}", resp.status(), resp.text()?);
-        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("status failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
 
         serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
@@ -152,9 +237,12 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("list env failed: {} {}", resp.status(), resp.text()?);
-        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("list env failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
 
         serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
@@ -175,10 +263,12 @@ impl ApiClient {
             .json(&payload)
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("set env failed: {} {}", resp.status(), resp.text()?);
-        }
-
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("set env failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
         Ok(())
     }
 
@@ -194,10 +284,12 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("activate failed: {} {}", resp.status(), resp.text()?);
-        }
-
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("activate failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
         Ok(())
     }
 
@@ -210,13 +302,12 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!(
-                "list deployments failed: {} {}",
-                resp.status(),
-                resp.text()?
-            );
-        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("list deployments failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
 
         serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
@@ -246,9 +337,12 @@ impl<'a> Tenants<'a> {
         };
         let resp = self.client.http.post(&url).json(&payload).send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("signup failed: {} {}", resp.status(), resp.text()?);
-        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("signup failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
         serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
 }
@@ -261,7 +355,12 @@ pub struct Auth<'a> {
 impl<'a> Auth<'a> {
     /// GET `/api/auth/whoami` — returns the tenant + API key info
     /// associated with the caller's Bearer token.
-    pub fn whoami(&self) -> Result<WhoamiResponse> {
+    ///
+    /// Returns `ApiError` so callers (e.g. `edge auth login`) can
+    /// distinguish a 401 rejection from a 5xx/network failure and
+    /// react accordingly. Use `whoami_anyhow` for the simple
+    /// `Result<WhoamiResponse>` shape.
+    pub fn whoami(&self) -> Result<WhoamiResponse, ApiError> {
         let url = format!("{}/api/auth/whoami", self.client.base_url);
         let resp = self
             .client
@@ -270,9 +369,20 @@ impl<'a> Auth<'a> {
             .header("Authorization", self.client.auth_header())
             .send()?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("whoami failed: {} {}", resp.status(), resp.text()?);
-        }
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        let resp = check_response(resp)?;
+        serde_json::from_str(&resp.text()?).map_err(ApiError::from)
+    }
+
+    /// Convenience wrapper around [`whoami`] that flattens the
+    /// `ApiError` into an `anyhow::Error`. Used by the `edge auth
+    /// whoami` subcommand, which has no need to distinguish rejection
+    /// from transient failure.
+    pub fn whoami_anyhow(&self) -> Result<WhoamiResponse> {
+        self.whoami().map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("whoami failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })
     }
 }
