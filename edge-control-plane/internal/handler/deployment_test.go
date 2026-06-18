@@ -156,17 +156,26 @@ func TestAppIngress_ServiceError_Returns500(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestAppIngress_PathTraversal_Returns400 exercises the 400 path the
-// handler can actually trigger. Note that the Go `http.ServeMux` does
+// handler can actually trigger. Note that Go's `http.ServeMux` does
 // its own path cleaning BEFORE the handler is called:
-//   - `..` and `.` segments in the URL are collapsed (mux returns 307
-//     to the cleaned URL — the handler never sees them).
-//   - `/` inside what would be a single wildcard segment makes the
+//   - A request whose `URL.RawPath` is empty (i.e. the decoded path
+//     equals the raw path) and that contains a literal `..` segment
+//     gets collapsed by the mux cleaner into a 307 redirect to the
+//     normalized URL — the handler never sees it.
+//   - A `/` inside what would be the `{appName}` segment makes the
 //     pattern not match at all (mux returns 404 — the handler never
-//     sees them).
+//     sees it).
+//   - An empty `{appName}` is unreachable: `GET /api/apps//ingress`
+//     redirects to `/api/apps/ingress/` via the mux's trailing-slash
+//     cleaner, so `r.PathValue("appName")` is never empty in practice.
 //
-// So the handler only has to defend against inputs that survive mux
-// cleaning, e.g. backslashes and percent-encoded forms that decode
-// after the mux has already moved on.
+// What survives mux cleaning and reaches the handler:
+//   - Literal backslashes (POSIX URL parsers pass them through).
+//   - Percent-encoded forms (`%2E%2E`, `%2F`) — these survive because
+//     when `URL.RawPath` is set and differs from `URL.Path`, the mux
+//     cleaner uses `RawPath`, where `%2E%2E` is a literal 6-char token
+//     with no `..` to collapse. The decoded `..` only materializes
+//     when `r.PathValue` decodes the matched segment.
 func TestAppIngress_PathTraversal_Returns400(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -176,10 +185,8 @@ func TestAppIngress_PathTraversal_Returns400(t *testing.T) {
 		// pass it through verbatim. The handler's containsPathTraversal
 		// explicitly rejects it.
 		{"backslash", `foo\bar`},
-		// %2E%2E reaches the handler as the literal string ".." because
-		// Go's net/url decodes percent-escapes in the path before the
-		// mux fills the path value (and the mux's `..` cleaning only
-		// runs on the un-decoded URL — see net/http serverHandler).
+		// %2E%2E — see block comment above for why the mux cleaner
+		// leaves this alone and the handler sees the decoded "..".
 		{"percent-encoded dots", "%2E%2E"},
 	}
 	for _, tt := range tests {
