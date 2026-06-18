@@ -37,12 +37,34 @@ fn config_file_for(home: &TempDir) -> PathBuf {
             .join("Application Support")
             .join("edgecloud")
             .join("config.toml")
+    } else if cfg!(target_os = "windows") {
+        home.path()
+            .join("AppData")
+            .join("Roaming")
+            .join("edgecloud")
+            .join("config.toml")
     } else {
         home.path()
             .join(".config")
             .join("edgecloud")
             .join("config.toml")
     }
+}
+
+/// Inject the platform-appropriate env vars so the child CLI resolves
+/// its config dir to the test tempdir, not the developer's real home.
+fn set_platform_env(cmd: &mut Command, home: &TempDir) {
+    if cfg!(target_os = "windows") {
+        cmd.env("APPDATA", home.path().join("AppData").join("Roaming"));
+        cmd.env("USERPROFILE", home.path());
+    } else {
+        cmd.env("HOME", home.path());
+        if !cfg!(target_os = "macos") {
+            cmd.env("XDG_CONFIG_HOME", home.path());
+        }
+    }
+    // Always strip any host-process env vars that could shadow the test.
+    cmd.env_remove("EDGE_API_KEY");
 }
 
 /// Read the config file and parse out `default.api_key` (if any).
@@ -76,10 +98,8 @@ async fn signup_writes_returned_key_to_config_file() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("EDGE_API_KEY")
-        .env("EDGE_API_URL", server.uri())
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("signup")
         .arg("--name")
@@ -98,13 +118,8 @@ fn login_with_key_flag_writes_to_config() {
     let home = isolated_home();
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("EDGE_API_KEY")
-        .arg("auth")
-        .arg("login")
-        .arg("--key")
-        .arg("k_from_flag");
+    set_platform_env(&mut cmd, &home);
+    cmd.arg("auth").arg("login").arg("--key").arg("k_from_flag");
 
     // Login also tries to call whoami at the end. We don't mount a
     // server here, so it should fail gracefully (warning, not error)
@@ -120,12 +135,8 @@ fn login_from_stdin_writes_to_config() {
     let home = isolated_home();
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("EDGE_API_KEY")
-        .arg("auth")
-        .arg("login")
-        .write_stdin("k_from_stdin\n");
+    set_platform_env(&mut cmd, &home);
+    cmd.arg("auth").arg("login").write_stdin("k_from_stdin\n");
 
     cmd.assert().success();
 
@@ -161,9 +172,8 @@ async fn whoami_prints_tenant_info() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env("EDGE_API_URL", server.uri())
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("whoami");
 
@@ -185,11 +195,8 @@ fn logout_removes_key_from_config() {
     writeln!(f, "[default]\napi_key = \"k_to_remove\"\n").unwrap();
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("EDGE_API_KEY")
-        .arg("auth")
-        .arg("logout");
+    set_platform_env(&mut cmd, &home);
+    cmd.arg("auth").arg("logout");
 
     cmd.assert().success();
     assert!(
@@ -204,11 +211,83 @@ fn logout_is_idempotent_when_no_key() {
     // No config file exists.
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    cmd.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("EDGE_API_KEY")
-        .arg("auth")
-        .arg("logout");
+    set_platform_env(&mut cmd, &home);
+    cmd.arg("auth").arg("logout");
 
     cmd.assert().success();
+}
+
+/// F1: a key the server rejects (401) must exit non-zero, but the
+/// rejected key is still on disk so the user can re-run `login` to
+/// overwrite it. Verifies the post-save verification now treats
+/// credential rejection as a hard error rather than a soft warning.
+#[tokio::test]
+async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
+    let home = isolated_home();
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/auth/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid key"))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("login")
+        .arg("--key")
+        .arg("k_typo");
+
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("rejected"));
+
+    // The bad key is still on disk; the user can fix it with another
+    // `login` call rather than starting from scratch.
+    let stored = read_api_key(&home).expect("rejected key should remain on disk");
+    assert_eq!(stored, "k_typo");
+}
+
+/// F2: an exported `EDGE_API_KEY` must NOT shadow the just-saved key
+/// during the post-save verification. The server should see the
+/// pasted `k_real` as the Bearer token, not the env-var `k_env`.
+#[tokio::test]
+async fn login_verifies_just_saved_key_not_env_var() {
+    use wiremock::matchers::header;
+
+    let home = isolated_home();
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/auth/whoami"))
+        .and(header("Authorization", "Bearer k_real"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_xyz",
+            "tenant_name": "Acme",
+            "plan": "free",
+            "api_key_id": "k_def",
+            "api_key_name": "default",
+            "role": "owner",
+            "created_at": "2026-06-18T00:00:00Z",
+        })))
+        // If the env-var shadowed the just-saved key, the request would
+        // arrive with `Bearer k_env` and be rejected by this mock.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .env("EDGE_API_KEY", "k_env_stale")
+        .arg("auth")
+        .arg("login")
+        .write_stdin("k_real\n");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Logged in as Acme"));
 }
