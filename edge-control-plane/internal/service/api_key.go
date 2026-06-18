@@ -25,6 +25,7 @@ var ErrInvalidAPIKey = errors.New("invalid api key")
 // repository type.
 type APIKeyRepo interface {
 	Create(ctx context.Context, k *domain.APIKey) error
+	GetByID(ctx context.Context, id string) (*domain.APIKey, error)
 	GetByLookupHash(ctx context.Context, lookupHash string) (*domain.APIKey, error)
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	Delete(ctx context.Context, id string) error
