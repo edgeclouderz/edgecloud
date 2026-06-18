@@ -764,6 +764,18 @@ impl HttpServer {
     /// Write a streaming response: status line, headers, then drain the
     /// OutgoingStreamAdapter chunks with `timeout_at(deadline, write_all)`
     /// per chunk. Requires Content-Length in headers (v1 — no chunked TE).
+    ///
+    /// Header enforcement (F3, F4):
+    /// - Content-Length MUST be present and parseable as a positive integer.
+    ///   The host does not default-inject a CL — the adapter does not expose
+    ///   its total byte count, and computing it would require draining the
+    ///   adapter (defeating the streaming benefit).
+    /// - Content-Encoding is rejected. Per-chunk streaming compression is
+    ///   deferred to v2 (gzip block overhead + no way to know compressed
+    ///   size up front). Use the buffered `respond` for pre-compressed bodies.
+    /// - Hop-by-hop / host-reserved headers (RFC 7230 §6.1) are stripped
+    ///   from the guest's set before writing, to avoid response splitting
+    ///   and spoofing.
     async fn write_streaming_response(
         stream: &mut SharedWriteHalf,
         head: &StreamingResponseHead,
@@ -771,13 +783,47 @@ impl HttpServer {
         deadline: Instant,
     ) -> Result<(), std::io::Error> {
         use futures::StreamExt;
+
+        // F3 — require Content-Length; reject Content-Encoding; strip hop-by-hop.
+        let mut content_length_present = false;
+        let mut filtered_headers: Vec<(&String, &String)> = Vec::with_capacity(head.headers.len());
+        for (k, v) in &head.headers {
+            if k.eq_ignore_ascii_case("Content-Length") {
+                content_length_present = true;
+                // Validate the value parses as a positive integer; we use
+                // this only to catch obviously-bad input, not to reconcile
+                // the actual body length.
+                if v.parse::<usize>().is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("streaming response Content-Length not a valid integer: {v:?}"),
+                    ));
+                }
+            } else if k.eq_ignore_ascii_case("Content-Encoding") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "compression not supported on streaming responses; use respond() for pre-compressed bodies",
+                ));
+            } else if Self::is_hop_byhop_or_reserved_header(k) {
+                // Strip — host owns framing.
+                continue;
+            }
+            filtered_headers.push((k, v));
+        }
+        if !content_length_present {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streaming response requires Content-Length in headers",
+            ));
+        }
+
         let status_line = format!(
             "HTTP/1.1 {} {}\r\n",
             head.status,
             Self::status_text(head.status)
         );
         let mut response = status_line.into_bytes();
-        for (k, v) in &head.headers {
+        for (k, v) in &filtered_headers {
             response.extend(format!("{}: {}\r\n", k, v).bytes());
         }
         response.extend(b"\r\n");
@@ -1012,6 +1058,27 @@ impl HttpServer {
             503 => "Service Unavailable",
             _ => "Unknown",
         }
+    }
+
+    /// Hop-by-hop headers (RFC 7230 §6.1) and host-reserved framing
+    /// headers that the guest must not set on `respond-stream`. The host
+    /// owns the framing on streaming responses (Content-Length is
+    /// required, no compression, no chunked TE in v1) and the connection
+    /// lifecycle (Connection, Keep-Alive, Upgrade, etc.).
+    fn is_hop_byhop_or_reserved_header(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "date"
+                | "server"
+        )
     }
 
     /// Poll for an incoming request (delivered by the accept loop).
