@@ -595,19 +595,23 @@ mod streams_impl {
             self_: Resource<Incoming>,
             _max_bytes: u32,
         ) -> Result<Vec<u8>, WitStreamError> {
-            // Recover from poisoned mutexes: a panic elsewhere in the
-            // worker must not take down every subsequent stream op on
-            // this RuntimeState. The lock is still held across
-            // block_on_timeout — that's a separate refactor (see plan
-            // follow-up "clone the entry, drop the guard, await on clone").
-            let mut incoming = self
-                .incoming_streams
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = incoming
-                .get_mut(&self_.rep())
-                .ok_or(WitStreamError::Closed)?;
-            block_on_timeout(entry.stream.read_chunk()).map_err(streams::to_wit)
+            // Clone the IncomingStream out of the map, drop the map guard,
+            // then await on the clone. This avoids holding the
+            // `StdMutex<HashMap>` across the `block_on_timeout` await — a
+            // stalled stream op would otherwise block every other stream op
+            // on this RuntimeState for up to 5 seconds.
+            //
+            // Recovers from a poisoned mutex (F7): a panic elsewhere in the
+            // worker must not take down every subsequent stream op.
+            let mut cloned = {
+                let incoming = self
+                    .incoming_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = incoming.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.read_chunk()).map_err(streams::to_wit)
         }
 
         fn cancel(&mut self, self_: Resource<Incoming>) {
@@ -645,25 +649,31 @@ mod streams_impl {
             self_: Resource<Outgoing>,
             bytes: Vec<u8>,
         ) -> Result<(), WitStreamError> {
-            let mut outgoing = self
-                .outgoing_streams
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = outgoing
-                .get_mut(&self_.rep())
-                .ok_or(WitStreamError::Closed)?;
-            block_on_timeout(entry.stream.write_chunk(bytes)).map_err(streams::to_wit)
+            // Clone the OutgoingStream out of the map, drop the map guard,
+            // then await on the clone. See `read_chunk` above for the
+            // lock-across-await rationale.
+            let mut cloned = {
+                let outgoing = self
+                    .outgoing_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.write_chunk(bytes)).map_err(streams::to_wit)
         }
 
         fn finish(&mut self, self_: Resource<Outgoing>) -> Result<(), WitStreamError> {
-            let mut outgoing = self
-                .outgoing_streams
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = outgoing
-                .get_mut(&self_.rep())
-                .ok_or(WitStreamError::Closed)?;
-            block_on_timeout(entry.stream.finish()).map_err(streams::to_wit)
+            // Clone out + drop-guard pattern — see `read_chunk` above.
+            let mut cloned = {
+                let outgoing = self
+                    .outgoing_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.finish()).map_err(streams::to_wit)
         }
 
         fn drop(&mut self, rep: Resource<Outgoing>) -> wasmtime::Result<()> {
