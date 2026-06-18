@@ -734,3 +734,226 @@ async fn test_streaming_response_rejects_content_encoding() {
     );
     drop(stream);
 }
+
+// ---- Inbound Transfer-Encoding: chunked (F2 review-2) ----------------------
+
+/// Inbound `Transfer-Encoding: chunked` body (small, multi-chunk) decoded
+/// and delivered to the guest as a streaming `Incoming` resource. The
+/// chunked pipeline always streams regardless of `stream_threshold` because
+/// the total body length is unknown up front — `stream_threshold` is a
+/// CL-only signal. Trailers are ignored in v1.
+#[tokio::test]
+async fn test_inbound_chunked_body_decoded_via_streaming_path() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_stream_threshold(64 * 1024) // body is small, but chunked always streams
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    // Multi-chunk body + an ignored trailer.
+    let wire = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nX-Trace-Id: abc\r\n\r\n".to_vec();
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+
+    let req = tokio::time::timeout(Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!("expected BodySource::Streamed, got {:?}", other),
+    };
+
+    // Read all chunks until EOF.
+    let mut collected = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(e) => panic!("unexpected stream error: {e:?}"),
+        }
+    }
+    assert_eq!(collected, b"hello world".to_vec());
+}
+
+/// Inbound chunked body where the client closes the connection before the
+/// terminating 0-chunk arrives — the streaming pipeline must surface this
+/// as an `Io("truncated chunked body: ...")` chunk rather than a silent EOF.
+#[tokio::test]
+async fn test_inbound_chunked_body_truncated_streaming_returns_error() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    // Declare a 5-byte chunk but never send the payload, CRLF, or 0-chunk.
+    let wire = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhel".to_vec();
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+    sock.shutdown().await.expect("shutdown");
+
+    let req = tokio::time::timeout(Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!("expected BodySource::Streamed, got {:?}", other),
+    };
+
+    let mut saw_truncation_error = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(_chunk) => continue,
+            Err(StreamError::Io(msg)) if msg.contains("truncated") || msg.contains("EOF") => {
+                saw_truncation_error = true;
+                break;
+            }
+            Err(StreamError::Closed) => break,
+            Err(e) => panic!("unexpected stream error: {e:?}"),
+        }
+    }
+    assert!(
+        saw_truncation_error,
+        "expected a truncation Io error before EOF"
+    );
+}
+
+/// Inbound chunked body where the client declares a chunk larger than
+/// `max_body_size`. The pipeline must reject this BEFORE reading the
+/// payload (the per-chunk cap bounds memory since total size is unknown).
+///
+/// Note: `with_max_body_size` clamps to `MIN_MAX_BODY_SIZE` (1024), so the
+/// effective cap is 1024 bytes — declare a 0x801-byte (2049) chunk to
+/// exercise the rejection.
+#[tokio::test]
+async fn test_inbound_chunked_body_oversize_chunk_rejected_streaming() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_max_body_size(2048) // effective cap = 2048 (above MIN=1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    // Declare a 0x801 (2049) byte chunk; cap is 2048 → must reject.
+    let wire = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n801\r\n".to_vec();
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+    sock.shutdown().await.expect("shutdown");
+
+    let req = tokio::time::timeout(Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!("expected BodySource::Streamed, got {:?}", other),
+    };
+
+    let mut saw_cap_error = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(_chunk) => continue,
+            Err(StreamError::Io(msg)) if msg.contains("per-chunk cap") => {
+                saw_cap_error = true;
+                break;
+            }
+            Err(StreamError::Closed) => break,
+            Err(e) => panic!("unexpected stream error: {e:?}"),
+        }
+    }
+    assert!(
+        saw_cap_error,
+        "expected a per-chunk-cap Io error before EOF"
+    );
+}
+
+/// `Transfer-Encoding` and `Content-Length` both present: per RFC 7230 §3.3.3,
+/// TE wins and CL is ignored. The chunked path runs regardless of CL.
+#[tokio::test]
+async fn test_inbound_chunked_wins_over_content_length() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    // CL=999 (much larger than actual chunked body) + TE: chunked.
+    let wire = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n".to_vec();
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+
+    let req = tokio::time::timeout(Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!(
+            "expected BodySource::Streamed (TE wins over CL), got {:?}",
+            other
+        ),
+    };
+
+    let mut collected = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(e) => panic!("unexpected stream error: {e:?}"),
+        }
+    }
+    assert_eq!(
+        collected, b"hello",
+        "chunked framing should win over the bogus CL=999"
+    );
+}

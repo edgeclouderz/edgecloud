@@ -235,6 +235,321 @@ async fn read_body_inline(
     Ok(body)
 }
 
+/// Parse a chunked-TE size line (hex digits terminated by CRLF, per RFC 7230
+/// §4.1). Returns the chunk size in bytes. Per-chunk extensions
+/// (`;name=value`) are tolerated but discarded, matching RFC 7230's
+/// "conservative recipient" recommendation: we ignore anything we don't
+/// understand rather than rejecting the chunk.
+fn parse_chunk_size(line: &[u8]) -> Result<usize, std::io::Error> {
+    let trimmed = line.strip_suffix(b"\r\n").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk size line missing CRLF",
+        )
+    })?;
+    // Drop any chunk extension (`;name=value`) — we ignore extensions.
+    let hex_end = trimmed
+        .iter()
+        .position(|&b| b == b';')
+        .unwrap_or(trimmed.len());
+    let hex = std::str::from_utf8(&trimmed[..hex_end])
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size not ASCII"))?
+        .trim();
+    if hex.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty chunk size",
+        ));
+    }
+    usize::from_str_radix(hex, 16).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("chunk size not valid hex: {hex:?}"),
+        )
+    })
+}
+
+/// Read a single CRLF-terminated line from `rh`, appending bytes into `buf`
+/// (which carries over any bytes already past the previous delimiter).
+/// Returns the line including the trailing CRLF.
+async fn read_chunked_line(
+    rh: &mut SharedReadHalf,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<Vec<u8>, std::io::Error> {
+    // Fast path: there's already a full line in `buf`.
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+        let line: Vec<u8> = buf.drain(..pos + 2).collect();
+        return Ok(line);
+    }
+    // Otherwise pull more bytes from the read half until we see CRLF.
+    let mut scratch = vec![0u8; 1024];
+    loop {
+        let n = match timeout_at(deadline, rh.read(&mut scratch)).await {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF in chunked line",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "chunked line read deadline",
+                ));
+            }
+        };
+        buf.extend_from_slice(&scratch[..n]);
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            let line: Vec<u8> = buf.drain(..pos + 2).collect();
+            return Ok(line);
+        }
+        // Guard against runaway trailer headers consuming the buffer.
+        if buf.len() > MAX_HEADER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunked line exceeds max header size",
+            ));
+        }
+    }
+}
+
+/// Read an inbound chunked-TE body inline (small bodies). Decodes the chunk
+/// framing, enforces a per-chunk size cap against `max_body_size` (we cannot
+/// know the total body size upfront), and ignores trailers in v1.
+///
+/// `body_prefix` is bytes already consumed past the `\r\n\r\n` header
+/// delimiter — they are the first bytes of the chunked framing and seed
+/// the decoder.
+///
+/// Currently `#[allow(dead_code)]`: chunked TE always streams via
+/// `body_pipeline_chunked` because the total body length is unknown up
+/// front — the `stream_threshold` CL-vs-chunked split has no signal to
+/// work on for chunked bodies. This function is the corresponding buffered
+/// primitive, exercised by unit tests and reserved for a future
+/// "stream if many chunks, buffer if few" heuristic.
+#[allow(dead_code)]
+async fn read_body_chunked_inline(
+    body_prefix: Vec<u8>,
+    mut rh: SharedReadHalf,
+    deadline: Instant,
+    max_body_size: u64,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut buf = body_prefix;
+    let mut body = Vec::new();
+    let max_chunk = max_body_size as usize;
+    loop {
+        let line = read_chunked_line(&mut rh, &mut buf, deadline).await?;
+        let size = parse_chunk_size(&line)?;
+        if size == 0 {
+            // Drain trailer headers until blank line. Trailers are ignored in v1
+            // (they could be surfaced via a separate header list — deferred).
+            loop {
+                let trailer_line = read_chunked_line(&mut rh, &mut buf, deadline).await?;
+                if trailer_line == b"\r\n" {
+                    break;
+                }
+            }
+            return Ok(body);
+        }
+        if size > max_chunk {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk size {size} exceeds per-chunk cap {max_chunk} (max_body_size)"),
+            ));
+        }
+        // Pull the chunk payload (which may already be in `buf` from the
+        // header read or a previous line read).
+        if buf.len() < size {
+            let mut want = size - buf.len();
+            let mut scratch = vec![0u8; want.min(65536)];
+            while want > 0 {
+                let cap = scratch.len();
+                let n = match timeout_at(deadline, rh.read(&mut scratch[..cap.min(want)])).await {
+                    Ok(Ok(0)) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF in chunk payload",
+                        ));
+                    }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "chunk payload read deadline",
+                        ));
+                    }
+                };
+                buf.extend_from_slice(&scratch[..n]);
+                want -= n;
+            }
+        }
+        body.extend_from_slice(&buf[..size]);
+        buf.drain(..size);
+        // Expect trailing CRLF after the chunk payload.
+        if buf.len() < 2 {
+            let mut crlf_scratch = [0u8; 2];
+            let n = timeout_at(deadline, rh.read(&mut crlf_scratch))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "chunk CRLF read deadline")
+                })??;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF before chunk CRLF",
+                ));
+            }
+            buf.extend_from_slice(&crlf_scratch[..n]);
+        }
+        if &buf[..2] != b"\r\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk payload missing trailing CRLF",
+            ));
+        }
+        buf.drain(..2);
+    }
+}
+
+/// Background task that decodes an inbound chunked-TE body and pushes chunks
+/// into the `IncomingProducer` for the guest to poll. Mirrors `body_pipeline`
+/// for chunked framing: reads until the terminating 0-sized chunk, drains
+/// trailers (ignored in v1), and surfaces truncation/deadline as
+/// `Err("…")` chunks so the guest's `read_chunk` sees the failure before EOF.
+async fn body_pipeline_chunked(
+    body_prefix: Vec<u8>,
+    mut rh: SharedReadHalf,
+    deadline: Instant,
+    max_body_size: u64,
+    producer: IncomingProducer,
+) {
+    let max_chunk = max_body_size as usize;
+    let mut buf = body_prefix;
+    loop {
+        let line = match read_chunked_line(&mut rh, &mut buf, deadline).await {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = producer.push(Err(e.to_string())).await;
+                return;
+            }
+        };
+        let size = match parse_chunk_size(&line) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = producer.push(Err(e.to_string())).await;
+                return;
+            }
+        };
+        if size == 0 {
+            // Drain trailers until blank line, ignoring contents.
+            loop {
+                let trailer_line = match read_chunked_line(&mut rh, &mut buf, deadline).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = producer.push(Err(e.to_string())).await;
+                        return;
+                    }
+                };
+                if trailer_line == b"\r\n" {
+                    break;
+                }
+            }
+            // Drop producer — channel closes, guest sees Closed.
+            return;
+        }
+        if size > max_chunk {
+            let _ = producer
+                .push(Err(format!(
+                    "chunk size {size} exceeds per-chunk cap {max_chunk} (max_body_size)"
+                )))
+                .await;
+            return;
+        }
+        // Pull chunk payload into buf if not already present.
+        if buf.len() < size {
+            let mut want = size - buf.len();
+            let mut scratch = vec![0u8; want.min(65536)];
+            while want > 0 {
+                let cap = scratch.len();
+                let n = match timeout_at(deadline, rh.read(&mut scratch[..cap.min(want)])).await {
+                    Ok(Ok(0)) => {
+                        let _ = producer
+                            .push(Err("truncated chunked body: EOF before 0-chunk".to_string()))
+                            .await;
+                        return;
+                    }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        let _ = producer.push(Err(e.to_string())).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = producer.push(Err("body read deadline".to_string())).await;
+                        return;
+                    }
+                };
+                buf.extend_from_slice(&scratch[..n]);
+                want -= n;
+            }
+        }
+        let chunk: Vec<u8> = buf[..size].to_vec();
+        buf.drain(..size);
+        if producer.push(Ok(chunk)).await.is_err() {
+            return; // Consumer dropped — guest cancelled.
+        }
+        // Expect trailing CRLF after chunk payload.
+        if buf.len() < 2 {
+            let mut crlf_scratch = [0u8; 2];
+            let n = match timeout_at(deadline, rh.read(&mut crlf_scratch)).await {
+                Ok(Ok(0)) => {
+                    let _ = producer
+                        .push(Err("truncated chunked body: EOF before CRLF".to_string()))
+                        .await;
+                    return;
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    let _ = producer.push(Err(e.to_string())).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = producer.push(Err("body read deadline".to_string())).await;
+                    return;
+                }
+            };
+            if n == 0 {
+                let _ = producer
+                    .push(Err("truncated chunked body: EOF before CRLF".to_string()))
+                    .await;
+                return;
+            }
+            buf.extend_from_slice(&crlf_scratch[..n]);
+        }
+        if &buf[..2] != b"\r\n" {
+            let _ = producer
+                .push(Err("chunk payload missing trailing CRLF".to_string()))
+                .await;
+            return;
+        }
+        buf.drain(..2);
+    }
+}
+
+/// Returns true iff the request headers advertise `Transfer-Encoding:
+/// chunked` (case-insensitive on the header name and tolerant of
+/// comma-separated multi-value TEs like `gzip, chunked`).
+fn has_chunked_te(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("Transfer-Encoding")
+            && v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
 /// Default maximum concurrent connections.
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
 /// Default per-connection read/write timeout in seconds.
@@ -273,7 +588,10 @@ struct ParsedHeaders {
     path: String,
     query: Option<String>,
     headers: Vec<(String, String)>,
-    body_len: usize,
+    /// `Some(n)` = Content-Length declared and parsed successfully (CL framing).
+    /// `None` = unknown length — either no CL or chunked TE (length is
+    /// determined by the chunked framing itself).
+    body_len: Option<usize>,
     /// Bytes already read past the `\r\n\r\n` delimiter — TCP can deliver
     /// the body in the same read as the headers, so we have to preserve these
     /// bytes and pass them to the body reader (otherwise the body reader would
@@ -667,28 +985,52 @@ impl HttpServer {
         //    HTTP/1.1, which is request/response-sequential on one connection.
         let (read_half, mut write_half) = shared_split(stream);
 
-        // 3. Read the body: streamed if it exceeds the threshold, buffered
-        //    otherwise. `body_len == 0` always takes the buffered (empty) path.
+        // 3. Read the body. Three paths, in order of specificity:
+        //    - Chunked TE (parsed.body_len is None): always streamed
+        //      regardless of declared CL because TE wins per RFC 7230 §3.3.3;
+        //      the body length is determined by the chunked framing itself.
+        //    - CL-known and large: streamed (chunked-decoded pipeline).
+        //    - CL-known and small: buffered inline.
+        //    - No CL and not chunked: no body (Buffered(empty)).
         //    `body_prefix` is the bytes already consumed past the \r\n\r\n —
-        //    TCP can deliver the body in the same packet as the headers, so we
-        //    have to preserve those bytes rather than losing them.
-        let body = if parsed.body_len > stream_threshold as usize && parsed.body_len > 0 {
-            let (producer, incoming_stream) =
-                crate::streams::incoming_pair(DEFAULT_STREAM_CAPACITY);
-            tokio::spawn(body_pipeline(
-                parsed.body_prefix,
-                read_half,
-                parsed.body_len,
-                deadline,
-                producer,
-            ));
-            BodySource::Streamed(incoming_stream)
-        } else {
-            match read_body_inline(parsed.body_prefix, read_half, parsed.body_len, deadline).await {
-                Ok(bytes) => BodySource::Buffered(bytes),
-                Err(e) => {
-                    tracing::warn!(req_id = %id, err = %e, "body read error");
-                    return;
+        //    TCP can deliver the body in the same packet as the headers, so
+        //    we have to preserve those bytes rather than losing them.
+        let body = match parsed.body_len {
+            None => {
+                // Chunked TE — always streamed (no upfront size; chunked
+                // framing determines length). Use the chunked decoder
+                // pipeline, which pushes chunks via the IncomingProducer.
+                let (producer, incoming_stream) =
+                    crate::streams::incoming_pair(DEFAULT_STREAM_CAPACITY);
+                tokio::spawn(body_pipeline_chunked(
+                    parsed.body_prefix,
+                    read_half,
+                    deadline,
+                    max_body_size,
+                    producer,
+                ));
+                BodySource::Streamed(incoming_stream)
+            }
+            Some(0) => BodySource::Buffered(Vec::new()),
+            Some(len) if len > stream_threshold as usize => {
+                let (producer, incoming_stream) =
+                    crate::streams::incoming_pair(DEFAULT_STREAM_CAPACITY);
+                tokio::spawn(body_pipeline(
+                    parsed.body_prefix,
+                    read_half,
+                    len,
+                    deadline,
+                    producer,
+                ));
+                BodySource::Streamed(incoming_stream)
+            }
+            Some(len) => {
+                match read_body_inline(parsed.body_prefix, read_half, len, deadline).await {
+                    Ok(bytes) => BodySource::Buffered(bytes),
+                    Err(e) => {
+                        tracing::warn!(req_id = %id, err = %e, "body read error");
+                        return;
+                    }
                 }
             }
         };
@@ -986,41 +1328,47 @@ impl HttpServer {
             tracestate,
         });
 
-        // Determine body length from Content-Length.
-        let body_len = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
-            .and_then(|(_, v)| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        // Determine body framing:
+        // - Transfer-Encoding: chunked → `body_len = None` (length is set by
+        //   the chunked framing itself; per RFC 7230 §3.3.3 TE wins over CL
+        //   when both are present, so we ignore CL if chunked TE is advertised).
+        // - Otherwise, parse Content-Length into `body_len`. Missing or
+        //   unparseable CL on a non-chunked request → `Some(0)` (no body).
+        //   We must distinguish "no body" from "chunked body" — both reach
+        //   the dispatch as None, but only chunked TE should spawn the
+        //   chunked pipeline. Missing CL on a non-chunked request is just
+        //   an empty body (RFC 7230 §3.3.2: "If a message is received
+        //   without Transfer-Encoding and with a non-empty Content-Length,
+        //   ... [otherwise] the message body length is determined by the
+        //   number of octets received prior to the server closing the
+        //   connection"; for an HTTP/1.1 server we treat that as 0).
+        let chunked_te = has_chunked_te(&headers);
+        let body_len = if chunked_te {
+            None
+        } else {
+            Some(
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+                    .and_then(|(_, v)| v.parse::<usize>().ok())
+                    .unwrap_or(0),
+            )
+        };
 
-        // Reject Transfer-Encoding: chunked — v1 does not implement
-        // chunked decoding (the body reader is length-driven; an unknown-
-        // length body would need a sentinel value and a chunk-size
-        // parser). Per RFC 7230 §3.3.3, TE takes precedence over CL when
-        // both are present, so we reject the combination rather than
-        // silently honoring CL. The connection is closed without an
-        // `IncomingRequest` being delivered.
-        if headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("Transfer-Encoding")
-                && v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
-        }) {
-            tracing::warn!(
-                req_id = %id,
-                "Transfer-Encoding: chunked not supported; closing connection"
-            );
-            return Ok(None);
-        }
-
-        // Reject oversized bodies to prevent memory exhaustion.
-        if body_len > max_body_size as usize {
-            tracing::warn!(
-                req_id = %id,
-                body_len,
-                max = %max_body_size,
-                "request body exceeds max size",
-            );
-            return Ok(None);
+        // Reject oversized CL-declared bodies to prevent memory exhaustion.
+        // Chunked bodies are bounded per-chunk by `max_body_size` (in the
+        // chunked decoder) — total size is unknown up front, so we cannot
+        // bound it here.
+        if let Some(len) = body_len {
+            if len > max_body_size as usize {
+                tracing::warn!(
+                    req_id = %id,
+                    body_len = len,
+                    max = %max_body_size,
+                    "request body exceeds max size",
+                );
+                return Ok(None);
+            }
         }
 
         Ok(Some(ParsedHeaders {
@@ -1420,14 +1768,14 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// F6 regression: `read_headers` must reject `Transfer-Encoding:
-    /// chunked` (v1 does not implement chunked decoding) by returning
-    /// `Ok(None)`, causing the connection handler to drop the
-    /// connection without delivering an `IncomingRequest`. The check is
-    /// case-insensitive on the header name and tolerant of multi-value
-    /// TE like `gzip, chunked`.
+    /// F2 (review-2) regression: `read_headers` accepts `Transfer-Encoding:
+    /// chunked` and reports `body_len = None` (the body length is determined
+    /// by the chunked framing itself). Per RFC 7230 §3.3.3, TE wins over CL
+    /// when both are present — CL is ignored when chunked TE is advertised.
+    /// The check is case-insensitive on the header name and tolerant of
+    /// multi-value TE like `gzip, chunked`.
     #[tokio::test]
-    async fn test_chunked_transfer_encoding_rejected() {
+    async fn test_chunked_transfer_encoding_accepted() {
         use std::net::SocketAddr;
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
@@ -1451,11 +1799,156 @@ mod tests {
         let parsed =
             HttpServer::read_headers(&mut StreamKind::Plain(client), deadline, 1, 64 * 1024)
                 .await
-                .expect("read_headers ok");
+                .expect("read_headers ok")
+                .expect("chunked TE request should be accepted, not dropped");
         assert!(
-            parsed.is_none(),
-            "expected Transfer-Encoding: chunked to be rejected, got a request"
+            parsed.body_len.is_none(),
+            "chunked TE should produce body_len = None, got {:?}",
+            parsed.body_len
         );
+        // The first chunk's "hello" prefix may already be in `body_prefix`.
+        assert!(
+            parsed.body_prefix.starts_with(b"5\r\nhello\r\n")
+                || parsed.body_prefix == b"5\r\nhello\r\n".to_vec()
+                || parsed.body_prefix == b"hello".to_vec(),
+            "expected chunked body bytes in body_prefix, got {:?}",
+            String::from_utf8_lossy(&parsed.body_prefix)
+        );
+        writer.await.unwrap();
+    }
+
+    /// F2 (review-2): `parse_chunk_size` handles hex digits, chunk extensions
+    /// (`;name=value`), and rejects malformed input.
+    #[test]
+    fn test_parse_chunk_size_valid() {
+        assert_eq!(parse_chunk_size(b"5\r\n").unwrap(), 5);
+        assert_eq!(parse_chunk_size(b"1f\r\n").unwrap(), 31);
+        assert_eq!(parse_chunk_size(b"0\r\n").unwrap(), 0);
+        assert_eq!(parse_chunk_size(b"FF\r\n").unwrap(), 255);
+        // Chunk extension ignored (per RFC 7230 §4.1.1).
+        assert_eq!(parse_chunk_size(b"5;ext=foo\r\n").unwrap(), 5);
+        assert_eq!(parse_chunk_size(b"5;name=value;more\r\n").unwrap(), 5);
+    }
+
+    #[test]
+    fn test_parse_chunk_size_invalid() {
+        use std::io::ErrorKind;
+        let cases: &[&[u8]] = &[
+            b"5",      // missing CRLF
+            b"5\n",    // LF only, not CRLF
+            b"xx\r\n", // not hex
+            b"\r\n",   // empty
+            b"-1\r\n", // negative
+        ];
+        for line in cases {
+            let err = parse_chunk_size(line).expect_err(&format!(
+                "expected error for {:?}",
+                String::from_utf8_lossy(line)
+            ));
+            assert!(
+                matches!(err.kind(), ErrorKind::InvalidData),
+                "unexpected error kind for {:?}: {:?}",
+                String::from_utf8_lossy(line),
+                err
+            );
+        }
+    }
+
+    /// F2 (review-2): `read_body_chunked_inline` decodes a multi-chunk
+    /// chunked body into a flat `Vec<u8>`. Trailers are ignored in v1.
+    #[tokio::test]
+    async fn test_read_body_chunked_inline_multi_chunk() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"5\r\nhello\r\n5\r\nworld\r\n0\r\nX-Trace-Id: abc\r\n\r\n")
+                .await
+                .unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let body = read_body_chunked_inline(Vec::new(), read_half, deadline, 64 * 1024)
+            .await
+            .expect("chunked body should decode");
+        assert_eq!(body, b"helloworld".to_vec());
+        writer.await.unwrap();
+    }
+
+    /// F2 (review-2): `read_body_chunked_inline` surfaces an error when the
+    /// body is truncated (client closes before the 0-chunk).
+    #[tokio::test]
+    async fn test_read_body_chunked_inline_truncated_returns_error() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Chunk declared but no payload follows, and no terminating 0-chunk.
+            sock.write_all(b"5\r\nhello").await.unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let err = read_body_chunked_inline(Vec::new(), read_half, deadline, 64 * 1024)
+            .await
+            .expect_err("expected truncated chunked body error");
+        // Either an UnexpectedEof (chunk CRLF read) or InvalidData is acceptable
+        // depending on which read caught the close — both signal truncation.
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::UnexpectedEof)
+                || matches!(err.kind(), std::io::ErrorKind::InvalidData),
+            "unexpected error kind: {err:?}"
+        );
+        writer.await.unwrap();
+    }
+
+    /// F2 (review-2): a chunk size exceeding the per-chunk cap is rejected
+    /// (bounds memory since total chunked size is unknown up front).
+    #[tokio::test]
+    async fn test_read_body_chunked_inline_oversize_chunk_rejected() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Declare a 1024-byte chunk but max_body_size is 100 → reject.
+            sock.write_all(b"400\r\n").await.unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, _write_half) = shared_split(StreamKind::Plain(client));
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let err = read_body_chunked_inline(Vec::new(), read_half, deadline, 100)
+            .await
+            .expect_err("expected oversize chunk rejection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("per-chunk cap"));
         writer.await.unwrap();
     }
 

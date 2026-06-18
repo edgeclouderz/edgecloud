@@ -158,6 +158,15 @@ interface http-server {
     headers: list<tuple<string, string>>,
     body: body-source,
     trace: option<trace-context>,
+    // Inbound body framing accepted by the host:
+    // - Content-Length declared: body is buffered or streamed per the
+    //   host's `stream_threshold`.
+    // - Transfer-Encoding: chunked: body is decoded into the body-source.
+    //   Per-chunk size is capped at the host's `max_body_size`. Trailers
+    //   are read and discarded in v1.
+    // - Neither (e.g. GET): body is empty.
+    // Per RFC 7230 §3.3.3, when both Content-Length and TE: chunked are
+    // present, TE wins and CL is ignored.
   }
 
   // Buffered response — existing call. Body is fully delivered.
