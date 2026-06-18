@@ -19,6 +19,12 @@ import (
 // we touch the DB.
 const MaxLogBatchSize = 1 << 20
 
+// MaxEntries caps the number of log entries in a single batch. Matches the
+// worker's `max_buffer_len * HARD_CAP_MULT = 1000` ceiling so any worker
+// batch always fits. A runaway worker cannot submit unbounded rows in one
+// POST even with tiny messages.
+const MaxEntries = 1000
+
 // logEntryRepo is the subset of *repository.LogEntryRepository used here.
 // Defining it locally keeps tests mockable without a live DB.
 type logEntryRepo interface {
@@ -26,6 +32,10 @@ type logEntryRepo interface {
 }
 
 // IngestLogsRequest is the JSON body the worker sends to /api/internal/logs.
+//
+// The JSON shape is intentionally lenient: unknown fields are accepted (a
+// future worker struct drift becomes a no-op instead of a 400 that drops
+// the entire batch). Syntactically broken bodies still 400.
 type IngestLogsRequest struct {
 	Entries []domain.LogEntry `json:"entries"`
 }
@@ -34,31 +44,36 @@ type IngestLogsRequest struct {
 //
 // Auth: WorkerAuth middleware (HMAC-SHA256 JWT). The handler:
 //   - caps request body at MaxLogBatchSize
-//   - overwrites each entry's TenantID with the JWT's tenant_id (the worker
-//     can lie in the body, but the JWT is the truth)
-//   - stamps WorkerID and Region from the JWT (so a compromised worker cannot
-//     attribute its own logs to another worker)
+//   - caps the number of entries per batch at MaxEntries
+//   - overwrites each entry's TenantID, WorkerID, and Region with the JWT's
+//     claims (the worker can lie in the body, but the JWT is the truth —
+//     this is the security boundary that prevents a compromised worker
+//     from attributing its logs to another tenant, worker, or region)
 //   - trusts DeploymentID, AppName, Level, Message, Labels from the body
 //
-// Response: 204 No Content on success. 400 on malformed body or oversize
-// batch. 401 is handled by WorkerAuth before the handler runs. 500 on DB
-// failure.
+// Response: 204 No Content on success. 400 on malformed body, oversize
+// batch, or too many entries. 401 is handled by WorkerAuth before the
+// handler runs. 500 on DB failure.
 func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	workerID := middleware.GetWorkerID(r.Context())
+	region := middleware.GetWorkerRegion(r.Context())
 
-	// Cap request body before decoding.
-	r.Body = http.MaxBytesReader(w, r.Body, MaxLogBatchSize+1)
+	// Cap request body before decoding. MaxBytesReader returns a
+	// *http.MaxBytesError when the (N+1)-th read past the cap is attempted.
+	r.Body = http.MaxBytesReader(w, r.Body, MaxLogBatchSize)
 	defer r.Body.Close()
 
 	var req IngestLogsRequest
+	// Lenient decode: unknown fields are accepted so a future worker struct
+	// drift doesn't drop the whole batch. Syntactically broken JSON still
+	// surfaces as a decode error below.
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields() // tightens against typos in worker clients
 	if err := dec.Decode(&req); err != nil {
 		// MaxBytesReader returns a *http.MaxBytesError when the body exceeds
-		// the cap; json.UnmarshalTypeError for shape mismatches; io.EOF for
-		// empty body. Surface all as 400 with a generic message so we don't
-		// leak parser internals to the worker.
+		// the cap; io.EOF for empty body; everything else is shape/parse.
+		// Surface all as 400 with a generic message so we don't leak parser
+		// internals to the worker.
 		var maxErr *http.MaxBytesError
 		switch {
 		case errors.As(err, &maxErr):
@@ -78,13 +93,21 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the entry count so a worker that submits many tiny entries in a
+	// 1 MiB body cannot blow past any per-batch row budget.
+	if len(req.Entries) > MaxEntries {
+		http.Error(w, `{"error": "too many entries"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Overwrite authoritative fields from the JWT. We trust the JWT, not
-	// the body, for tenant/worker identity. This is the security boundary:
-	// a worker that lies about TenantID in the body gets its logs filed
-	// under the JWT's tenant_id.
+	// the body, for tenant/worker/region identity. This is the security
+	// boundary: a worker that lies about TenantID/WorkerID/Region in the
+	// body gets its logs filed under the JWT's values.
 	for i := range req.Entries {
 		req.Entries[i].TenantID = tenantID
 		req.Entries[i].WorkerID = workerID
+		req.Entries[i].Region = region
 	}
 
 	if err := h.logEntryRepo.InsertBatch(r.Context(), req.Entries); err != nil {
