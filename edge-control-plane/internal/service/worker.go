@@ -30,7 +30,7 @@ type workerRepoInterface interface {
 	UpdateLastSeen(ctx context.Context, id string) error
 	UpdateAddr(ctx context.Context, id, addr string) error
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
-	ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error)
+	ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 }
 
 // quotaRepoInterface defines the repository methods used by WorkerService.
@@ -167,10 +167,19 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	}
 }
 
-// ListRunningAppTargets returns every app currently routable on a worker.
-// The public ingress can use this to cold-start its routing table before
-// the first heartbeat lands; the CLI uses it to validate that a
-// `live_url` is actually live.
-func (s *WorkerService) ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error) {
-	return s.workerRepo.ListRunningAppTargets(ctx)
+// GetAppTarget returns the running target for a single
+// `(tenant_id, app_name)` pair, or `nil` when no running target is
+// found. The CLI's `edge status` uses this to validate that a
+// `live_url` is actually live. The query is scoped to the calling
+// tenant at the SQL level so cross-tenant information is not loaded
+// into Go memory.
+func (s *WorkerService) GetAppTarget(ctx context.Context, tenantID, appName string) (*domain.AppTarget, error) {
+	targets, err := s.workerRepo.ListRunningAppTarget(ctx, tenantID, appName)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	return &targets[0], nil
 }
