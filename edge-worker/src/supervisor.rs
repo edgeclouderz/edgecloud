@@ -401,8 +401,11 @@ impl Supervisor {
 
     /// Build a heartbeat message from current app states.
     pub async fn build_heartbeat(&self) -> HeartbeatMessage {
-        let mut msg =
-            HeartbeatMessage::new(self.config.worker_id.clone(), self.config.region.clone());
+        let mut msg = HeartbeatMessage::new(
+            self.config.worker_id.clone(),
+            self.config.region.clone(),
+            self.config.worker_addr.clone(),
+        );
 
         let state = self.state.read().await;
         for (app_name, inst) in &state.apps {
@@ -427,6 +430,8 @@ impl Supervisor {
                     status: status.to_string(),
                     exit_code,
                     request_count: inst.meter.snapshot().request_count,
+                    tenant_id: inst.tenant_id.clone(),
+                    port: inst.port,
                 },
             );
         }

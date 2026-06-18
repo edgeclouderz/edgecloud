@@ -7,6 +7,11 @@ use std::path::PathBuf;
 pub struct Config {
     pub worker_id: String,
     pub region: String,
+    /// The address the public ingress should reverse-proxy to in order to reach
+    /// apps on this worker (e.g. `203.0.113.10` or `worker-fra-1.internal:8080`).
+    /// Required: the worker fails to start without it. Operators in private VPCs
+    /// must set this to a routable IP or domain (Cloud NAT EIP, internal LB, etc.).
+    pub worker_addr: String,
     pub nats_url: String,
     pub control_plane_url: String,
     pub cache_dir: PathBuf,
@@ -23,6 +28,9 @@ impl Config {
     /// - `WORKER_ID` (e.g., `w_fra_abc123`)
     /// - `REGION` (e.g., `fra`)
     /// - `CONTROL_PLANE_URL` (e.g., `https://api.edgecloud.dev`)
+    /// - `EDGE_WORKER_ADDR` (e.g., `203.0.113.10`) — the routable address of
+    ///   this worker for the public ingress. Required: silent defaults have
+    ///   produced every past "URL works for me but not for users" incident.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -31,6 +39,7 @@ impl Config {
         Ok(Config {
             worker_id: std::env::var("WORKER_ID").context("WORKER_ID not set")?,
             region: std::env::var("REGION").context("REGION not set")?,
+            worker_addr: std::env::var("EDGE_WORKER_ADDR").context("EDGE_WORKER_ADDR not set")?,
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
             control_plane_url: std::env::var("CONTROL_PLANE_URL")
                 .context("CONTROL_PLANE_URL not set")?,
