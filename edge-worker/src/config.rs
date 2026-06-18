@@ -51,6 +51,16 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// HMAC secret the worker uses to sign outbound JWTs to the control
+    /// plane's internal endpoints. Must match `JWT_SECRET` on the Go side.
+    pub worker_jwt_secret: String,
+    /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
+    /// Defaults to `edgecloud`.
+    pub worker_jwt_issuer: String,
+    /// The tenant this worker is authorized for. Loaded once at startup;
+    /// a worker is per-tenant in this design (whitepaper §9.3 calls for
+    /// tenant-agnostic workers — file a follow-up to revisit).
+    pub worker_tenant_id: String,
 }
 
 impl Config {
@@ -63,6 +73,8 @@ impl Config {
     /// - `EDGE_WORKER_ADDR` (e.g., `203.0.113.10`) — the routable address of
     ///   this worker for the public ingress. Required: silent defaults have
     ///   produced every past "URL works for me but not for users" incident.
+    /// - `WORKER_JWT_SECRET` (HMAC secret shared with the control plane)
+    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`)
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -72,6 +84,7 @@ impl Config {
     /// - `EPOCH_DEADLINE_TICKS` (default: 100)
     /// - `EDGE_QUEUE_GROUP` (default: `edgecloud-workers`)
     /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
+    /// - `WORKER_JWT_ISSUER` (default: `edgecloud`)
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -118,6 +131,12 @@ impl Config {
             max_memory_mb: parse_env_u64("APP_MAX_MEMORY_MB", 256)?,
             epoch_tick_ms: parse_env_u64("EPOCH_TICK_MS", 10)?,
             epoch_deadline_ticks: parse_env_u64("EPOCH_DEADLINE_TICKS", 100)?,
+            worker_jwt_secret: std::env::var("WORKER_JWT_SECRET")
+                .context("WORKER_JWT_SECRET not set")?,
+            worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
+                .unwrap_or_else(|_| "edgecloud".into()),
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID")
+                .context("WORKER_TENANT_ID not set")?,
         })
     }
 }
