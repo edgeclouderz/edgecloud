@@ -282,3 +282,129 @@ func TestValidateWasm(t *testing.T) {
 		})
 	}
 }
+
+func TestIsValidDeploymentAppName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		// Valid
+		{"single char", "a", true},
+		{"alphanumeric", "hello", true},
+		{"with hyphen", "hello-world", true},
+		{"trailing digit", "app123", true},
+		{"starts with digit", "0app", true},
+		{"63 chars", "a" + repeat("b", 62), true},
+		// Invalid
+		{"empty", "", false},
+		{"64 chars", "a" + repeat("b", 63), false},
+		{"uppercase", "Hello", false},
+		{"all uppercase", "HELLO", false},
+		{"starts with hyphen", "-hello", false},
+		{"underscore", "hello_world", false},
+		{"dot", "hello.world", false},
+		{"slash", "hello/world", false},
+		{"space", "hello world", false},
+		{"path traversal", "../traversal", false},
+		{"path with bad segment", "a/../b", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsValidDeploymentAppName(tt.input); got != tt.want {
+				t.Errorf("IsValidDeploymentAppName(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func repeat(s string, n int) string {
+	out := make([]byte, 0, len(s)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, s...)
+	}
+	return string(out)
+}
+
+func TestClassifyFromPatterns(t *testing.T) {
+	auto := domain.PatternInfo{Transformability: "AutoTransformable"}
+	manual := domain.PatternInfo{Transformability: "NotTransformable"}
+	tests := []struct {
+		name     string
+		patterns []domain.PatternInfo
+		want     domain.MigrationStatus
+	}{
+		{"empty is success", nil, domain.MigrationStatusSuccess},
+		{"all auto", []domain.PatternInfo{auto, auto}, domain.MigrationStatusSuccess},
+		{"only manual is failed", []domain.PatternInfo{manual}, domain.MigrationStatusFailed},
+		{"mixed is partial", []domain.PatternInfo{auto, manual}, domain.MigrationStatusPartial},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyFromPatterns(tt.patterns); got != tt.want {
+				t.Errorf("classifyFromPatterns() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAggregateTreeStatus(t *testing.T) {
+	mk := func(s domain.MigrationStatus) domain.FileReport {
+		return domain.FileReport{Path: "x.c", Status: s}
+	}
+	tests := []struct {
+		name  string
+		files []domain.FileReport
+		want  domain.MigrationStatus
+	}{
+		{"empty is success", nil, domain.MigrationStatusSuccess},
+		{"all success", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusSuccess)}, domain.MigrationStatusSuccess},
+		{"one partial", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusPartial)}, domain.MigrationStatusPartial},
+		{"any failed wins", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusPartial), mk(domain.MigrationStatusFailed)}, domain.MigrationStatusFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := aggregateTreeStatus(tt.files); got != tt.want {
+				t.Errorf("aggregateTreeStatus() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMigrateTree_RejectsInvalidAppName(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "../bad", "c", []domain.FileEntry{
+		{Path: "main.c", Source: "int main(){return 0;}\n"},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid app name")
+	}
+}
+
+func TestMigrateTree_RejectsEmptyTree(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", nil)
+	if err == nil {
+		t.Fatal("expected error for empty tree")
+	}
+}
+
+func TestMigrateTree_RejectsUnsupportedLanguage(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", []domain.FileEntry{
+		{Path: "main.rs", Source: "fn main() {}\n"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported language")
+	}
+}
+
+func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "../etc/passwd", Source: "x"},
+	})
+	if err == nil {
+		t.Fatal("expected error for path traversal")
+	}
+}
