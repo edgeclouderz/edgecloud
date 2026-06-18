@@ -88,6 +88,7 @@ impl TestHarness {
         let config = Config {
             worker_id: "test-worker".to_string(),
             region: "test-region".to_string(),
+            worker_addr: "test-host:0".to_string(),
             nats_url: nats_url.clone(),
             control_plane_url: mock_server.uri(),
             cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
@@ -296,6 +297,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     let config = Config {
         worker_id: "test-worker".to_string(),
         region: "test-region".to_string(),
+        worker_addr: "test-host:0".to_string(),
         nats_url: nats_url.clone(),
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
@@ -402,4 +404,69 @@ async fn test_stop_all_apps() {
 
     let state = harness.supervisor.state.read().await;
     assert!(state.apps.is_empty(), "all apps should be stopped");
+}
+
+#[tokio::test]
+async fn test_heartbeat_includes_addr_and_port() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // Wire up the mock HTTP server to serve the test component.
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_deploy_001"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // Start an app.
+    let spec = AppSpec {
+        deployment_id: "d_deploy_001".to_string(),
+        deployment_hash: "abc123".to_string(),
+        env: HashMap::new(),
+        allowlist: vec![],
+    };
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-17T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("test-app".to_string(), spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    let running = wait_for_app_running(&harness.supervisor, "test-app", 10).await;
+    assert!(running, "app should be Running within 10s");
+
+    // Read the port that was actually assigned to the app, so the assertion
+    // doesn't depend on a particular value from the pool.
+    let assigned_port = {
+        let state = harness.supervisor.state.read().await;
+        let inst = state.apps.get("test-app").expect("test-app in state");
+        let inst = inst.lock().await;
+        inst.port
+    };
+
+    // Build a heartbeat and assert the new fields are present.
+    let heartbeat = harness.supervisor.build_heartbeat().await;
+    assert_eq!(
+        heartbeat.worker_addr.as_deref(),
+        Some("test-host:0"),
+        "worker_addr must reflect EDGE_WORKER_ADDR"
+    );
+
+    let app_status = heartbeat
+        .apps
+        .get("test-app")
+        .expect("test-app in heartbeat");
+    assert_eq!(app_status.tenant_id, "t_test", "tenant_id must be set");
+    assert_eq!(
+        app_status.port, assigned_port,
+        "port must match the app's assigned port"
+    );
 }
