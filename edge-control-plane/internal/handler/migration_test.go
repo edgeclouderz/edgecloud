@@ -215,3 +215,230 @@ int main() { return 0; }`
 		t.Errorf("expected status 401, got: %d", rr.Code)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// MigrateTree handler tests (M2.C10)
+// ─────────────────────────────────────────────────────────────────────
+
+// makeTreeReq builds a multipart POST with a `tree` JSON manifest and
+// one or more `file` parts. `tenant` is set into the request context
+// (mimicking middleware.GetTenantID).
+func makeTreeReq(t *testing.T, appName, language, manifest string, files map[string]string) *http.Request {
+	t.Helper()
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	if appName != "" {
+		_ = w.WriteField("app_name", appName)
+	}
+	if language != "" {
+		_ = w.WriteField("language", language)
+	}
+	if manifest != "" {
+		_ = w.WriteField("tree", manifest)
+	}
+	for name, content := range files {
+		fw, err := w.CreateFormFile("file", name)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := fw.Write([]byte(content)); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	return req
+}
+
+// withTenantID stuffs a tenant ID into the request context the way
+// middleware.GetTenantID expects.
+func withTenantID(req *http.Request, tenantID string) *http.Request {
+	ctx := middleware.WithTenantID(req.Context(), tenantID)
+	return req.WithContext(ctx)
+}
+
+func TestMigrateTree_RejectsMissingTenantID(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`, map[string]string{"main.c": "int main(){}"})
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsBadAppName(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	for _, bad := range []string{"../traversal", "Bad-Name", "a/b", ""} {
+		req := makeTreeReq(t, bad, "c", `{"files":["main.c"]}`, map[string]string{"main.c": "x"})
+		req = withTenantID(req, "t_1")
+		rr := httptest.NewRecorder()
+		h.MigrateTree(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("app_name=%q: expected 400, got %d: %s", bad, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestMigrateTree_RejectsMissingAppName(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// Make a request without an app_name field.
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("language", "c")
+	_ = w.WriteField("tree", `{"files":["main.c"]}`)
+	fw, _ := w.CreateFormFile("file", "main.c")
+	fw.Write([]byte("x"))
+	w.Close()
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsNonCLanguage(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "rust", `{"files":["main.c"]}`, map[string]string{"main.c": "x"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for rust, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsManifestMismatch(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// Manifest declares 2 files, but only 1 file part.
+	req := makeTreeReq(t, "hello", "c",
+		`{"files":["main.c","helper.c"]}`,
+		map[string]string{"main.c": "x"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 manifest mismatch, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// Manifest references a path with `..`.
+	req := makeTreeReq(t, "hello", "c",
+		`{"files":["../etc/passwd"]}`,
+		map[string]string{"passwd": "x"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 unsafe path, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsTooManyFiles(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// Build a manifest with maxTreeFiles+1 entries. We don't actually
+	// upload that many file parts — the mismatch is caught first, so
+	// we use a count over the limit in a valid manifest.
+	names := make([]string, maxTreeFiles+1)
+	files := make(map[string]string)
+	for i := range names {
+		names[i] = "f" + itoa(i) + ".c"
+		files[names[i]] = "x"
+	}
+	// JSON marshal the names.
+	json := "["
+	for i, n := range names {
+		if i > 0 {
+			json += ","
+		}
+		json += "\"" + n + "\""
+	}
+	json += "]"
+	manifest := `{"files":` + json + `}`
+	req := makeTreeReq(t, "hello", "c", manifest, files)
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 too-many-files, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	digits := []byte{}
+	for i > 0 {
+		digits = append([]byte{byte('0' + i%10)}, digits...)
+		i /= 10
+	}
+	return string(digits)
+}
+
+func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// Build a valid multipart body that's over the cap. We use a
+	// single large file part padded past maxTreeBodyBytes.
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("app_name", "hello")
+	_ = w.WriteField("language", "c")
+	_ = w.WriteField("tree", `{"files":["main.c"]}`)
+	fw, _ := w.CreateFormFile("file", "main.c")
+	padding := make([]byte, maxTreeBodyBytes+1024)
+	for i := range padding {
+		padding[i] = 'a'
+	}
+	fw.Write(padding)
+	w.Close()
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsMissingTree(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	// No `tree` field, no `file` parts.
+	req := makeTreeReq(t, "hello", "c", "", nil)
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 missing tree, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsInvalidManifestJSON(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk")
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "c", "not json", map[string]string{"main.c": "x"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 bad manifest, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
