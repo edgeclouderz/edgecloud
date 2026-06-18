@@ -127,3 +127,38 @@ func TestWorkerAuth_ValidToken(t *testing.T) {
 		t.Errorf("tenant_id = %s, want t_tenant1", gotTenantID)
 	}
 }
+
+func TestWorkerAuth_PutsRegionInContext(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Region:   "fra",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	gotRegion := ""
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRegion = GetWorkerRegion(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	middleware := WorkerAuth(cfg)(handler)
+
+	req := httptest.NewRequest("GET", "/api/internal/download/d_abc123", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	rec := httptest.NewRecorder()
+	middleware.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if gotRegion != "fra" {
+		t.Errorf("region = %q, want %q", gotRegion, "fra")
+	}
+}

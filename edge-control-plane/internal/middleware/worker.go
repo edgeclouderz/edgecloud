@@ -15,6 +15,7 @@ type WorkerClaims struct {
 	jwt.RegisteredClaims
 	WorkerID string   `json:"worker_id"`
 	TenantID string   `json:"tenant_id"`
+	Region   string   `json:"region"`
 	Apps     []string `json:"apps"`
 }
 
@@ -27,6 +28,7 @@ type WorkerJWTConfig struct {
 const (
 	WorkerIDKey       contextKey = "worker_id"
 	WorkerTenantIDKey contextKey = "worker_tenant_id"
+	WorkerRegionKey   contextKey = "worker_region"
 	WorkerAppsKey     contextKey = "worker_apps"
 )
 
@@ -71,6 +73,7 @@ func WorkerAuth(cfg WorkerJWTConfig) func(http.Handler) http.Handler {
 			}
 			ctx := context.WithValue(r.Context(), WorkerIDKey, claims.WorkerID)
 			ctx = context.WithValue(ctx, WorkerTenantIDKey, claims.TenantID)
+			ctx = context.WithValue(ctx, WorkerRegionKey, claims.Region)
 			ctx = context.WithValue(ctx, WorkerAppsKey, claims.Apps)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -89,6 +92,14 @@ func GetWorkerTenantID(ctx context.Context) string {
 func GetWorkerID(ctx context.Context) string {
 	if id, ok := ctx.Value(WorkerIDKey).(string); ok {
 		return id
+	}
+	return ""
+}
+
+// GetWorkerRegion extracts the worker region from context.
+func GetWorkerRegion(ctx context.Context) string {
+	if r, ok := ctx.Value(WorkerRegionKey).(string); ok {
+		return r
 	}
 	return ""
 }
