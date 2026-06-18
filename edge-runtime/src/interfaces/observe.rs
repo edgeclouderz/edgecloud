@@ -69,11 +69,65 @@ pub struct LogRecord {
 }
 
 // ---------------------------------------------------------------------------
-// NATS publisher trait
+// AppLogContext — per-app identity stamped on every emitted log
 // ---------------------------------------------------------------------------
 
-/// Interface for forwarding structured log records to a message bus.
-/// Implement this trait to enable log forwarding to the control plane.
+/// Per-app identity that the runtime attaches to every emitted log record.
+///
+/// The runtime doesn't know which app it's hosting on its own — the
+/// supervisor passes this in at construction time. The LogSink downstream
+/// (worker → HTTP → control plane) stamps it onto the record so the
+/// control plane can route logs back to the right tenant/app/deployment.
+#[derive(Clone, Debug, Default)]
+pub struct AppLogContext {
+    pub app_name: String,
+    pub tenant_id: String,
+    pub deployment_id: String,
+}
+
+impl AppLogContext {
+    /// Empty context for tests / callers that don't have app identity yet.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogSink — destination for tenant-emitted log records
+// ---------------------------------------------------------------------------
+
+/// Sink that receives structured log records from the guest (via
+/// `edge:observe.emit_log`).
+///
+/// Implementations decide where the record goes: a worker ships it to
+/// the control plane over HTTP; a unit test captures it in a `Vec`;
+/// `NoopLogSink` discards it.
+///
+/// `push` is called synchronously from the guest's WIT call. Implementations
+/// must be cheap (no I/O on the hot path) — buffer and forward async. The
+/// worker's `LogForwarder` is the canonical example: it appends to an
+/// in-memory buffer and a background task flushes batches over HTTP.
+pub trait LogSink: Send + Sync {
+    fn push(&self, record: LogRecord, ctx: AppLogContext);
+}
+
+/// Drop-on-the-floor sink. Used by `Observer::new()` and tests that don't
+/// care about log emission. Cheap to construct (no allocation).
+pub struct NoopLogSink;
+impl LogSink for NoopLogSink {
+    fn push(&self, _record: LogRecord, _ctx: AppLogContext) {}
+}
+
+// ---------------------------------------------------------------------------
+// NATS publisher trait (legacy)
+// ---------------------------------------------------------------------------
+
+/// Legacy interface for forwarding structured log records to a message bus.
+///
+/// Retained for backward compatibility with any caller that wired
+/// `ObserveConfig::with_nats_publisher`. The runtime no longer uses this
+/// path on the worker side; new code should implement `LogSink` instead.
+#[allow(dead_code)]
 pub trait NatsPublisher: Send + Sync {
     /// Publish a log record to the given region.
     fn publish_log(&self, region: &str, record: &LogRecord);
@@ -84,12 +138,24 @@ pub trait NatsPublisher: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the Observer.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ObserveConfig {
-    /// Optional NATS publisher for forwarding logs to the control plane.
-    pub nats_publisher: Option<Arc<dyn NatsPublisher>>,
     /// Minimum log level to emit and forward.
     pub min_log_level: LogLevel,
+    /// Destination for emitted log records. Defaults to `NoopLogSink`.
+    pub log_sink: Arc<dyn LogSink>,
+    /// Per-app identity stamped on every emitted record.
+    pub app_ctx: AppLogContext,
+}
+
+impl Default for ObserveConfig {
+    fn default() -> Self {
+        Self {
+            min_log_level: LogLevel::Info,
+            log_sink: Arc::new(NoopLogSink),
+            app_ctx: AppLogContext::default(),
+        }
+    }
 }
 
 impl ObserveConfig {
@@ -97,8 +163,13 @@ impl ObserveConfig {
         Self::default()
     }
 
-    pub fn with_nats_publisher(mut self, publisher: Arc<dyn NatsPublisher>) -> Self {
-        self.nats_publisher = Some(publisher);
+    pub fn with_log_sink(mut self, sink: Arc<dyn LogSink>) -> Self {
+        self.log_sink = sink;
+        self
+    }
+
+    pub fn with_app_ctx(mut self, ctx: AppLogContext) -> Self {
+        self.app_ctx = ctx;
         self
     }
 
@@ -119,32 +190,32 @@ impl ObserveConfig {
 /// DataDog, etc.). Production deployments must replace the global recorder by
 /// calling `metrics::set_global_recorder` with a real exporter before instantiating
 /// this type.
-#[derive(Default)]
 pub struct Observer {
     /// Local counters for observability.
     counters: RwLock<HashMap<String, (u64, MetricLabels)>>,
     gauges: RwLock<HashMap<String, (f64, MetricLabels)>>,
     histograms: RwLock<HashMap<String, Vec<(f64, MetricLabels)>>>,
-    /// NATS publisher for log forwarding.
-    nats_publisher: Option<Arc<dyn NatsPublisher>>,
+    /// Destination for emitted log records.
+    log_sink: Arc<dyn LogSink>,
+    /// Per-app identity stamped on every emitted record.
+    app_ctx: AppLogContext,
     /// Minimum log level to emit.
     min_log_level: LogLevel,
+}
+
+impl Default for Observer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Observer {
     /// Creates a new `Observer` and (once per process) installs a no-op global
     /// metrics recorder.
     ///
-    /// # Noop by Design
-    ///
-    /// `metrics::counter!`, `metrics::gauge!`, and `metrics::histogram!` macros
-    /// are no-ops until a real exporter is installed via
-    /// `metrics::set_global_recorder`. This struct also stores all increments /
-    /// recordings locally so unit tests can inspect them without a real backend.
-    ///
-    /// To enable production metrics: call `metrics::set_global_recorder` with a
-    /// suitable exporter (e.g. `metrics_exporter::Prometheus`) **before** constructing
-    /// the first `Observer`.
+    /// Uses `NoopLogSink` so emitted log records are dropped. Production code
+    /// (the worker) constructs an `Observer` via `ObserveConfig::with_log_sink`
+    /// so logs reach the control plane.
     pub fn new() -> Self {
         Self::from_config(ObserveConfig::new())
     }
@@ -160,7 +231,8 @@ impl Observer {
             counters: RwLock::new(HashMap::new()),
             gauges: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
-            nats_publisher: config.nats_publisher,
+            log_sink: config.log_sink,
+            app_ctx: config.app_ctx,
             min_log_level: config.min_log_level,
         }
     }
@@ -232,12 +304,15 @@ impl Observer {
         self.emit_log_record_inner(record);
     }
 
-    /// Internal emit path — handles level filtering, tracing, and NATS forwarding.
+    /// Internal emit path — handles level filtering, tracing, and sink forwarding.
     fn emit_log_record_inner(&self, record: &LogRecord) {
-        // Filter by minimum log level — drop records less severe than min_log_level.
-        // tracing::Level ordering: ERROR(1) < WARN(2) < INFO(3) < DEBUG(4) < TRACE(5).
-        // So a record is below minimum when its numeric level is less than the configured minimum.
-        if record.level.to_tracing_level() < self.min_log_level.to_tracing_level() {
+        // Filter by minimum log level. tracing::Level ordering treats lower
+        // ordinal as MORE severe: ERROR(1) < WARN(2) < INFO(3) < DEBUG(4) < TRACE(5).
+        // Standard log-level semantics: min=Info means "show Info and anything
+        // MORE severe" — i.e. ERROR/WARN/INFO pass, DEBUG/TRACE are dropped.
+        // In tracing's ordinal scheme that's "level <= min", so drop when
+        // `record.level > min_log_level`.
+        if record.level.to_tracing_level() > self.min_log_level.to_tracing_level() {
             return;
         }
 
@@ -247,7 +322,7 @@ impl Observer {
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
-        // Emit to tracing.
+        // Emit to tracing (local stdout).
         match record.level {
             LogLevel::Error => tracing::error!(labels = ?label_strs, "{}", record.message),
             LogLevel::Warn => tracing::warn!(labels = ?label_strs, "{}", record.message),
@@ -256,12 +331,12 @@ impl Observer {
             LogLevel::Trace => tracing::trace!(labels = ?label_strs, "{}", record.message),
         }
 
-        // Forward via NATS if configured.
-        // TODO: region routing — pull region from runtime context / tenant metadata
-        // instead of hardcoding "global".
-        if let Some(ref publisher) = self.nats_publisher {
-            publisher.publish_log("global", record);
-        }
+        // Forward to the configured LogSink. The sink handles stamping
+        // tenant/worker identity, batching, and transport. Per-app
+        // AppLogContext travels with the record so downstream sinks don't
+        // need a separate lookup.
+        self.log_sink
+            .push(record.clone(), self.app_ctx.clone());
     }
 
     /// Returns the current value of a counter for testing.
@@ -295,6 +370,27 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test sink that records every record it sees along with the
+    /// `AppLogContext` it was called with.
+    pub struct RecordingLogSink {
+        pub pushed: RwLock<Vec<(LogRecord, AppLogContext)>>,
+    }
+    impl RecordingLogSink {
+        pub fn new() -> Self {
+            Self {
+                pushed: RwLock::new(Vec::new()),
+            }
+        }
+        pub fn records(&self) -> Vec<(LogRecord, AppLogContext)> {
+            self.pushed.read().unwrap().clone()
+        }
+    }
+    impl LogSink for RecordingLogSink {
+        fn push(&self, record: LogRecord, ctx: AppLogContext) {
+            self.pushed.write().unwrap().push((record, ctx));
+        }
+    }
 
     #[test]
     fn test_log_level_from_level_str() {
@@ -347,50 +443,54 @@ mod tests {
         });
     }
 
+    /// Emit forwards the record to the configured LogSink alongside the
+    /// app context. This is the core contract for #76's worker→CP pipeline.
     #[test]
-    fn test_observer_with_nats_publisher_does_not_panic() {
-        struct MockPublisher;
-        impl NatsPublisher for MockPublisher {
-            fn publish_log(&self, _region: &str, _record: &LogRecord) {}
-        }
+    fn test_emit_log_forwards_to_sink() {
+        let sink = Arc::new(RecordingLogSink::new());
         let observer = Observer::from_config(
             ObserveConfig::new()
-                .with_nats_publisher(Arc::new(MockPublisher))
-                .with_min_log_level(LogLevel::Debug),
+                .with_log_sink(sink.clone())
+                .with_app_ctx(AppLogContext {
+                    app_name: "my-app".into(),
+                    tenant_id: "t_tenant1".into(),
+                    deployment_id: "d_xyz".into(),
+                }),
         );
-        observer.emit_log("debug", "test", &[]);
+
+        observer.emit_log("info", "hello world", &[("k".into(), "v".into())]);
+        observer.emit_log("error", "boom", &[]);
+
+        let pushed = sink.records();
+        assert_eq!(pushed.len(), 2);
+
+        let (rec1, ctx1) = &pushed[0];
+        assert_eq!(rec1.message, "hello world");
+        assert_eq!(rec1.level, LogLevel::Info);
+        assert_eq!(rec1.labels, vec![("k".into(), "v".into())]);
+        assert_eq!(ctx1.app_name, "my-app");
+        assert_eq!(ctx1.tenant_id, "t_tenant1");
+        assert_eq!(ctx1.deployment_id, "d_xyz");
+
+        let (rec2, _) = &pushed[1];
+        assert_eq!(rec2.level, LogLevel::Error);
+        assert_eq!(rec2.message, "boom");
     }
 
-    /// Mock publisher that records which log levels were published.
-    struct RecordingPublisher {
-        published: RwLock<Vec<LogLevel>>,
-    }
-    impl RecordingPublisher {
-        fn new() -> Self {
-            Self {
-                published: RwLock::new(Vec::new()),
-            }
-        }
-        fn published_levels(&self) -> Vec<LogLevel> {
-            self.published.read().unwrap().clone()
-        }
-    }
-    impl NatsPublisher for RecordingPublisher {
-        fn publish_log(&self, _region: &str, record: &LogRecord) {
-            self.published.write().unwrap().push(record.level);
-        }
-    }
-
+    /// min_log_level filters records BEFORE forwarding to the sink, so the
+    /// sink only sees records that pass the threshold. Standard semantics:
+    /// min=Info passes ERROR/WARN/INFO and drops DEBUG/TRACE.
     #[test]
     fn test_min_log_level_filters_correctly() {
-        // min=Info: Error and Warn should be blocked; Info/Debug/Trace should pass.
-        let publisher = Arc::new(RecordingPublisher::new());
+        let sink = Arc::new(RecordingLogSink::new());
         let observer = Observer::from_config(
             ObserveConfig::new()
-                .with_nats_publisher(publisher.clone())
+                .with_log_sink(sink.clone())
                 .with_min_log_level(LogLevel::Info),
         );
 
+        // min=Info: ERROR, WARN, INFO pass; DEBUG, TRACE are blocked
+        // (DEBUG/TRACE are less severe than INFO).
         for (msg, lvl) in [
             ("error", LogLevel::Error),
             ("warn", LogLevel::Warn),
@@ -406,17 +506,21 @@ mod tests {
             });
         }
 
-        let published = publisher.published_levels();
-        assert!(
-            !published.contains(&LogLevel::Error),
-            "Error should be filtered"
-        );
-        assert!(
-            !published.contains(&LogLevel::Warn),
-            "Warn should be filtered"
-        );
-        assert!(published.contains(&LogLevel::Info), "Info should pass");
-        assert!(published.contains(&LogLevel::Debug), "Debug should pass");
-        assert!(published.contains(&LogLevel::Trace), "Trace should pass");
+        let pushed = sink.records();
+        let levels: Vec<LogLevel> = pushed.iter().map(|(r, _)| r.level).collect();
+        assert!(levels.contains(&LogLevel::Error), "Error must pass (more severe than Info)");
+        assert!(levels.contains(&LogLevel::Warn), "Warn must pass (more severe than Info)");
+        assert!(levels.contains(&LogLevel::Info), "Info must pass");
+        assert!(!levels.contains(&LogLevel::Debug), "Debug should be filtered (less severe than Info)");
+        assert!(!levels.contains(&LogLevel::Trace), "Trace should be filtered (less severe than Info)");
+    }
+
+    /// Default Observer (no sink configured) uses NoopLogSink; emit must
+    /// not panic even though no consumer exists.
+    #[test]
+    fn test_default_observer_does_not_panic() {
+        let observer = Observer::new();
+        observer.emit_log("debug", "below default min", &[]);
+        observer.emit_log("info", "above default min", &[]);
     }
 }

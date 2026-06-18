@@ -449,11 +449,24 @@ impl Supervisor {
         // Build per-deployment egress policy from the tenant's allowlist.
         let egress = Arc::new(EgressPolicy::new(allowlist));
 
-        // Create a fresh RuntimeState with per-app env vars, metering, and tenant-scoped
-        // persistent stores (KV, cache, scheduling) so data never leaks across tenants.
+        // Create a fresh RuntimeState with per-app env vars, metering, log sink,
+        // app context, and tenant_id. The PR #98 follow-up commits will
+        // replace the stub `NoopLogSink` / empty `app_ctx` with the worker's
+        // real `LogForwarder` and a populated AppLogContext.
+        use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+        struct NoopLogSink;
+        impl LogSink for NoopLogSink {
+            fn push(&self, _record: LogRecord, _ctx: AppLogContext) {}
+        }
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
+            Arc::new(NoopLogSink) as Arc<dyn LogSink>,
+            AppLogContext {
+                app_name: String::new(),
+                tenant_id: tenant_id.to_string(),
+                deployment_id: String::new(),
+            },
             tenant_id.to_string(),
             egress,
         );

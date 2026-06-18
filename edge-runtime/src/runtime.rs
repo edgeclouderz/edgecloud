@@ -100,9 +100,16 @@ impl RuntimeState {
         }
     }
 
-    /// Create a RuntimeState with per-app environment variables for tenant isolation.
+/// Create a RuntimeState with per-app environment variables, log sink,
+    /// app context, and tenant_id for tenant isolation. `log_sink` receives
+    /// every record emitted by `edge:observe.emit_log`; `app_ctx` is stamped
+    /// onto each forwarded record so downstream sinks know the
+    /// tenant/app/deployment. `egress` is the per-tenant outbound allowlist
+    /// enforced by `edge:http-client.fetch` (see `EgressPolicy`).
     pub fn with_env(
         env: std::collections::HashMap<String, String>,
+        log_sink: Arc<dyn observe::LogSink>,
+        app_ctx: observe::AppLogContext,
         tenant_id: String,
         egress: Arc<EgressPolicy>,
     ) -> Self {
@@ -112,7 +119,11 @@ impl RuntimeState {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::new(),
+            observe: observe::Observer::from_config(
+                observe::ObserveConfig::new()
+                    .with_log_sink(log_sink)
+                    .with_app_ctx(app_ctx),
+            ),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
@@ -130,10 +141,14 @@ impl RuntimeState {
         }
     }
 
-    /// Create a RuntimeState with per-app env vars and a request meter.
+    /// Create a RuntimeState with per-app env vars, request meter, log sink,
+    /// app context, and tenant_id. The worker's per-app `execute_app` path
+    /// uses this.
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
+        log_sink: Arc<dyn observe::LogSink>,
+        app_ctx: observe::AppLogContext,
         tenant_id: String,
         egress: Arc<EgressPolicy>,
     ) -> Self {
@@ -143,7 +158,11 @@ impl RuntimeState {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::new(),
+            observe: observe::Observer::from_config(
+                observe::ObserveConfig::new()
+                    .with_log_sink(log_sink)
+                    .with_app_ctx(app_ctx),
+            ),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
