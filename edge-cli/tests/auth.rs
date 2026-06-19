@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Returns a fresh tempdir. The caller passes `home.path()` to the
@@ -335,5 +335,119 @@ async fn signup_server_rejects_invalid_plan_does_not_write_key() {
     assert!(
         read_api_key(&home).is_none(),
         "rejected signup should not write api_key to config"
+    );
+}
+
+/// Pre-seed the tempdir config with a known API key. Used by the
+/// `keys create` tests below so the CLI is already authenticated when
+/// it tries to mint an additional key.
+fn seed_api_key(home: &TempDir, key: &str) {
+    let cfg_path = config_file_for(home);
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    writeln!(f, "[default]\napi_key = \"{key}\"\n").unwrap();
+}
+
+#[tokio::test]
+async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
+    let home = isolated_home();
+    let server = MockServer::start().await;
+
+    seed_api_key(&home, "k_existing");
+
+    // Assert the bearer token the CLI sends matches the on-disk key
+    // (i.e. the new key never overwrites it; we are using the saved
+    // key to authenticate the create call).
+    Mock::given(method("POST"))
+        .and(path("/api/keys"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "k_new",
+            "name": "ci-key",
+            "role": "developer",
+            "token": "raw-token-shown-once",
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("create")
+        .arg("--name")
+        .arg("ci-key");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("k_new"))
+        .stdout(predicate::str::contains("raw-token-shown-once"))
+        .stderr(predicate::str::contains("NOT saved"));
+
+    // The on-disk key must NOT have been overwritten.
+    let stored = read_api_key(&home).expect("config should still have a key");
+    assert_eq!(
+        stored, "k_existing",
+        "keys create must not overwrite the saved api_key"
+    );
+}
+
+#[tokio::test]
+async fn keys_create_without_saved_key_exits_non_zero() {
+    let home = isolated_home();
+    // No seed_api_key call → no key on disk, no EDGE_API_KEY env.
+    // The CLI must refuse to try to authenticate against /api/keys.
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.arg("auth")
+        .arg("keys")
+        .arg("create")
+        .arg("--name")
+        .arg("n");
+
+    cmd.assert().failure().stderr(
+        predicate::str::contains("API key")
+            .or(predicate::str::contains("EDGE_API_KEY"))
+            .or(predicate::str::contains("not found")),
+    );
+}
+
+#[tokio::test]
+async fn keys_create_server_rejects_does_not_overwrite_key() {
+    let home = isolated_home();
+    let server = MockServer::start().await;
+
+    seed_api_key(&home, "k_existing");
+
+    Mock::given(method("POST"))
+        .and(path("/api/keys"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid role"))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("create")
+        .arg("--name")
+        .arg("ci-key")
+        .arg("--role")
+        .arg("bogus");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("keys create failed"))
+        .stdout(predicate::str::contains("raw-token-shown-once").not());
+
+    let stored = read_api_key(&home).expect("config should still have a key");
+    assert_eq!(
+        stored, "k_existing",
+        "rejected keys create must not touch the saved api_key"
     );
 }

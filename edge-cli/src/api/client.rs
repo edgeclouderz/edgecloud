@@ -117,6 +117,18 @@ pub struct TenantCreated {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateAPIKeyResponse {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    /// Raw key shown only once. The caller is responsible for
+    /// persisting it — `edge auth keys create` deliberately does NOT
+    /// overwrite the on-disk credential so the key that was used to
+    /// authenticate this call still works.
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,
     pub tenant_name: String,
@@ -176,6 +188,12 @@ impl ApiClient {
     /// Group accessor for tenant-management endpoints (e.g. signup).
     pub fn tenants(&self) -> Tenants<'_> {
         Tenants { client: self }
+    }
+
+    /// Group accessor for API key management endpoints (requires the
+    /// caller to be authenticated — `new_anonymous` is not enough).
+    pub fn keys(&self) -> Keys<'_> {
+        Keys { client: self }
     }
 
     /// Group accessor for auth-related endpoints (e.g. whoami).
@@ -351,6 +369,44 @@ impl<'a> Tenants<'a> {
     }
 }
 
+/// API key management endpoints. Borrows the parent [`ApiClient`] and
+/// requires the client to have been built with an API key (i.e. NOT via
+/// [`ApiClient::new_anonymous`]).
+pub struct Keys<'a> {
+    client: &'a ApiClient,
+}
+
+impl<'a> Keys<'a> {
+    /// POST `/api/keys` — create an additional API key for the caller's
+    /// tenant. The raw `token` in the response is shown only once and is
+    /// NOT persisted to the local config by the CLI — the caller is
+    /// responsible for storing it.
+    pub fn create(&self, name: &str, role: &str) -> Result<CreateAPIKeyResponse> {
+        let url = format!("{}/api/keys", self.client.base_url);
+        #[derive(Serialize)]
+        struct Payload<'b> {
+            name: &'b str,
+            role: &'b str,
+        }
+        let payload = Payload { name, role };
+        let resp = self
+            .client
+            .http
+            .post(&url)
+            .header("Authorization", self.client.auth_header())
+            .json(&payload)
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys create failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
+    }
+}
+
 /// Auth-related endpoints. Borrows the parent [`ApiClient`].
 pub struct Auth<'a> {
     client: &'a ApiClient,
@@ -412,8 +468,7 @@ mod tests {
         let err = reqwest::blocking::Client::new()
             .get("http://[::1]:not-a-port")
             .build()
-            .err()
-            .expect("build should fail for invalid url");
+            .expect_err("build should fail for invalid url");
         let e: ApiError = err.into();
         assert!(matches!(e, ApiError::Transient { .. }));
     }

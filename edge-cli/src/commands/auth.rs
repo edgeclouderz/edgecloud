@@ -42,6 +42,28 @@ pub enum AuthAction {
     Whoami,
     /// Remove the locally-saved API key.
     Logout,
+    /// Manage additional API keys for the current tenant.
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+}
+
+/// Subcommands of `edge auth keys`.
+#[derive(Subcommand)]
+pub enum KeysAction {
+    /// Mint a new API key for the current tenant. The new key is printed
+    /// to stdout and is NOT saved to your local config — the key you
+    /// used to authenticate this call keeps working.
+    Create {
+        /// Human-readable label for the new key.
+        #[arg(long)]
+        name: String,
+        /// Role for the new key (owner | developer | viewer). Defaults
+        /// to "developer", matching the server-side default.
+        #[arg(long, default_value = "developer")]
+        role: String,
+    },
 }
 
 impl AuthAction {
@@ -56,7 +78,14 @@ impl AuthAction {
             AuthAction::Login { key } => login(key.as_deref()),
             AuthAction::Whoami => whoami(),
             AuthAction::Logout => logout(),
+            AuthAction::Keys { action } => keys_run(action),
         }
+    }
+}
+
+fn keys_run(action: KeysAction) -> Result<()> {
+    match action {
+        KeysAction::Create { name, role } => keys_create(&name, &role),
     }
 }
 
@@ -242,4 +271,44 @@ fn logout() -> Result<()> {
     ApiKey::clear().context("failed to clear API key from local config")?;
     output::success("Logged out");
     Ok(())
+}
+
+/// `edge auth keys create --name <N> [--role <R>]`
+///
+/// Mints an additional API key for the currently-authenticated tenant.
+/// Prints the raw token to stdout but does NOT overwrite the on-disk
+/// key — the key that was used to authenticate this call keeps
+/// working. The caller is responsible for storing the new token
+/// somewhere safe (CI secret, password manager, etc.).
+#[cfg(feature = "network")]
+fn keys_create(name: &str, role: &str) -> Result<()> {
+    let base_url = load_api_url("https://api.edgecloud.dev");
+    output::info(&format!("Endpoint: {base_url}"));
+    let client = ApiClient::new(base_url)?;
+
+    let created = client
+        .keys()
+        .create(name, role)
+        .with_context(|| "failed to create API key")?;
+
+    output::success(&format!("Created key {}", created.id));
+    println!("  ID:        {}", created.id);
+    println!("  Name:      {}", created.name);
+    println!("  Role:      {}", created.role);
+    println!();
+    output::warn("the raw token below is shown only once and was NOT saved to your config");
+    println!("  Token:     {}", created.token);
+    if let Some(path) = ApiKey::config_path() {
+        output::hint(&format!(
+            "your existing key at {} still works",
+            path.display()
+        ));
+    }
+    output::hint("store the new token now (e.g. EDGE_API_KEY=<token> edge deploy ...)");
+    Ok(())
+}
+
+#[cfg(not(feature = "network"))]
+fn keys_create(_name: &str, _role: &str) -> Result<()> {
+    anyhow::bail!("auth keys requires network support; rebuild with --features network")
 }
