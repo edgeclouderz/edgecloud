@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
@@ -16,6 +17,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
+	natsio "github.com/nats-io/nats.go"
 )
 
 func main() {
@@ -49,6 +51,21 @@ func main() {
 	}
 	defer publisher.Close()
 
+	// Ensure the task stream exists with the shape workers expect
+	// (workqueue retention, 24h max age, RF=3). Idempotent — workers also
+	// call ensure_task_stream at startup, but having the control plane
+	// own the stream creation makes startup ordering deterministic.
+	// See issue #86.
+	if err := publisher.EnsureStream(nats.StreamConfig{
+		Name:      nats.TaskStreamName,
+		Subjects:  []string{"edgecloud.tasks.>"},
+		Retention: natsio.WorkQueuePolicy,
+		MaxAge:    24 * time.Hour,
+		Replicas:  3,
+	}); err != nil {
+		log.Fatalf("Failed to ensure NATS stream: %v", err)
+	}
+
 	// Initialize artifact storage
 	artifactStore := storage.NewArtifactStore(cfg.Storage.ArtifactPath)
 
@@ -62,6 +79,7 @@ func main() {
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
+	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
@@ -73,6 +91,7 @@ func main() {
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
+	clusterHandler := handler.NewClusterHandler(clusterSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -118,6 +137,7 @@ func main() {
 	admin.HandleFunc("PUT /api/admin/tenants/{tenantID}", tenantHandler.Update)
 	admin.HandleFunc("DELETE /api/admin/tenants/{tenantID}", tenantHandler.Delete)
 	admin.HandleFunc("DELETE /api/admin/apps/{appName}", appHandler.Delete)
+	admin.HandleFunc("GET /api/admin/cluster", clusterHandler.Get)
 
 	// Chain auth + role middleware
 	apiWithAuth := authMiddleware.Authenticate(api)
