@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -46,7 +47,7 @@ func (m *mockArtifactStore) Save(tenantID, appName, deploymentID string, r io.Re
 
 // migrationSvcForTest builds a MigrationService with mock dependencies.
 func migrationSvcForTest(repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
-	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
 }
 
 func skipIfNoEdgeMigrate(t *testing.T) {
@@ -156,7 +157,7 @@ func TestMigrationService_Migrate_EdgeMigrateFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin")
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc")
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if !errors.Is(err, ErrEdgeMigrateFailed) {
@@ -389,13 +390,33 @@ func TestMigrateTree_RejectsEmptyTree(t *testing.T) {
 	}
 }
 
-func TestMigrateTree_RejectsUnsupportedLanguage(t *testing.T) {
+func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
+	// M3 widened the language gate from "c only" to "c or rust".
+	// Anything else (e.g. "python", "go") is still rejected at the
+	// service layer as a defense-in-depth check, even though the
+	// handler rejects it earlier.
 	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
-	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", []domain.FileEntry{
-		{Path: "main.rs", Source: "fn main() {}\n"},
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "python", []domain.FileEntry{
+		{Path: "main.py", Source: "print('hi')\n"},
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported language")
+	}
+}
+
+func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
+	// M3 also added Rust. The service shouldn't reject "rust" at the
+	// language gate — it'll only fail later (in the per-file
+	// subprocess), so this test only confirms the gate is open.
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", nil)
+	// Empty entries still errors, but the error must be about empty
+	// tree, not about the language.
+	if err == nil {
+		t.Fatal("expected error for empty tree")
+	}
+	if !strings.Contains(err.Error(), "no files in tree") {
+		t.Fatalf("expected empty-tree error, got: %v", err)
 	}
 }
 
@@ -406,5 +427,124 @@ func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for path traversal")
+	}
+}
+
+// TestDetectTransformedPatternsRust covers the M3.C7 heuristic helper
+// that backs the `--analyze-json` fallback path in MigrateTree when
+// `language == "rust"`. Each subtest is a representative transformed
+// Rust source and the set of pattern names that should be detected.
+func TestDetectTransformedPatternsRust(t *testing.T) {
+	cases := []struct {
+		name     string
+		source   string
+		expected []string // substrings that must appear in Pattern field
+	}{
+		{
+			name: "TcpBind",
+			source: `use wasi::socket::tcp::TcpSocket;
+fn main() {
+    let _ = TcpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_bind("127.0.0.1:80")?.finish_bind();
+}`,
+			expected: []string{"TcpListener::bind"},
+		},
+		{
+			name: "TcpConnect",
+			source: `use wasi::socket::tcp::TcpSocket;
+fn main() {
+    let _ = TcpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_connect("127.0.0.1:80")?.finish_connect();
+}`,
+			expected: []string{"TcpStream::connect"},
+		},
+		{
+			name: "UdpBind",
+			source: `use wasi::socket::udp::UdpSocket;
+fn main() {
+    let _ = UdpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_bind("0.0.0.0:53")?.finish_bind();
+}`,
+			expected: []string{"UdpSocket::bind"},
+		},
+		{
+			name: "FsOpen",
+			source: `fn main() {
+    let _ = wasi::filesystem::open("data.txt", wasi::filesystem::OpenFlags::READ);
+}`,
+			expected: []string{"File::open"},
+		},
+		{
+			name: "FsRead",
+			source: `fn main() {
+    let _ = wasi::filesystem::read("data.txt");
+}`,
+			expected: []string{"fs::read"},
+		},
+		{
+			name: "FsWrite",
+			source: `fn main() {
+    let _ = wasi::filesystem::write("out.txt", b"hi");
+}`,
+			expected: []string{"fs::write"},
+		},
+		{
+			name:     "no match",
+			source:   "fn main() { println!(\"hello\"); }",
+			expected: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			patterns := detectTransformedPatternsRust(tc.source)
+			if tc.expected == nil {
+				if len(patterns) != 0 {
+					t.Errorf("expected no patterns, got %d: %+v", len(patterns), patterns)
+				}
+				return
+			}
+			for _, want := range tc.expected {
+				found := false
+				for _, p := range patterns {
+					if strings.Contains(p.Pattern, want) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected to find pattern containing %q, got %+v", want, patterns)
+				}
+			}
+		})
+	}
+}
+
+// TestMigrationService_StoresRustcPath confirms the constructor
+// round-trips the rustc path so the service is wired correctly.
+func TestMigrationService_StoresRustcPath(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc")
+	if svc.rustcPath != "/opt/rust/bin/rustc" {
+		t.Errorf("expected rustcPath=%q, got %q", "/opt/rust/bin/rustc", svc.rustcPath)
+	}
+	if svc.edgeMigratePath != "edge-migrate" {
+		t.Errorf("expected edgeMigratePath=%q, got %q", "edge-migrate", svc.edgeMigratePath)
+	}
+	if svc.wasiSdkPath != "/wasi-sdk" {
+		t.Errorf("expected wasiSdkPath=%q, got %q", "/wasi-sdk", svc.wasiSdkPath)
+	}
+}
+
+// TestExtForLanguage covers the small dispatch helper.
+func TestExtForLanguage(t *testing.T) {
+	if extForLanguage("rust") != ".rs" {
+		t.Errorf("rust: expected .rs, got %q", extForLanguage("rust"))
+	}
+	if extForLanguage("c") != ".c" {
+		t.Errorf("c: expected .c, got %q", extForLanguage("c"))
+	}
+	if extForLanguage("") != ".c" {
+		t.Errorf("empty: expected .c, got %q", extForLanguage(""))
+	}
+	if extForLanguage("python") != ".c" {
+		t.Errorf("unknown: expected .c fallback, got %q", extForLanguage("python"))
 	}
 }

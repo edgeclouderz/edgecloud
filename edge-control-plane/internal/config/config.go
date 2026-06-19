@@ -130,6 +130,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("WASI_SDK_PATH"); v != "" {
 		cfg.Migration.WasiSdkPath = v
 	}
+	if v := os.Getenv("RUSTC_PATH"); v != "" {
+		cfg.Migration.RustcPath = v
+	}
 
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
@@ -146,4 +149,10 @@ func Load(path string) (*Config, error) {
 type MigrationConfig struct {
 	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
 	WasiSdkPath     string `yaml:"wasi_sdk_path"     env:"WASI_SDK_PATH"     envDefault:"/usr/local/wasi-sdk/bin"`
+	// RustcPath is the absolute path to a rustc binary capable of
+	// targeting wasm32-wasip2 (i.e. `rustup target add wasm32-wasip2`
+	// has been run on the host). Used by the migration service when
+	// language == "rust" to compile the transformed source into a
+	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
+	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
 }
