@@ -217,17 +217,55 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		return fmt.Errorf("invalid app name: %s", appName)
 	}
 
-	// Check MaxApps quota before inserting.
-	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting quota: %w", err)
-	}
-	count, err := s.appRepo.CountByTenant(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("counting apps: %w", err)
-	}
-	if quota != nil && count >= quota.MaxApps {
-		return ErrMaxAppsQuotaExceeded
+	var err error // outer-scope for InsertIfNotExists call below
+
+	// Serialize concurrent creates for the same tenant via SELECT FOR UPDATE.
+	// This prevents a TOCTOU race where two simultaneous creates both count N
+	// apps, both pass the quota check, and the tenant ends up with N+1 apps.
+	if s.db != nil {
+		tx, err := s.db.BeginTxx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("beginning transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		var tenantExists bool
+		err = tx.GetContext(ctx, &tenantExists, `SELECT true FROM tenants WHERE id = $1 FOR UPDATE`, tenantID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("tenant not found")
+			}
+			return fmt.Errorf("locking tenant: %w", err)
+		}
+
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		count, err := s.appRepo.CountByTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("counting apps: %w", err)
+		}
+		if quota != nil && count >= quota.MaxApps {
+			return ErrMaxAppsQuotaExceeded
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing transaction: %w", err)
+		}
+	} else {
+		// No DB available (test path) — check quota without the lock.
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		count, err := s.appRepo.CountByTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("counting apps: %w", err)
+		}
+		if quota != nil && count >= quota.MaxApps {
+			return ErrMaxAppsQuotaExceeded
+		}
 	}
 
 	app := &domain.App{
