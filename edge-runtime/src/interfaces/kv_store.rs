@@ -554,49 +554,51 @@ mod tests {
     }
 
     /// Two tenants writing the same key to their own scoped stores must not
-    /// see each other's data. Runs inside a Tokio runtime so flush_if_persistent
-    /// actually writes to disk — verifying path-level isolation, not just
-    /// in-memory object separation.
+    /// see each other's data. Store ops run in `spawn_blocking` so
+    /// `flush_if_persistent` can call `Handle::block_on` (not allowed on
+    /// executor threads), verifying path-level isolation on disk.
     #[tokio::test]
     async fn test_tenant_stores_are_isolated() {
         let (base, _cleanup) = unique_test_dir();
 
-        let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
-        store_a
-            .set("secret".into(), b"tenant_a_value".to_vec(), None)
-            .unwrap();
+        tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || {
+                let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+                store_a.set("secret".into(), b"tenant_a_value".to_vec(), None).unwrap();
 
-        let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
-        store_b
-            .set("secret".into(), b"tenant_b_value".to_vec(), None)
-            .unwrap();
+                let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+                store_b.set("secret".into(), b"tenant_b_value".to_vec(), None).unwrap();
 
-        // In-memory view is isolated
-        assert_eq!(
-            store_a.get("secret").unwrap(),
-            Some(b"tenant_a_value".to_vec()),
-            "tenant A must not see tenant B's data"
-        );
-        assert_eq!(
-            store_b.get("secret").unwrap(),
-            Some(b"tenant_b_value".to_vec()),
-            "tenant B must not see tenant A's data"
-        );
+                // In-memory view is isolated.
+                assert_eq!(
+                    store_a.get("secret").unwrap(),
+                    Some(b"tenant_a_value".to_vec()),
+                    "tenant A must not see tenant B's data"
+                );
+                assert_eq!(
+                    store_b.get("secret").unwrap(),
+                    Some(b"tenant_b_value".to_vec()),
+                    "tenant B must not see tenant A's data"
+                );
 
-        // Verify that the data was flushed to separate on-disk paths.
-        // Opening a fresh store from tenant A's path must NOT see tenant B's key.
-        let store_a2 = KvStore::with_persistence(&base.join("t_a")).expect("store_a2");
-        assert_eq!(
-            store_a2.get("secret").unwrap(),
-            Some(b"tenant_a_value".to_vec()),
-            "reloading tenant A's store must not return tenant B's value"
-        );
-        let store_b2 = KvStore::with_persistence(&base.join("t_b")).expect("store_b2");
-        assert_eq!(
-            store_b2.get("secret").unwrap(),
-            Some(b"tenant_b_value".to_vec()),
-            "reloading tenant B's store must not return tenant A's value"
-        );
+                // Reload from disk and verify paths are separate.
+                let store_a2 = KvStore::with_persistence(&base.join("t_a")).expect("store_a2");
+                assert_eq!(
+                    store_a2.get("secret").unwrap(),
+                    Some(b"tenant_a_value".to_vec()),
+                    "reloading tenant A must not return tenant B's value"
+                );
+                let store_b2 = KvStore::with_persistence(&base.join("t_b")).expect("store_b2");
+                assert_eq!(
+                    store_b2.get("secret").unwrap(),
+                    Some(b"tenant_b_value".to_vec()),
+                    "reloading tenant B must not return tenant A's value"
+                );
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
     }
 
     /// A tenant must not be able to enumerate keys belonging to another tenant
@@ -605,29 +607,37 @@ mod tests {
     async fn test_tenant_list_keys_does_not_cross_tenant_boundary() {
         let (base, _cleanup) = unique_test_dir();
 
-        let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
-        store_a.set("user:1".into(), b"alice".to_vec(), None).unwrap();
-        store_a.set("user:2".into(), b"bob".to_vec(), None).unwrap();
+        tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || {
+                let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+                store_a.set("user:1".into(), b"alice".to_vec(), None).unwrap();
+                store_a.set("user:2".into(), b"bob".to_vec(), None).unwrap();
 
-        let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
-        store_b.set("user:1".into(), b"eve".to_vec(), None).unwrap();
+                let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+                store_b.set("user:1".into(), b"eve".to_vec(), None).unwrap();
 
-        // store_a sees only its own keys
-        let mut keys_a = store_a.list_keys("user:").unwrap();
-        keys_a.sort();
-        assert_eq!(keys_a, vec!["user:1", "user:2"]);
-        assert_eq!(store_a.get("user:1").unwrap(), Some(b"alice".to_vec()));
+                let mut keys_a = store_a.list_keys("user:").unwrap();
+                keys_a.sort();
+                assert_eq!(keys_a, vec!["user:1", "user:2"]);
+                assert_eq!(store_a.get("user:1").unwrap(), Some(b"alice".to_vec()));
 
-        // store_b sees only its own key; tenant A's "alice" is invisible
-        let keys_b = store_b.list_keys("user:").unwrap();
-        assert_eq!(keys_b, vec!["user:1"]);
-        assert_eq!(store_b.get("user:1").unwrap(), Some(b"eve".to_vec()));
+                let keys_b = store_b.list_keys("user:").unwrap();
+                assert_eq!(keys_b, vec!["user:1"]);
+                assert_eq!(store_b.get("user:1").unwrap(), Some(b"eve".to_vec()));
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
     }
 
-    /// from_env_for_tenant must reject path-traversal tenant IDs.
+    /// from_env_for_tenant must reject path-traversal and Windows-reserved tenant IDs.
     #[test]
     fn test_from_env_for_tenant_rejects_path_traversal() {
-        let dangerous = ["../escape", "../../etc", "/absolute", "a/b", ".", "..", "a\0b"];
+        let dangerous = [
+            "../escape", "../../etc", "/absolute", "a/b", ".", "..", "a\0b",
+            "CON", "NUL", "PRN", "AUX", "COM1", "LPT9",
+        ];
         for id in dangerous {
             assert!(
                 KvStore::from_env_for_tenant(id).is_err(),
@@ -635,7 +645,7 @@ mod tests {
                 id
             );
         }
-        // Safe IDs should not be rejected
-        assert!(KvStore::from_env_for_tenant("t_abc123").is_ok() || true); // Ok(None) or Ok(Some)
+        // Safe IDs return Ok (either Ok(None) when env var absent, or Ok(Some)).
+        assert!(KvStore::from_env_for_tenant("t_abc123").is_ok());
     }
 }

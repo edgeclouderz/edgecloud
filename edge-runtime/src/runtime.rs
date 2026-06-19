@@ -66,6 +66,7 @@ pub struct RuntimeState {
 impl RuntimeState {
     /// Test-only constructor. Always uses ephemeral in-memory stores regardless of env vars.
     /// Production code must use `with_env_and_meter` to get per-tenant persistent stores.
+    #[cfg(test)]
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
@@ -198,6 +199,7 @@ impl RuntimeState {
     }
 }
 
+#[cfg(test)]
 impl Default for RuntimeState {
     fn default() -> Self {
         Self::new()

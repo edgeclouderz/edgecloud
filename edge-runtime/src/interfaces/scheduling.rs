@@ -184,11 +184,14 @@ pub struct Scheduler {
     tasks: Arc<Mutex<HashMap<String, ScheduledTask>>>,
     persistence: Option<SchedulerPersistence>,
     shutdown: Arc<AtomicBool>,
+    /// Signals the background thread to wake and exit without waiting the full sleep period.
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.shutdown_notify.notify_one();
     }
 }
 
@@ -206,11 +209,12 @@ impl Scheduler {
         let tasks_clone = tasks.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
 
-        // Spawn a background worker that fires due tasks.
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("scheduling: failed to spawn runtime");
 
@@ -230,8 +234,10 @@ impl Scheduler {
                             None => 10_000,
                         }
                     };
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {}
+                        _ = shutdown_notify_clone.notified() => { break; }
+                    }
                     if shutdown_clone.load(Ordering::Acquire) {
                         break;
                     }
@@ -259,6 +265,7 @@ impl Scheduler {
             tasks,
             persistence: None,
             shutdown,
+            shutdown_notify,
         }
     }
 
@@ -286,15 +293,22 @@ impl Scheduler {
             .recv()
             .map_err(|_| SchedulerError::Io("load thread panicked".into()))??;
 
-        let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
+        // Populate tasks before spawning the worker so the thread sees the full
+        // task list immediately on its first iteration.
+        let mut initial_tasks = HashMap::<String, ScheduledTask>::new();
+        for task in loaded {
+            initial_tasks.insert(task.id.clone(), task);
+        }
+        let tasks = Arc::new(Mutex::new(initial_tasks));
         let tasks_clone = tasks.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
 
-        // Spawn the background worker (same as new()).
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("scheduling: failed to spawn runtime");
 
@@ -314,8 +328,10 @@ impl Scheduler {
                             None => 10_000,
                         }
                     };
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {}
+                        _ = shutdown_notify_clone.notified() => { break; }
+                    }
                     if shutdown_clone.load(Ordering::Acquire) {
                         break;
                     }
@@ -339,18 +355,11 @@ impl Scheduler {
             });
         });
 
-        // Populate tasks from loaded state.
-        {
-            let mut tasks_guard = tasks.lock().unwrap();
-            for task in loaded {
-                tasks_guard.insert(task.id.clone(), task);
-            }
-        }
-
         Ok(Self {
             tasks,
             persistence: Some(persistence),
             shutdown,
+            shutdown_notify,
         })
     }
 
