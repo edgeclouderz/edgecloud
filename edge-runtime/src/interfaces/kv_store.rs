@@ -203,6 +203,19 @@ impl KvStore {
         }
     }
 
+    /// Persistent store scoped to a specific tenant.
+    /// The store file is `{EDGE_KV_STORE_PATH}/{tenant_id}/store.json`.
+    /// Returns `Ok(None)` if `EDGE_KV_STORE_PATH` is not set.
+    pub fn from_env_for_tenant(tenant_id: &str) -> Result<Option<Self>, KvStoreError> {
+        match std::env::var(ENV_KV_STORE_PATH) {
+            Ok(base) => {
+                let path = Path::new(&base).join(tenant_id);
+                Self::with_persistence(&path).map(Some)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Returns the current unix timestamp in seconds.
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -518,5 +531,73 @@ mod tests {
         let result = KvStore::from_env();
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// RAII guard that removes a temp directory on drop.
+    struct DeferRmDir(std::path::PathBuf);
+    impl Drop for DeferRmDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_test_dir() -> (std::path::PathBuf, DeferRmDir) {
+        use uuid::Uuid;
+        let path = std::env::temp_dir().join(format!("edge-kv-test-{}", Uuid::new_v4()));
+        let guard = DeferRmDir(path.clone());
+        (path, guard)
+    }
+
+    /// Two tenants writing the same key to their own scoped stores must not
+    /// see each other's data. This is the core isolation contract for issue #71.
+    #[test]
+    fn test_tenant_stores_are_isolated() {
+        let (base, _cleanup) = unique_test_dir();
+
+        let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+        store_a
+            .set("secret".into(), b"tenant_a_value".to_vec(), None)
+            .unwrap();
+
+        let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+        store_b
+            .set("secret".into(), b"tenant_b_value".to_vec(), None)
+            .unwrap();
+
+        assert_eq!(
+            store_a.get("secret").unwrap(),
+            Some(b"tenant_a_value".to_vec()),
+            "tenant A must not see tenant B's data"
+        );
+        assert_eq!(
+            store_b.get("secret").unwrap(),
+            Some(b"tenant_b_value".to_vec()),
+            "tenant B must not see tenant A's data"
+        );
+    }
+
+    /// A tenant must not be able to enumerate keys belonging to another tenant
+    /// even when both have the same key prefix.
+    #[test]
+    fn test_tenant_list_keys_does_not_cross_tenant_boundary() {
+        let (base, _cleanup) = unique_test_dir();
+
+        let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+        store_a.set("user:1".into(), b"alice".to_vec(), None).unwrap();
+        store_a.set("user:2".into(), b"bob".to_vec(), None).unwrap();
+
+        let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+        store_b.set("user:1".into(), b"eve".to_vec(), None).unwrap();
+
+        // store_a sees only its own keys
+        let mut keys_a = store_a.list_keys("user:").unwrap();
+        keys_a.sort();
+        assert_eq!(keys_a, vec!["user:1", "user:2"]);
+        assert_eq!(store_a.get("user:1").unwrap(), Some(b"alice".to_vec()));
+
+        // store_b sees only its own key; tenant A's "alice" is invisible
+        let keys_b = store_b.list_keys("user:").unwrap();
+        assert_eq!(keys_b, vec!["user:1"]);
+        assert_eq!(store_b.get("user:1").unwrap(), Some(b"eve".to_vec()));
     }
 }
