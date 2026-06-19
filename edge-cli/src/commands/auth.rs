@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use std::env;
 use std::io::Read;
 
 use crate::api::{ApiClient, ApiError};
@@ -20,6 +21,11 @@ pub enum AuthAction {
         /// Plan tier. Defaults to "free".
         #[arg(long, default_value = "free")]
         plan: String,
+        /// Overwrite an existing saved key without prompting. Required
+        /// when an `EDGE_API_KEY` env var is set and a saved key is
+        /// present.
+        #[arg(long)]
+        force: bool,
     },
     /// Save an existing API key to the local config file. Reads from
     /// stdin if `--key` is not provided.
@@ -37,7 +43,7 @@ pub enum AuthAction {
 impl AuthAction {
     pub fn run(self) -> Result<()> {
         match self {
-            AuthAction::Signup { name, plan } => signup(&name, &plan),
+            AuthAction::Signup { name, plan, force } => signup(&name, &plan, force),
             AuthAction::Login { key } => login(key.as_deref()),
             AuthAction::Whoami => whoami(),
             AuthAction::Logout => logout(),
@@ -45,22 +51,51 @@ impl AuthAction {
     }
 }
 
-/// `edge auth signup --name <NAME> [--plan <PLAN>]`
+/// `edge auth signup --name <NAME> [--plan <PLAN>] [--force]`
 ///
 /// Hits the public `POST /api/tenants` endpoint, then persists the
 /// returned API key to the local config file. Requires network.
 #[cfg(feature = "network")]
-fn signup(name: &str, plan: &str) -> Result<()> {
+fn signup(name: &str, plan: &str, force: bool) -> Result<()> {
     let base_url = load_api_url("https://api.edgecloud.dev");
     let client = ApiClient::new_anonymous(base_url)?;
 
+    // F1: surface the endpoint so the user sees where the request is
+    // going. A developer pointing at staging or a local control plane
+    // gets a chance to ctrl-C if the URL looks wrong.
+    output::info(&format!("Endpoint: {url}", url = client.base_url()));
     output::section(&format!("Creating tenant '{name}'"));
+
     let created = client.tenants().create(name, plan).with_context(|| {
         format!(
             "signup failed (is the control plane reachable at {}?)",
             client.base_url()
         )
     })?;
+
+    // F2: refuse to silently overwrite a saved key the user may still
+    // be relying on. If EDGE_API_KEY is set in the env, the user is
+    // actively using *that* key — destroying the saved one is
+    // destructive. Otherwise we warn but proceed so a deliberate
+    // re-signup is still possible. --force bypasses both checks.
+    if !force {
+        if let Ok(existing) = ApiKey::load_without_env() {
+            if env::var("EDGE_API_KEY").is_ok() {
+                output::error(&format!(
+                    "an API key is already saved at {}; signup would overwrite it. \
+                     unset EDGE_API_KEY, remove the file, or pass --force.",
+                    ApiKey::config_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".into())
+                ));
+                anyhow::bail!("refusing to overwrite saved key while EDGE_API_KEY is set");
+            }
+            // Warn but proceed.
+            let _ = existing; // keep the file read alive; warn is what we want
+            output::warn("an API key is already saved locally; signup will replace it");
+            output::hint("pass --force to silence this warning");
+        }
+    }
 
     // Persist the key to the user's config file. We do this even though
     // the server has just minted it — that is the whole point of signup.
@@ -79,7 +114,7 @@ fn signup(name: &str, plan: &str) -> Result<()> {
 }
 
 #[cfg(not(feature = "network"))]
-fn signup(_name: &str, _plan: &str) -> Result<()> {
+fn signup(_name: &str, _plan: &str, _force: bool) -> Result<()> {
     anyhow::bail!("auth signup requires network support; rebuild with --features network")
 }
 
@@ -120,6 +155,7 @@ fn login(key: Option<&str>) -> Result<()> {
     // exported `EDGE_API_KEY` cannot shadow the key we just saved
     // (issue #69 review finding F2).
     let base_url = load_api_url("https://api.edgecloud.dev");
+    output::info(&format!("Endpoint: {base_url}"));
     let client = match ApiClient::new_from_config_only(base_url) {
         Ok(c) => c,
         Err(e) => {
@@ -166,6 +202,7 @@ fn login(key: Option<&str>) -> Result<()> {
 #[cfg(feature = "network")]
 fn whoami() -> Result<()> {
     let base_url = load_api_url("https://api.edgecloud.dev");
+    output::info(&format!("Endpoint: {base_url}"));
     let client = ApiClient::new(base_url)?;
     let info = client
         .auth()
