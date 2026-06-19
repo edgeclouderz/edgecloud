@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -61,6 +62,38 @@ func skipIfNoClang(t *testing.T) {
 		t.Skip("wasi-sdk clang not available at /usr/local/wasi-sdk/bin/clang")
 	}
 }
+
+// skipIfNoRustcWasip2 skips the test if rustc is not on PATH or if the
+// wasm32-wasip2 target isn't installed. The latter is the most common
+// failure mode on a fresh checkout — rustc is bundled with rustup but
+// `rustup target add wasm32-wasip2` has to be run separately.
+func skipIfNoRustcWasip2(t *testing.T) {
+	rustc, err := exec.LookPath("rustc")
+	if err != nil {
+		t.Skip("rustc not in PATH")
+	}
+	out, err := exec.Command(rustc, "--print", "target-list").Output()
+	if err != nil {
+		t.Skipf("rustc --print target-list failed: %v", err)
+	}
+	if !strings.Contains(string(out), "wasm32-wasip2") {
+		t.Skip("rustc target wasm32-wasip2 not installed; run `rustup target add wasm32-wasip2`")
+	}
+}
+
+// rustHTTPSource is a minimal Rust program that exercises the
+// auto-transformable patterns: TcpBind (std::net::TcpListener::bind),
+// FsOpen (std::fs::File::open), and FsWrite (std::fs::write). After
+// `edge-migrate --language rust --transform`, the resulting source
+// must contain `TcpSocket::new`, `wasi::filesystem::open`, and
+// `wasi::filesystem::write` to compile against wasi::socket and
+// wasi::filesystem.
+const rustHTTPSource = `fn main() {
+    let _listener = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
+    let _f = std::fs::File::open("hello.txt").unwrap();
+    std::fs::write("out.txt", b"hi").unwrap();
+}
+`
 
 // posixHTTPSource is a simple POSIX C program with socket + bind + listen + accept.
 const posixHTTPSource = `#include <stdio.h>
@@ -546,5 +579,221 @@ func TestExtForLanguage(t *testing.T) {
 	}
 	if extForLanguage("python") != ".c" {
 		t.Errorf("unknown: expected .c fallback, got %q", extForLanguage("python"))
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M3.C10 — Rust integration tests
+// ─────────────────────────────────────────────────────────────────────
+
+// TestMigrationService_Migrate_RustSuccess exercises the full Rust
+// pipeline: edge-migrate transforms the source to wasi::socket +
+// wasi::filesystem calls, then rustc --target wasm32-wasip2 compiles
+// it. The artifact must be a non-empty wasm blob and a deployment
+// must be created. This is the load-bearing M3 end-to-end test.
+func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if report.Status != domain.MigrationStatusSuccess {
+		t.Errorf("expected status success, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+	if !report.WasmStored {
+		t.Error("expected WasmStored=true")
+	}
+	if report.DeploymentID == nil || *report.DeploymentID == "" {
+		t.Error("expected non-empty deployment ID")
+	}
+	if report.AppName != "hello" {
+		t.Errorf("expected appName=hello, got: %s", report.AppName)
+	}
+	if len(repo.deployments) != 1 {
+		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
+	}
+	// The artifact must be a non-empty wasm blob — at minimum the
+	// 8-byte wasm magic + version.
+	wasmBytes, ok := store.artifacts["tenant-1/hello/"+*report.DeploymentID]
+	if !ok {
+		t.Fatal("artifact not found in store")
+	}
+	if len(wasmBytes) < 8 {
+		t.Errorf("wasm artifact too small (%d bytes); expected >= 8", len(wasmBytes))
+	}
+	if !bytes.HasPrefix(wasmBytes, []byte{0x00, 0x61, 0x73, 0x6d}) {
+		t.Errorf("artifact is not a wasm binary (missing magic); first bytes: % x", wasmBytes[:min(8, len(wasmBytes))])
+	}
+}
+
+// TestMigrationService_Migrate_RustAppNameStripsRs confirms the
+// Rust path strips `.rs` (not `.c`) when deriving the app name. If
+// this regresses, every Rust deployment would land under a literal
+// `.rs` app_name directory.
+func TestMigrationService_Migrate_RustAppNameStripsRs(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "my_app.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if report.AppName != "my_app" {
+		t.Errorf("expected appName=my_app, got: %s", report.AppName)
+	}
+}
+
+// TestMigrationService_Migrate_RustProcessExitNotTransformable
+// confirms `std::process::exit` is detected and flagged as
+// manual-review, producing a partial migration report (not success).
+// WASM has no process model — there's no auto-transform.
+func TestMigrationService_Migrate_RustProcessExitNotTransformable(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	const src = `fn main() {
+    std::process::exit(0);
+}
+`
+	report, err := svc.Migrate(context.Background(), "tenant-1", "exit.rs", "rust", src)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	// Status is "partial" because the analyze-json path reports
+	// manual_review entries; wasm may still be produced (rustc
+	// ignores the unmatched call) but the report flag is what
+	// callers use to decide if a deployment is migratable.
+	if report.Status == domain.MigrationStatusSuccess && len(report.PatternsManualReview) == 0 {
+		t.Errorf("expected manual_review entries for std::process::exit, got report: %+v", report)
+	}
+	hasExitReview := false
+	for _, p := range report.PatternsManualReview {
+		if strings.Contains(p.Pattern, "ProcessExit") || strings.Contains(p.Pattern, "exit") {
+			hasExitReview = true
+			break
+		}
+	}
+	if !hasExitReview {
+		t.Errorf("expected a ProcessExit manual_review entry, got: %+v", report.PatternsManualReview)
+	}
+}
+
+// TestMigrationService_Migrate_RustEdgeMigrateFails covers the
+// error path when the Rust analyzer itself blows up (edge-migrate
+// returns non-zero). The service must surface a Failed report.
+func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	// Point edge-migrate at a non-existent binary so the subprocess
+	// fails. The Rust compile path must surface this as a failure,
+	// not silently produce a wasm.
+	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no top-level error (report carries it), got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status=failed, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false on edge-migrate failure")
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error entry on edge-migrate failure")
+	}
+}
+
+// TestMigrateTree_RustCompilesAllFilesTogether exercises the tree
+// pipeline for Rust. Two .rs files; the service must produce a
+// single wasm artifact and per-file reports.
+func TestMigrateTree_RustCompilesAllFilesTogether(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	entries := []domain.FileEntry{
+		{Path: "src/main.rs", Source: `fn main() {
+    let _l = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
+}
+`},
+		{Path: "src/util.rs", Source: `pub fn helper() {
+    let _f = std::fs::File::open("x.txt").unwrap();
+}
+`},
+	}
+
+	report, err := svc.MigrateTree(context.Background(), "tenant-1", "rust_tree", "rust", entries)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if len(report.Files) != 2 {
+		t.Fatalf("expected 2 file reports, got: %d", len(report.Files))
+	}
+	if report.FilesTotal != 2 {
+		t.Errorf("expected FilesTotal=2, got: %d", report.FilesTotal)
+	}
+	if report.AppName != "rust_tree" {
+		t.Errorf("expected appName=rust_tree, got: %s", report.AppName)
+	}
+}
+
+// TestDetectTransformedPatternsRust_OnHttpServerFixture runs the
+// heuristic scanner on the actual transformed output of the http
+// server fixture (not a synthetic string). It catches regressions
+// where the transformer drops a wasi::socket call without
+// detectTransformedPatternsRust noticing.
+func TestDetectTransformedPatternsRust_OnHttpServerFixture(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	fixture := "/Users/poyrazk/dev/Cloud/edgeCloud/.claude/worktrees/migrate-issue-88/edge-migrate/testdata/http_server.rs"
+	cmd := exec.Command("edge-migrate", "--language", "rust", "--transform", fixture)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("edge-migrate --language rust --transform failed: %v", err)
+	}
+	transformed := string(out)
+
+	detections := detectTransformedPatternsRust(transformed)
+	if len(detections) == 0 {
+		t.Fatalf("detectTransformedPatternsRust found no detections in:\n%s", transformed)
+	}
+	// http_server.rs uses TcpListener::bind + TcpStream::connect;
+	// both should be detected.
+	hasBind, hasConnect := false, false
+	for _, d := range detections {
+		if strings.Contains(d.Pattern, "TcpBind") {
+			hasBind = true
+		}
+		if strings.Contains(d.Pattern, "TcpConnect") {
+			hasConnect = true
+		}
+	}
+	if !hasBind {
+		t.Errorf("expected TcpBind detection, got: %+v", detections)
+	}
+	if !hasConnect {
+		t.Errorf("expected TcpConnect detection, got: %+v", detections)
 	}
 }
