@@ -11,8 +11,8 @@ impl TempDir {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let path = std::env::temp_dir()
-            .join(format!("edge_migrate_treetest_{}_{}_{}", label, pid, id));
+        let path =
+            std::env::temp_dir().join(format!("edge_migrate_treetest_{}_{}_{}", label, pid, id));
         fs::create_dir_all(&path).expect("create tempdir");
         Self { path }
     }
@@ -65,7 +65,8 @@ fn test_tree_flag_rejects_unmigratable_without_force() {
     assert!(
         !output.status.success(),
         "expected non-zero exit. stdout: {}\nstderr: {}",
-        stdout, stderr
+        stdout,
+        stderr
     );
     assert!(
         stdout.contains("Manual review") || stderr.contains("untransformable"),

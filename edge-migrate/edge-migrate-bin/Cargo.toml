@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-edge-migrate-lib = { path = "../edge-migrate-lib" }
+edge-migrate-lib = { path = "../edge-migrate-lib", features = ["rust"] }
 clap = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
