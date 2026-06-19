@@ -333,6 +333,19 @@ impl Scheduler {
         }
     }
 
+    /// Persistent scheduler scoped to a specific tenant.
+    /// The schedule file is `{EDGE_SCHEDULING_PATH}/{tenant_id}/schedule.json`.
+    /// Returns `Ok(None)` if `EDGE_SCHEDULING_PATH` is not set.
+    pub fn from_env_for_tenant(tenant_id: &str) -> Result<Option<Self>, SchedulerError> {
+        match std::env::var(ENV_SCHEDULING_PATH) {
+            Ok(base) => {
+                let path = Path::new(&base).join(tenant_id);
+                Self::with_persistence(&path).map(Some)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Internal helper: flush to disk if persistence is configured.
     fn flush_if_persistent(&self) {
         if self.persistence.is_none() {

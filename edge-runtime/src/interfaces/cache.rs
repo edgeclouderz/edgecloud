@@ -241,6 +241,19 @@ impl Cache {
         }
     }
 
+    /// Persistent cache scoped to a specific tenant.
+    /// The cache file is `{EDGE_CACHE_PATH}/{tenant_id}/cache.json`.
+    /// Returns `Ok(None)` if `EDGE_CACHE_PATH` is not set.
+    pub fn from_env_for_tenant(tenant_id: &str, max_entries: u32) -> Result<Option<Self>, CacheError> {
+        match std::env::var(ENV_CACHE_PATH) {
+            Ok(base) => {
+                let path = Path::new(&base).join(tenant_id);
+                Self::with_persistence(&path, max_entries).map(Some)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Internal helper: flush to disk if persistence is configured.
     /// Skips silently when no Tokio runtime is active (e.g., in unit tests).
     fn flush_if_persistent(&self) {
