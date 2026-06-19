@@ -1,5 +1,6 @@
-//! `edge auth {signup, login, whoami, logout}` — manage local credentials
-//! and (for `signup`) create a new tenant on the control plane.
+//! `edge auth {signup, login, whoami, logout, keys}` — manage local
+//! credentials and (for `signup`) create a new tenant on the control plane;
+//! for `keys create`, mint additional API keys for the current tenant.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -119,23 +120,20 @@ fn signup(name: &str, plan: &str, key_name: &str, force: bool) -> Result<()> {
     // actively using *that* key — destroying the saved one is
     // destructive. Otherwise we warn but proceed so a deliberate
     // re-signup is still possible. --force bypasses both checks.
-    if !force {
-        if let Ok(existing) = ApiKey::load_without_env() {
-            if env::var("EDGE_API_KEY").is_ok() {
-                output::error(&format!(
-                    "an API key is already saved at {}; signup would overwrite it. \
-                     unset EDGE_API_KEY, remove the file, or pass --force.",
-                    ApiKey::config_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<unknown>".into())
-                ));
-                anyhow::bail!("refusing to overwrite saved key while EDGE_API_KEY is set");
-            }
-            // Warn but proceed.
-            let _ = existing; // keep the file read alive; warn is what we want
-            output::warn("an API key is already saved locally; signup will replace it");
-            output::hint("pass --force to silence this warning");
+    if !force && ApiKey::load_without_env().is_ok() {
+        if env::var("EDGE_API_KEY").is_ok() {
+            output::error(&format!(
+                "an API key is already saved at {}; signup would overwrite it. \
+                 unset EDGE_API_KEY, remove the file, or pass --force.",
+                ApiKey::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".into())
+            ));
+            anyhow::bail!("refusing to overwrite saved key while EDGE_API_KEY is set");
         }
+        // Warn but proceed.
+        output::warn("an API key is already saved locally; signup will replace it");
+        output::hint("pass --force to silence this warning");
     }
 
     // Persist the key to the user's config file. We do this even though
