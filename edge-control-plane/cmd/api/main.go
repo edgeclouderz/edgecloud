@@ -90,6 +90,7 @@ func main() {
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 	appHandler := handler.NewAppHandler(appSvc)
+	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
@@ -118,6 +119,7 @@ func main() {
 	api.HandleFunc("GET /api/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
 	api.HandleFunc("GET /api/apps/{appName}/active", deploymentHandler.GetActive)
+	api.HandleFunc("GET /api/auth/whoami", authHandler.Whoami)
 	api.HandleFunc("POST /api/apps/{appName}/env", envHandler.Set)
 	api.HandleFunc("GET /api/apps/{appName}/env", envHandler.List)
 	api.HandleFunc("DELETE /api/apps/{appName}/env/{key}", envHandler.Delete)

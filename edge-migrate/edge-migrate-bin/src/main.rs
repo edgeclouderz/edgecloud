@@ -148,11 +148,22 @@ fn derive_app_name(path: &str) -> String {
     stem.to_string()
 }
 
+/// Read the API key. Delegates to the shared `edge-config` crate so the
+/// precedence (env → config file → error) stays in lock-step with the
+/// `edge` CLI.
+fn read_api_key() -> Result<String> {
+    edge_config::read_api_key()
+}
+
+/// Read the API URL. Delegates to `edge-config` for the same reason as
+/// [`read_api_key`].
+fn read_api_url() -> String {
+    edge_config::read_api_url(DEFAULT_API_URL)
+}
+
 async fn upload_to_edgecloud(file_path: &str, source: &str) -> Result<MigrationReport> {
-    let api_url = std::env::var("EDGE_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-    let api_key = std::env::var("EDGE_API_KEY")
-        .context("EDGE_API_KEY not set — run `edge auth login` first")?;
+    let api_url = read_api_url();
+    let api_key = read_api_key()?;
 
     let client = reqwest::Client::new();
     let form = reqwest::multipart::Form::new()

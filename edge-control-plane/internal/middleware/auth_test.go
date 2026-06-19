@@ -22,6 +22,9 @@ type stubAPIKeyRepo struct {
 }
 
 func (s *stubAPIKeyRepo) Create(ctx context.Context, k *domain.APIKey) error { return nil }
+func (s *stubAPIKeyRepo) GetByID(ctx context.Context, id string) (*domain.APIKey, error) {
+	return nil, nil
+}
 func (s *stubAPIKeyRepo) GetByLookupHash(ctx context.Context, lookupHash string) (*domain.APIKey, error) {
 	if s.getByLookupHashFn != nil {
 		return s.getByLookupHashFn(ctx, lookupHash)
