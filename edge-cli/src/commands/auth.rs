@@ -75,12 +75,15 @@ fn signup(name: &str, plan: &str, key_name: &str, force: bool) -> Result<()> {
     output::info(&format!("Endpoint: {url}", url = client.base_url()));
     output::section(&format!("Creating tenant '{name}'"));
 
-    let created = client.tenants().create(name, plan, key_name).with_context(|| {
-        format!(
-            "signup failed (is the control plane reachable at {}?)",
-            client.base_url()
-        )
-    })?;
+    let created = client
+        .tenants()
+        .create(name, plan, key_name)
+        .with_context(|| {
+            format!(
+                "signup failed (is the control plane reachable at {}?)",
+                client.base_url()
+            )
+        })?;
 
     // F2: refuse to silently overwrite a saved key the user may still
     // be relying on. If EDGE_API_KEY is set in the env, the user is
