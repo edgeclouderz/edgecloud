@@ -86,7 +86,7 @@ func main() {
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 	appHandler := handler.NewAppHandler(appSvc)
@@ -126,6 +126,7 @@ func main() {
 	api.HandleFunc("POST /api/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/apps", appHandler.List)
 	api.HandleFunc("GET /api/apps/{appName}", appHandler.Get)
+	api.HandleFunc("GET /api/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/keys/{keyID}", apiKeyHandler.Delete)
 

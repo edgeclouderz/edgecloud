@@ -35,6 +35,13 @@ use edge_worker::port_pool::PortPool;
 use edge_worker::state::{AppInstanceStatus, WorkerState};
 use edge_worker::supervisor::Supervisor;
 
+// TODO(shared-test-harness): this helper is a byte-for-byte copy of the
+// same code in `edge-ingress/tests/integration.rs`. Extract both
+// `should_skip_integration_tests` and the testcontainers NATS startup
+// into a shared `edge-test-helpers` crate (workspace-relative) so a
+// future change to the test-skip policy or NATS startup contract lands
+// in one place.
+
 /// Returns true if integration tests should be skipped (e.g., in CI environments
 /// where Docker is unavailable or unreliable for container tests).
 fn should_skip_integration_tests() -> bool {
@@ -298,6 +305,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     let config = Config {
         worker_id: "test-worker".to_string(),
         region: "test-region".to_string(),
+        worker_addr: "test-host:0".to_string(),
         nats_url: nats_url.clone(),
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
@@ -436,6 +444,7 @@ async fn build_supervisor(
     let config = Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
         nats_url: nats_url.to_string(),
         control_plane_url: control_plane_url.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -489,6 +498,7 @@ async fn test_artifact_hash_match_starts_app() {
 
     let harness = TestHarness::new().await.expect("create test harness");
 
+    // Wire up the mock HTTP server to serve the test component.
     Mock::given(method("GET"))
         .and(path("/api/internal/download/d_hash_match"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
