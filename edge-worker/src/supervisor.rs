@@ -165,6 +165,7 @@ impl Supervisor {
 
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
+        let tenant_id_str = tenant_id.to_string();
         let meter_clone = meter.clone();
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
@@ -186,6 +187,7 @@ impl Supervisor {
                 max_memory_mb,
                 epoch_deadline_ticks,
                 health_check_timeout_secs,
+                tenant_id_str,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -306,6 +308,7 @@ impl Supervisor {
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
+        tenant_id: String,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -336,6 +339,7 @@ impl Supervisor {
                         env.clone(),
                         max_memory_mb,
                         epoch_deadline_ticks,
+                        &tenant_id,
                     ),
                 ) => {
                     match result {
@@ -421,12 +425,17 @@ impl Supervisor {
         env: HashMap<String, String>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
+        tenant_id: &str,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
-        // Create a fresh RuntimeState with per-app env vars and metering for tenant isolation.
-        let runtime_state =
-            edge_runtime::RuntimeState::with_env_and_meter(env, Some(Arc::clone(meter)));
+        // Create a fresh RuntimeState with per-app env vars, metering, and tenant-scoped
+        // persistent stores (KV, cache, scheduling) so data never leaks across tenants.
+        let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
+            env,
+            Some(Arc::clone(meter)),
+            tenant_id.to_string(),
+        );
 
         // Create a store with per-invocation state. The memory cap is plumbed
         // through Config (APP_MAX_MEMORY_MB); the previous code hardcoded
