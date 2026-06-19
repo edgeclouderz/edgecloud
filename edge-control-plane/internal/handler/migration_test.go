@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"io"
@@ -144,7 +145,33 @@ func TestMigrationHandler_Migrate_MissingFile(t *testing.T) {
 	}
 }
 
-func TestMigrationHandler_Migrate_NonC_Language(t *testing.T) {
+func TestMigrationHandler_Migrate_AcceptsRustLanguage(t *testing.T) {
+	// The handler's language gate widens to c + rust in M3. Without
+	// edge-migrate on PATH the handler may then surface a 500 from
+	// the service — that's fine, we only assert the gate is open.
+	skipIfNoEdgeMigrate(t)
+
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	h := NewMigrationHandler(svc)
+
+	source := `fn main() {}`
+	req, err := makeMigrationReq("hello.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code == http.StatusBadRequest {
+		t.Errorf("rust language must not hit the language gate, got 400: %s", rr.Body.String())
+	}
+}
+
+func TestMigrationHandler_Migrate_RejectsUnknownLanguage(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
@@ -152,10 +179,10 @@ func TestMigrationHandler_Migrate_NonC_Language(t *testing.T) {
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	if err := writer.WriteField("filename", "hello.rs"); err != nil {
+	if err := writer.WriteField("filename", "hello.py"); err != nil {
 		t.Fatalf("WriteField: %v", err)
 	}
-	if err := writer.WriteField("language", "rust"); err != nil {
+	if err := writer.WriteField("language", "python"); err != nil {
 		t.Fatalf("WriteField: %v", err)
 	}
 	writer.Close()
@@ -171,8 +198,8 @@ func TestMigrationHandler_Migrate_NonC_Language(t *testing.T) {
 		t.Errorf("expected status 400, got: %d", rr.Code)
 	}
 	bodyStr := rr.Body.String()
-	if !strings.Contains(bodyStr, "only C language is supported") {
-		t.Errorf("expected 'only C language is supported', got: %s", bodyStr)
+	if !strings.Contains(bodyStr, "only c and rust are supported") {
+		t.Errorf("expected 'only c and rust are supported', got: %s", bodyStr)
 	}
 }
 
@@ -306,15 +333,84 @@ func TestMigrateTree_RejectsMissingAppName(t *testing.T) {
 	}
 }
 
-func TestMigrateTree_RejectsNonCLanguage(t *testing.T) {
+func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
+	// Same shape as the C multipart test, but with `language: rust`
+	// and a `.rs` file. The handler must pass the language gate; the
+	// service is stubbed and will produce a 500 if it tries to spawn
+	// `edge-migrate` (it doesn't, since the test path doesn't need
+	// edge-migrate to run — the gate rejection happens before any
+	// service work).
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
 	h := NewMigrationHandler(svc)
-	req := makeTreeReq(t, "hello", "rust", `{"files":["main.c"]}`, map[string]string{"main.c": "x"})
+	req := makeTreeReq(t, "hello", "rust", `{"files":["main.rs"]}`, map[string]string{"main.rs": "fn main(){}"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code == http.StatusBadRequest {
+		t.Errorf("rust language must not hit the language gate, got 400: %s", rr.Body.String())
+	}
+}
+
+func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "python", `{"files":["main.py"]}`, map[string]string{"main.py": "x"})
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
 	h.MigrateTree(rr, req)
 	if rr.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for rust, got %d: %s", rr.Code, rr.Body.String())
+		t.Errorf("expected 400 for python, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "only c and rust are supported") {
+		t.Errorf("expected 'only c and rust are supported', got: %s", rr.Body.String())
+	}
+}
+
+func TestMigrateTree_AcceptsRsInZipVariant(t *testing.T) {
+	// The zip variant must accept `.rs` entries without rejecting
+	// them at the extension filter. We construct a zip in-memory,
+	// POST it, and assert the response is not 400 (the gate is open;
+	// the service is stubbed and will 500 if it tries to run the
+	// toolchain, which is acceptable for this assertion).
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	f, err := zw.Create("main.rs")
+	if err != nil {
+		t.Fatalf("zip.Create: %v", err)
+	}
+	if _, err := f.Write([]byte("fn main() {}\n")); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip.Close: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("app_name", "hello")
+	_ = w.WriteField("language", "rust")
+	treePart, err := w.CreateFormFile("tree", "src.zip")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := treePart.Write(zipBuf.Bytes()); err != nil {
+		t.Fatalf("zip write to multipart: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code == http.StatusBadRequest {
+		t.Errorf("rust zip entry must not hit language/extension gate, got 400: %s", rr.Body.String())
 	}
 }
 

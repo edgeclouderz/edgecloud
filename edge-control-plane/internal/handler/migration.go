@@ -28,6 +28,16 @@ const (
 	maxTreeFiles = 256
 )
 
+// treeUploadExts is the set of file extensions accepted in a tree
+// upload. C: `.c`/`.h` (M2). Rust: `.rs` (M3). Other extensions are
+// silently skipped — neither accepted nor rejected — so a tarball
+// with a `Makefile` or `Cargo.toml` still works.
+var treeUploadExts = map[string]bool{
+	".c":  true,
+	".h":  true,
+	".rs": true,
+}
+
 // MigrationHandler handles migration requests.
 type MigrationHandler struct {
 	migrationSvc *service.MigrationService
@@ -59,8 +69,8 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	language := r.MultipartForm.Value["language"]
-	if len(language) == 0 || language[0] != "c" {
-		http.Error(w, `{"error":"only C language is supported"}`, http.StatusBadRequest)
+	if len(language) == 0 || (language[0] != "c" && language[0] != "rust") {
+		http.Error(w, `{"error":"only c and rust are supported"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -97,7 +107,7 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 }
 
 // MigrateTree handles POST /api/migrate-tree. Accepts a multi-file
-// C project in two wire formats:
+// source tree (`language: c` or `language: rust`) in two wire formats:
 //
 //   - Variant A — multipart parts: one `file` per source file, plus
 //     a `tree` JSON manifest `{"files": [...]}`. Each `file` part's
@@ -144,10 +154,10 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Language gate. M2 only supports C; M3 widens.
+	// Language gate. M2 accepted only C; M3 widens to c + rust.
 	language := r.MultipartForm.Value["language"]
-	if len(language) == 0 || language[0] != "c" {
-		http.Error(w, `{"error":"only C is supported"}`, http.StatusBadRequest)
+	if len(language) == 0 || (language[0] != "c" && language[0] != "rust") {
+		http.Error(w, `{"error":"only c and rust are supported"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -244,8 +254,10 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 type multipartFilePart = multipart.FileHeader
 
 // readZipEntries opens the uploaded zip, validates each entry name
-// (zip-slip protection), and returns the .c/.h files as FileEntry
-// slices. Caps the number of files and total decompressed size.
+// (zip-slip protection), and returns the supported source files as
+// FileEntry slices. The accepted extensions live in `treeUploadExts`
+// (C: `.c`/`.h`, Rust: `.rs`). Caps the number of files and total
+// decompressed size.
 func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) ([]domain.FileEntry, error) {
 	src, err := header.Open()
 	if err != nil {
@@ -263,13 +275,13 @@ func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) (
 		if f.FileInfo().IsDir() {
 			continue
 		}
-		// Reject any name that's not a relative .c/.h path.
+		// Reject any name that's not a relative, safe source-tree path.
 		name := strings.ReplaceAll(f.Name, "\\", "/")
 		if !isSafeFilePath(name) {
 			return nil, fmt.Errorf("unsafe zip entry: %q", f.Name)
 		}
 		ext := strings.ToLower(filepath.Ext(name))
-		if ext != ".c" && ext != ".h" {
+		if !treeUploadExts[ext] {
 			continue
 		}
 		if len(entries) >= maxFiles {
