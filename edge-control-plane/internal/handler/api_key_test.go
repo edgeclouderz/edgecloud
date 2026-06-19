@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,7 +151,7 @@ func TestCreateAPIKey_MissingTenantContext(t *testing.T) {
 }
 
 func TestCreateAPIKey_ServiceError(t *testing.T) {
-	svc := &mockAPIKeyCreateSvc{createErr: errBoom("db down")}
+	svc := &mockAPIKeyCreateSvc{createErr: errors.New("db down")}
 	h := handler.NewAPIKeyHandler(svc)
 
 	body, _ := json.Marshal(handler.CreateAPIKeyRequest{Name: "n", Role: "owner"})
@@ -167,9 +168,3 @@ func TestCreateAPIKey_ServiceError(t *testing.T) {
 		t.Errorf("response should not leak raw error, got: %s", rr.Body.String())
 	}
 }
-
-// errBoom is a tiny helper that satisfies the error interface without
-// importing "errors" just for one line.
-type errBoom string
-
-func (e errBoom) Error() string { return string(e) }
