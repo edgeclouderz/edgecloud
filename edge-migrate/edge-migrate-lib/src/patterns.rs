@@ -94,7 +94,11 @@ impl Default for PatternMatch {
 }
 
 /// All known POSIX patterns that edge-migrate can detect.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` is derived because every variant is a unit variant; this
+/// keeps analyzer/transformer code and test helpers from cloning the
+/// discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PosixPattern {
     /// `socket(AF_INET, SOCK_STREAM, 0)` — TCP socket creation.
     SocketTcp,
@@ -149,7 +153,11 @@ pub enum PosixPattern {
 /// M3 only covers the `std` namespace. `tokio::net`, `async-std`, and
 /// `#![no_std]` are out of scope for v1; see `rust_analyzer.rs` for
 /// the explicit scope statement and the TODO for future expansion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` is derived because every variant is a unit variant; this
+/// keeps test helpers and analyzer code from having to clone the
+/// discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RustPattern {
     /// `std::net::TcpListener::bind(addr)` — bind a TCP listener.
     TcpBind,
@@ -184,7 +192,7 @@ pub enum RustPattern {
 ///
 /// This keeps the JSON wire format a bare variant name (no wrapper
 /// object), which preserves back-compat with the M1/M2 shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PatternKind {
     /// A C/POSIX pattern.

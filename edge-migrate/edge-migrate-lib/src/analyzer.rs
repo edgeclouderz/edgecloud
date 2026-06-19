@@ -31,7 +31,7 @@ impl CAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_c::language())
+            .set_language(&tree_sitter_c::LANGUAGE.into())
             .expect("Failed to set tree-sitter C language");
         Self {
             parser,
@@ -45,7 +45,7 @@ impl CAnalyzer {
     pub fn with_preprocessor(preprocessor: Preprocessor) -> Self {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_c::language())
+            .set_language(&tree_sitter_c::LANGUAGE.into())
             .expect("Failed to set tree-sitter C language");
         Self {
             parser,
