@@ -300,3 +300,40 @@ async fn login_verifies_just_saved_key_not_env_var() {
         .success()
         .stdout(predicate::str::contains("Logged in as Acme"));
 }
+
+/// F11: when the server rejects the signup request (e.g. invalid plan),
+/// the CLI must exit non-zero AND must not write a key to the config
+/// file — otherwise the user would end up with a saved credential for
+/// a tenant the server never created.
+#[tokio::test]
+async fn signup_server_rejects_invalid_plan_does_not_write_key() {
+    let home = isolated_home();
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/tenants"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid plan"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("signup")
+        .arg("--name")
+        .arg("test-user")
+        .arg("--plan")
+        .arg("bogus");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("signup failed"));
+
+    // The rejected signup must NOT leave a key behind.
+    assert!(
+        read_api_key(&home).is_none(),
+        "rejected signup should not write api_key to config"
+    );
+}

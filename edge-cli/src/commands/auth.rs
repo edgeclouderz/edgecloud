@@ -21,6 +21,10 @@ pub enum AuthAction {
         /// Plan tier. Defaults to "free".
         #[arg(long, default_value = "free")]
         plan: String,
+        /// Human-readable label for the API key minted for this tenant.
+        /// Defaults to "default" (single-tenant CLI model).
+        #[arg(long, default_value = "default")]
+        key_name: String,
         /// Overwrite an existing saved key without prompting. Required
         /// when an `EDGE_API_KEY` env var is set and a saved key is
         /// present.
@@ -43,7 +47,12 @@ pub enum AuthAction {
 impl AuthAction {
     pub fn run(self) -> Result<()> {
         match self {
-            AuthAction::Signup { name, plan, force } => signup(&name, &plan, force),
+            AuthAction::Signup {
+                name,
+                plan,
+                key_name,
+                force,
+            } => signup(&name, &plan, &key_name, force),
             AuthAction::Login { key } => login(key.as_deref()),
             AuthAction::Whoami => whoami(),
             AuthAction::Logout => logout(),
@@ -51,12 +60,12 @@ impl AuthAction {
     }
 }
 
-/// `edge auth signup --name <NAME> [--plan <PLAN>] [--force]`
+/// `edge auth signup --name <NAME> [--plan <PLAN>] [--key-name <N>] [--force]`
 ///
 /// Hits the public `POST /api/tenants` endpoint, then persists the
 /// returned API key to the local config file. Requires network.
 #[cfg(feature = "network")]
-fn signup(name: &str, plan: &str, force: bool) -> Result<()> {
+fn signup(name: &str, plan: &str, key_name: &str, force: bool) -> Result<()> {
     let base_url = load_api_url("https://api.edgecloud.dev");
     let client = ApiClient::new_anonymous(base_url)?;
 
@@ -66,7 +75,7 @@ fn signup(name: &str, plan: &str, force: bool) -> Result<()> {
     output::info(&format!("Endpoint: {url}", url = client.base_url()));
     output::section(&format!("Creating tenant '{name}'"));
 
-    let created = client.tenants().create(name, plan).with_context(|| {
+    let created = client.tenants().create(name, plan, key_name).with_context(|| {
         format!(
             "signup failed (is the control plane reachable at {}?)",
             client.base_url()
@@ -114,7 +123,7 @@ fn signup(name: &str, plan: &str, force: bool) -> Result<()> {
 }
 
 #[cfg(not(feature = "network"))]
-fn signup(_name: &str, _plan: &str, _force: bool) -> Result<()> {
+fn signup(_name: &str, _plan: &str, _key_name: &str, _force: bool) -> Result<()> {
     anyhow::bail!("auth signup requires network support; rebuild with --features network")
 }
 

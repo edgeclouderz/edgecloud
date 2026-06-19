@@ -322,7 +322,11 @@ pub struct Tenants<'a> {
 impl<'a> Tenants<'a> {
     /// POST `/api/tenants` — self-signup. No `Authorization` header sent.
     /// Returns the new tenant id and the raw API key (shown only once).
-    pub fn create(&self, name: &str, plan: &str) -> Result<TenantCreated> {
+    ///
+    /// `key_name` controls the human-readable label on the API key
+    /// minted for the new tenant. The CLI defaults this to `"default"`
+    /// (single-tenant model) but callers can override.
+    pub fn create(&self, name: &str, plan: &str, key_name: &str) -> Result<TenantCreated> {
         let url = format!("{}/api/tenants", self.client.base_url);
         #[derive(Serialize)]
         struct Payload<'b> {
@@ -333,7 +337,7 @@ impl<'a> Tenants<'a> {
         let payload = Payload {
             name,
             plan,
-            key_name: "default",
+            key_name,
         };
         let resp = self.client.http.post(&url).json(&payload).send()?;
 
@@ -384,5 +388,40 @@ impl<'a> Auth<'a> {
             }
             ApiError::Transient { source } => source,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F12: the three `From` impls must keep mapping their source errors
+    /// into `ApiError::Transient`. A future "3xx handling" refactor that
+    /// dropped one of these would surface here.
+    #[test]
+    fn from_anyhow_yields_transient() {
+        let e: ApiError = anyhow::anyhow!("boom").into();
+        assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    #[test]
+    fn from_reqwest_yields_transient() {
+        // Construct a real reqwest::Error via a build failure. An
+        // unparseable URL is the cleanest way to get a `reqwest::Error`
+        // without making a network call.
+        let err = reqwest::blocking::Client::new()
+            .get("http://[::1]:not-a-port")
+            .build()
+            .err()
+            .expect("build should fail for invalid url");
+        let e: ApiError = err.into();
+        assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    #[test]
+    fn from_serde_json_yields_transient() {
+        let err: serde_json::Error = serde_json::from_str::<i32>("not int").unwrap_err();
+        let e: ApiError = err.into();
+        assert!(matches!(e, ApiError::Transient { .. }));
     }
 }
