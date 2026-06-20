@@ -35,6 +35,16 @@ const SKIP_DIRS: &[&str] = &[
     "out",
 ];
 
+/// True when any segment of `e.path()` matches a [`SKIP_DIRS`] entry.
+/// Used as the `filter_entry` callback for [`walk_tree_for_language`]
+/// so walkdir prunes the whole subtree (e.g. `target/`) without
+/// descending into it.
+fn is_in_skip_dir(e: &walkdir::DirEntry) -> bool {
+    e.path()
+        .components()
+        .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+}
+
 /// Case-insensitive set of file extensions the walker accepts per
 /// language. M3 added `Language::Rust → ["rs"]`; the C entry is the
 /// original `["c", "h"]` (header files are included so the downstream
@@ -96,8 +106,19 @@ pub fn walk_tree_for_language(
 
     let allowed_exts = allowed_exts_for(language);
 
+    // Use `filter_entry` to prune entire subtrees rooted in `SKIP_DIRS`
+    // before walkdir descends into them. The previous implementation
+    // visited every entry under `target/` / `node_modules` / etc. and
+    // filtered after the fact, which is a real perf regression for
+    // large Rust crates (10 k+ files in `target/`). The filter
+    // callback returns `false` for any entry whose path contains a
+    // skip-dir segment; walkdir treats that as "do not yield this
+    // entry **or any of its descendants**".
     let mut entries: Vec<FileEntry> = Vec::new();
-    let walker = WalkDir::new(root).follow_links(true).into_iter();
+    let walker = WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|e| !is_in_skip_dir(e));
 
     for entry in walker {
         let entry = match entry {
@@ -114,30 +135,8 @@ pub fn walk_tree_for_language(
             }
         };
 
-        // Skip directories (and their contents).
+        // Skip directories (we only emit file entries).
         if entry.file_type().is_dir() {
-            // Check whether any segment of the path matches a skip dir.
-            let path = entry.path();
-            if path
-                .components()
-                .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
-            {
-                // walkdir doesn't let us prune from the iterator; instead we
-                // skip the dir at the entry level. Children are still visited
-                // by the iterator, so we filter them out below by checking
-                // their parent's name via the entry path. See test:
-                // `test_walk_skips_nested_build` for the assertion.
-            }
-            continue;
-        }
-
-        // Skip files whose parent directory is a skip dir (walkdir visits
-        // children of filtered directories too unless we filter them).
-        if entry
-            .path()
-            .components()
-            .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
-        {
             continue;
         }
 
@@ -384,9 +383,20 @@ mod tests {
     /// ├── Makefile
     /// ├── src/
     /// │   └── util.c
-    /// └── build/
-    ///     └── skip_me.c
+    /// ├── build/
+    /// │   ├── skip_me.c
+    /// │   └── deep/
+    /// │       └── nested.c
+    /// └── target/
+    ///     └── debug/
+    ///         └── skip_target.c
     /// ```
+    ///
+    /// The deeply-nested `.c` files inside `build/` and `target/` are
+    /// intentionally placed with the **right** extension so the only
+    /// thing keeping them out of the result is the directory-pruning
+    /// logic. If `filter_entry` regresses, these would appear in the
+    /// output and the test would fail.
     fn make_project() -> TempDir {
         let dir = TempDir::new("walk");
         fs::write(dir.path().join("main.c"), "int main(){return 0;}\n").unwrap();
@@ -396,8 +406,11 @@ mod tests {
         fs::write(dir.path().join("Makefile"), "# not a C file\n").unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/util.c"), "// util\n").unwrap();
-        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::create_dir_all(dir.path().join("build/deep")).unwrap();
         fs::write(dir.path().join("build/skip_me.c"), "// skip\n").unwrap();
+        fs::write(dir.path().join("build/deep/nested.c"), "// nested\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        fs::write(dir.path().join("target/debug/skip_target.c"), "// skip\n").unwrap();
         dir
     }
 
@@ -446,9 +459,38 @@ mod tests {
         let dir = make_project();
         let entries = walk_tree(dir.path()).expect("walk");
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        // No path under build/ (including deeply nested .c files)
+        // may appear. This is the property `filter_entry` provides
+        // over the older "filter after the fact" approach.
         assert!(
             !paths.iter().any(|p| p.contains("build")),
             "build/ contents must be skipped, got: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("deep/nested")),
+            "build/deep/nested.c must be skipped (proves subtree pruning), got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_walk_filter_entry_skips_target_subtree() {
+        // Parallel to `test_walk_skips_nested_build` for the other
+        // high-volume skip dir: `target/`. cargo writes thousands of
+        // files into `target/debug/...` and we must not enumerate any
+        // of them.
+        let dir = make_project();
+        let entries = walk_tree(dir.path()).expect("walk");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("target")),
+            "target/ contents must be skipped, got: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("skip_target")),
+            "target/debug/skip_target.c must be skipped, got: {:?}",
             paths
         );
     }
