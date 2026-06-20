@@ -91,6 +91,14 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let client = ApiClient::new(base_url)?;
     client.activate(&app_name, deployment_id)?;
 
+    // Capture the URL we'll print BEFORE `state` is moved into the save
+    // block below. The save only mutates `deployment_id`, so the URL we
+    // capture here is byte-identical to what we'd re-read from disk
+    // afterwards — but we avoid one redundant state.json read on the
+    // success path. Empty URLs (or a state for a different app) suppress
+    // the URL line entirely instead of printing a misleading blank.
+    let url_to_print = url_to_print(state.as_ref(), &app_name);
+
     // Update state.json if it exists for this app.
     if let Some(mut s) = state {
         if s.app_name == app_name {
@@ -101,13 +109,21 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
 
     output::success("Activated successfully");
     println!("  ID: {deployment_id}");
-    // Only show the URL from state.json when it corresponds to the app we just
-    // activated. A stale state.json from a different app would be misleading.
-    match load_state_optional(path)? {
-        Some(s) if s.app_name == app_name => println!("  URL: {}", s.live_url),
-        _ => println!("  (run `edge status` to view)"),
+    match url_to_print {
+        Some(url) => println!("  URL: {url}"),
+        None => println!("  (run `edge status` to view)"),
     }
     Ok(())
+}
+
+/// Decide whether to print `  URL: <live_url>` for the just-activated
+/// app. Returns Some(url) only when state.json exists, belongs to the
+/// same app we activated, and has a non-empty `live_url`; otherwise
+/// None (caller prints the "run `edge status` to view" hint).
+fn url_to_print(state: Option<&State>, app_name: &str) -> Option<String> {
+    state
+        .filter(|s| s.app_name == app_name && !s.live_url.is_empty())
+        .map(|s| s.live_url.clone())
 }
 
 /// Load `.edge/state.json` if it exists. Suppress only `NotFound`; surface
@@ -234,5 +250,44 @@ mod tests {
             msg.contains("failed to parse") || msg.contains("parse"),
             "expected a parse error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn url_to_print_is_some_when_state_app_matches_with_url() {
+        // The just-activated app has a state.json with a populated
+        // live_url — we should print it.
+        let s = state_with("myapp");
+        let got = url_to_print(Some(&s), "myapp");
+        assert_eq!(got, Some("https://example.test".to_string()));
+    }
+
+    #[test]
+    fn url_to_print_is_none_when_state_app_differs() {
+        // state.json belongs to a different app — printing its URL
+        // would be misleading. Suppress the URL line.
+        let s = state_with("state-app");
+        let got = url_to_print(Some(&s), "different-app");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn url_to_print_is_none_when_state_live_url_is_empty() {
+        // state.json exists for the right app but live_url is empty
+        // (e.g. it was never set by an `edge deploy` upload). Printing
+        // "  URL: " with nothing after it is a UX bug — suppress.
+        let s = State {
+            deployment_id: "d_test".to_string(),
+            app_name: "myapp".to_string(),
+            live_url: String::new(),
+        };
+        let got = url_to_print(Some(&s), "myapp");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn url_to_print_is_none_when_state_is_missing() {
+        // No state.json at all — the caller has nothing to print.
+        let got = url_to_print(None, "myapp");
+        assert_eq!(got, None);
     }
 }
