@@ -65,6 +65,46 @@ func (r *WorkerRepository) UpdateLastSeen(ctx context.Context, id string) error 
 	return err
 }
 
+// UpdateAddr updates the worker's public IP. Called from the heartbeat handler
+// when a heartbeat carries a non-empty `worker_addr` so the column reflects
+// the worker's current routable address. A previous good value is preserved
+// when the new value is empty (defensive default — operators should always
+// set `EDGE_WORKER_ADDR` on the worker).
+func (r *WorkerRepository) UpdateAddr(ctx context.Context, id, addr string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE workers SET ip = $2 WHERE id = $1`, id, addr)
+	return err
+}
+
+// ListRunningAppTarget returns the running target for a single
+// `(tenant_id, app_name)` pair, or an empty slice if none. The query
+// pushes the tenant + app filter into SQL so the handler does not have
+// to load the fleet-wide result and scan it in Go.
+func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error) {
+	const query = `
+		SELECT
+			apps.key                                    AS app_name,
+			apps.value->>'tenant_id'                    AS tenant_id,
+			workers.id                                  AS worker_id,
+			workers.region                              AS region,
+			COALESCE(workers.ip, '')                    AS worker_addr,
+			COALESCE((apps.value->>'port')::int, 0)     AS port
+		FROM workers
+		JOIN worker_status ON worker_status.worker_id = workers.id
+		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
+		WHERE apps.key = $1
+		  AND apps.value->>'tenant_id' = $2
+		  AND apps.value->>'status' = 'running'
+		  AND (apps.value->>'port') IS NOT NULL
+		  AND COALESCE((apps.value->>'port')::int, 0) > 0
+		  AND workers.ip IS NOT NULL
+		  AND workers.ip <> ''`
+	var targets []domain.AppTarget
+	if err := r.db.SelectContext(ctx, &targets, query, appName, tenantID); err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
 func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
 	memoryMB := req.MemoryMB
 	if memoryMB == 0 {
@@ -75,10 +115,20 @@ func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *dom
 		ip = &req.IP
 	}
 	now := time.Now()
+	// `ip = COALESCE(EXCLUDED.ip, workers.ip)` (instead of `EXCLUDED.ip`)
+	// preserves a previously-known IP when a worker re-registers without
+	// one (EXCLUDED.ip is NULL). The heartbeat path (WorkerRepository.UpdateAddr)
+	// is the primary writer of `workers.ip`; a worker restart that omits IP
+	// from the register body must not clobber the IP that heartbeats have
+	// established — otherwise the public ingress's ListRunningAppTarget
+	// filter (`workers.ip IS NOT NULL`) drops the app from routing and
+	// every public request 502s until the next heartbeat lands.
 	query := `
 		INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+		ON CONFLICT (id) DO UPDATE SET
+			last_seen = EXCLUDED.last_seen,
+			ip        = COALESCE(EXCLUDED.ip, workers.ip)
 		RETURNING (xmax = 0) AS was_created`
 	var wasCreatedRow bool
 	err = r.db.GetContext(ctx, &wasCreatedRow, query, req.WorkerID, tenantID, req.Region, ip, memoryMB, now, now)

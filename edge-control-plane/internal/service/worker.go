@@ -28,7 +28,9 @@ type workerRepoInterface interface {
 	Delete(ctx context.Context, id string) error
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
 	UpdateLastSeen(ctx context.Context, id string) error
+	UpdateAddr(ctx context.Context, id, addr string) error
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
+	ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 }
 
 // quotaRepoInterface defines the repository methods used by WorkerService.
@@ -50,6 +52,14 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 		quotaRepo:  quotaRepo,
 		nc:         nc,
 	}
+}
+
+// AppTargetLookup is the narrow contract the deployment handler needs to
+// answer "is this tenant's app currently routable?". Kept separate from
+// the full WorkerService so handler tests can mock just the one method
+// without standing up a NATS connection, a worker repo, and a quota repo.
+type AppTargetLookup interface {
+	GetAppTarget(ctx context.Context, tenantID, appName string) (*domain.AppTarget, error)
 }
 
 // Register creates or updates a worker record for a tenant.
@@ -133,17 +143,26 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 
 func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	var hb struct {
-		Type      string          `json:"type"`
-		Timestamp time.Time       `json:"timestamp"`
-		WorkerID  string          `json:"worker_id"`
-		Region    string          `json:"region"`
-		Apps      json.RawMessage `json:"apps"`
+		Type       string          `json:"type"`
+		Timestamp  time.Time       `json:"timestamp"`
+		WorkerID   string          `json:"worker_id"`
+		Region     string          `json:"region"`
+		WorkerAddr string          `json:"worker_addr"`
+		Apps       json.RawMessage `json:"apps"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
 		return
 	}
 	if err := s.workerRepo.UpdateLastSeen(ctx, hb.WorkerID); err != nil {
 		log.Printf("heartbeat: failed to update last_seen for %s: %v", hb.WorkerID, err)
+	}
+	// Only update the worker's public IP when the heartbeat actually carries
+	// one — a heartbeat from a legacy worker (no EDGE_WORKER_ADDR) must not
+	// clobber a previously-known good value.
+	if hb.WorkerAddr != "" {
+		if err := s.workerRepo.UpdateAddr(ctx, hb.WorkerID, hb.WorkerAddr); err != nil {
+			log.Printf("heartbeat: failed to update ip for %s: %v", hb.WorkerID, err)
+		}
 	}
 
 	ws := &domain.WorkerStatus{
@@ -154,4 +173,21 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
 		log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
 	}
+}
+
+// GetAppTarget returns the running target for a single
+// `(tenant_id, app_name)` pair, or `nil` when no running target is
+// found. The CLI's `edge status` uses this to validate that a
+// `live_url` is actually live. The query is scoped to the calling
+// tenant at the SQL level so cross-tenant information is not loaded
+// into Go memory.
+func (s *WorkerService) GetAppTarget(ctx context.Context, tenantID, appName string) (*domain.AppTarget, error) {
+	targets, err := s.workerRepo.ListRunningAppTarget(ctx, tenantID, appName)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	return &targets[0], nil
 }

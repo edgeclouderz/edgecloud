@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 
+[lib]
+name = "edge_worker"
+path = "src/lib.rs"
+
 [dependencies]
 async-nats = { version = "0.49", features = ["jetstream", "nkeys"] }
 async-trait = "0.1"
@@ -28,3 +32,10 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
+# Cross-wire integration tests exercise the public-ingress contract:
+# the worker emits a heartbeat, the ingress parses it and populates its
+# routing table. Adding edge-ingress as a dev-dependency lets the test
+# directly call `edge_ingress::heartbeats::apply_heartbeat` (the same
+# function the NATS subscriber loop drives) without standing up the full
+# ingress binary.
+edge-ingress = { path = "../edge-ingress" }
