@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -31,29 +32,29 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	// Validate app name
 	if appName == "" || containsPathTraversal(appName) {
-		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		httperror.BadRequest(w, "invalid app name")
 		return
 	}
 
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error": "failed to read body"}`, http.StatusBadRequest)
+		httperror.BadRequest(w, "failed to read body")
 		return
 	}
 
 	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body))
 	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
-			http.Error(w, `{"error": "max deployments quota exceeded"}`, http.StatusTooManyRequests)
+			httperror.QuotaExceeded(w, "max deployments quota exceeded")
 			return
 		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
-			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
+			httperror.QuotaExceeded(w, "max apps quota exceeded")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalError(w)
 		return
 	}
 
@@ -72,11 +73,11 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalError(w)
 		return
 	}
 	if deployment == nil {
-		http.Error(w, `{"error": "deployment not found"}`, http.StatusNotFound)
+		httperror.NotFound(w, "deployment not found")
 		return
 	}
 
@@ -105,7 +106,7 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	deployments, total, err := h.deploymentSvc.ListDeploymentsPaginatedWithTotal(r.Context(), tenantID, appName, limit, offset)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalError(w)
 		return
 	}
 
@@ -125,7 +126,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalError(w)
 		return
 	}
 
@@ -139,7 +140,7 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
 	if err != nil || deployment == nil {
-		http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
+		httperror.NotFound(w, "no active deployment")
 		return
 	}
 
@@ -171,14 +172,14 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	if appName == "" || containsPathTraversal(appName) {
-		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		httperror.BadRequest(w, "invalid app name")
 		return
 	}
 
 	target, err := h.workerSvc.GetAppTarget(r.Context(), tenantID, appName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalError(w)
 		return
 	}
 	if target == nil {
