@@ -7,6 +7,15 @@ use std::sync::{Arc, RwLock};
 /// Default labels used when none are provided.
 const DEFAULT_LABELS: &[(String, String)] = &[];
 
+/// Maximum size of a single log message after which the record is dropped.
+/// 16 KiB is well above any reasonable log line and small enough that a
+/// pathological guest can't OOM the forwarder, blow past the per-batch
+/// 1 MiB cap with a single message, or wedge the in-memory buffer with
+/// a 1 MB+ entry. The check lives in `emit_log_record_inner` (the
+/// chokepoint for both `emit_log` and `emit_log_record`) so both entry
+/// points are covered.
+pub const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
+
 /// Label pairs for metric metadata.
 type MetricLabels = Vec<(String, String)>;
 
@@ -316,6 +325,21 @@ impl Observer {
             return;
         }
 
+        // Drop oversized messages. Without this cap, a guest could call
+        // emit_log with a multi-MB string (e.g. an unintentional stack
+        // dump) and the worker would buffer it, the forwarder would ship
+        // it, and the control plane would 400 on the body. We log a
+        // warning and return — the guest sees a no-op, not a partial
+        // record. The constant is documented at the top of the file.
+        if record.message.len() > MAX_LOG_MESSAGE_BYTES {
+            tracing::warn!(
+                size = record.message.len(),
+                max = MAX_LOG_MESSAGE_BYTES,
+                "emit_log: dropping oversized message"
+            );
+            return;
+        }
+
         let label_strs: Vec<_> = record
             .labels
             .iter()
@@ -533,5 +557,76 @@ mod tests {
         let observer = Observer::new();
         observer.emit_log("debug", "below default min", &[]);
         observer.emit_log("info", "above default min", &[]);
+    }
+
+    /// Oversized messages are dropped at the chokepoint. The sink must
+    /// see zero records and the call must not panic — the guest gets a
+    /// silent no-op, not a partial record.
+    #[test]
+    fn test_emit_log_drops_oversized_message() {
+        let sink = Arc::new(RecordingLogSink::new());
+        let observer = Observer::from_config(
+            ObserveConfig::new()
+                .with_log_sink(sink.clone())
+                .with_min_log_level(LogLevel::Info),
+        );
+
+        let huge = "x".repeat(MAX_LOG_MESSAGE_BYTES + 1);
+        observer.emit_log("info", &huge, &[]);
+
+        assert!(
+            sink.records().is_empty(),
+            "oversized message must be dropped before reaching the sink"
+        );
+    }
+
+    /// Boundary case: a message of exactly `MAX_LOG_MESSAGE_BYTES` bytes
+    /// must pass. The cap is inclusive (`>` not `>=`).
+    #[test]
+    fn test_emit_log_accepts_message_at_cap() {
+        let sink = Arc::new(RecordingLogSink::new());
+        let observer = Observer::from_config(
+            ObserveConfig::new()
+                .with_log_sink(sink.clone())
+                .with_min_log_level(LogLevel::Info),
+        );
+
+        let at_cap = "x".repeat(MAX_LOG_MESSAGE_BYTES);
+        observer.emit_log("info", &at_cap, &[]);
+
+        let pushed = sink.records();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "message at exactly MAX_LOG_MESSAGE_BYTES must pass"
+        );
+        assert_eq!(pushed[0].0.message.len(), MAX_LOG_MESSAGE_BYTES);
+    }
+
+    /// The cap is enforced at the chokepoint (`emit_log_record_inner`),
+    /// so the typed `emit_log_record` entry point is also covered. This
+    /// test pins that contract — if someone moves the check to `emit_log`
+    /// only, this test fails.
+    #[test]
+    fn test_emit_log_record_drops_oversized() {
+        let sink = Arc::new(RecordingLogSink::new());
+        let observer = Observer::from_config(
+            ObserveConfig::new()
+                .with_log_sink(sink.clone())
+                .with_min_log_level(LogLevel::Info),
+        );
+
+        let huge = "y".repeat(MAX_LOG_MESSAGE_BYTES + 1);
+        observer.emit_log_record(&LogRecord {
+            timestamp_ms: 0,
+            level: LogLevel::Info,
+            message: huge,
+            labels: vec![],
+        });
+
+        assert!(
+            sink.records().is_empty(),
+            "emit_log_record with oversized message must also be dropped"
+        );
     }
 }
