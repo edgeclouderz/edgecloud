@@ -17,7 +17,7 @@ if ! command -v node &> /dev/null; then
 fi
 
 # Install openapi-typescript if not present (cached in node_modules)
-npx --yes openapi-typescript@14 "$SPEC" \
+npx --yes openapi-typescript@7 "$SPEC" \
     --output "$OUTPUT" \
     --strict
 
