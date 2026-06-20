@@ -26,6 +26,13 @@ const (
 	// maxTreeFiles is the cap on the number of files in a single tree
 	// upload. Larger trees are rejected with 400.
 	maxTreeFiles = 256
+	// maxPartBytes is the per-file cap inside a tree upload. A
+	// single 49 MiB file could otherwise consume the entire body
+	// budget (and the server's memory) before the per-file manifest
+	// mismatch check at line ~202 ever ran. Generous default
+	// (median .c file is ~10 KiB; even large generated code is well
+	// under 5 MiB) but small enough to prevent memory abuse.
+	maxPartBytes int64 = 5 << 20 // 5 MiB
 )
 
 // treeUploadExts is the set of file extensions accepted in a tree
@@ -280,10 +287,19 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error":"failed to open file part"}`, http.StatusInternalServerError)
 				return
 			}
-			body, err := io.ReadAll(src)
+			// LimitReader at maxPartBytes+1 lets us detect "exactly
+			// the cap" vs "exceeded the cap" without reading the
+			// whole oversized blob into memory.
+			body, err := io.ReadAll(io.LimitReader(src, maxPartBytes+1))
 			src.Close()
 			if err != nil {
 				http.Error(w, `{"error":"failed to read file part"}`, http.StatusInternalServerError)
+				return
+			}
+			if int64(len(body)) > maxPartBytes {
+				http.Error(w, fmt.Sprintf(
+					`{"error":"file part exceeds %d bytes"}`, maxPartBytes,
+				), http.StatusRequestEntityTooLarge)
 				return
 			}
 			entries = append(entries, domain.FileEntry{Path: p, Source: string(body)})
@@ -324,8 +340,8 @@ type multipartFilePart = multipart.FileHeader
 // readZipEntries opens the uploaded zip, validates each entry name
 // (zip-slip protection), and returns the supported source files as
 // FileEntry slices. The accepted extensions live in `treeUploadExts`
-// (C: `.c`/`.h`, Rust: `.rs`). Caps the number of files and total
-// decompressed size.
+// (C: `.c`/`.h`, Rust: `.rs`). Caps the number of files, per-entry
+// size, and total decompressed size.
 func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) ([]domain.FileEntry, error) {
 	src, err := header.Open()
 	if err != nil {
@@ -359,10 +375,17 @@ func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) (
 		if err != nil {
 			return nil, fmt.Errorf("opening zip entry %q: %w", f.Name, err)
 		}
-		body, err := io.ReadAll(io.LimitReader(rc, maxBody+1))
+		// Per-entry cap. The total cap is enforced via the running
+		// `total` accumulator below; the per-entry cap protects
+		// against a single zip-bomb entry consuming the whole
+		// budget before we ever reach the total check.
+		body, err := io.ReadAll(io.LimitReader(rc, maxPartBytes+1))
 		rc.Close()
 		if err != nil {
 			return nil, fmt.Errorf("reading zip entry %q: %w", f.Name, err)
+		}
+		if int64(len(body)) > maxPartBytes {
+			return nil, fmt.Errorf("zip entry %q exceeds %d bytes", f.Name, maxPartBytes)
 		}
 		total += int64(len(body))
 		if total > maxBody {

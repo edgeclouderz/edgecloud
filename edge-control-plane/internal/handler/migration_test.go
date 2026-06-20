@@ -654,3 +654,94 @@ func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
 		t.Errorf("expected 'unsupported file extension' in body, got: %s", rr.Body.String())
 	}
 }
+
+// TestMigrateTree_RejectsOversizedPart covers the per-file body
+// cap: a single file part > 5 MiB must be rejected with 413,
+// even when the total request body is well under the 50 MiB cap.
+// The per-part cap protects the server from a malicious caller
+// who uploads one huge part to consume the whole body budget
+// before the per-file manifest mismatch check runs.
+func TestMigrateTree_RejectsOversizedPart(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+
+	// Build a multipart request with a single file part of 6 MiB.
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("app_name", "hello")
+	_ = w.WriteField("language", "c")
+	_ = w.WriteField("tree", `{"files":["big.c"]}`)
+	fw, err := w.CreateFormFile("file", "big.c")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	// 6 MiB of zeros. The per-part cap is 5 MiB; this exceeds it.
+	if _, err := fw.Write(make([]byte, 6<<20)); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for 6 MiB part, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "exceeds") {
+		t.Errorf("expected 'exceeds' in body, got: %s", rr.Body.String())
+	}
+}
+
+// TestMigrateTree_RejectsOversizedZipEntry covers the per-entry
+// cap on the zip variant: a single zip entry > 5 MiB must be
+// rejected even when the total decompressed size is under the
+// 50 MiB cap. Same threat model as the multipart per-part cap.
+func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+
+	// Build a zip with a single 6 MiB entry.
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	f, err := zw.Create("big.c")
+	if err != nil {
+		t.Fatalf("zip.Create: %v", err)
+	}
+	if _, err := f.Write(make([]byte, 6<<20)); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip.Close: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("app_name", "hello")
+	_ = w.WriteField("language", "c")
+	treePart, err := w.CreateFormFile("tree", "src.zip")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := treePart.Write(zipBuf.Bytes()); err != nil {
+		t.Fatalf("zip write to multipart: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized zip entry, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "exceeds") {
+		t.Errorf("expected 'exceeds' in body, got: %s", rr.Body.String())
+	}
+}
