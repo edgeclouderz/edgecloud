@@ -117,6 +117,18 @@ pub struct TenantCreated {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateAPIKeyResponse {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    /// Raw key shown only once. The caller is responsible for
+    /// persisting it — `edge auth keys create` deliberately does NOT
+    /// overwrite the on-disk credential so the key that was used to
+    /// authenticate this call still works.
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,
     pub tenant_name: String,
@@ -176,6 +188,12 @@ impl ApiClient {
     /// Group accessor for tenant-management endpoints (e.g. signup).
     pub fn tenants(&self) -> Tenants<'_> {
         Tenants { client: self }
+    }
+
+    /// Group accessor for API key management endpoints (requires the
+    /// caller to be authenticated — `new_anonymous` is not enough).
+    pub fn keys(&self) -> Keys<'_> {
+        Keys { client: self }
     }
 
     /// Group accessor for auth-related endpoints (e.g. whoami).
@@ -322,7 +340,11 @@ pub struct Tenants<'a> {
 impl<'a> Tenants<'a> {
     /// POST `/api/tenants` — self-signup. No `Authorization` header sent.
     /// Returns the new tenant id and the raw API key (shown only once).
-    pub fn create(&self, name: &str, plan: &str) -> Result<TenantCreated> {
+    ///
+    /// `key_name` controls the human-readable label on the API key
+    /// minted for the new tenant. The CLI defaults this to `"default"`
+    /// (single-tenant model) but callers can override.
+    pub fn create(&self, name: &str, plan: &str, key_name: &str) -> Result<TenantCreated> {
         let url = format!("{}/api/tenants", self.client.base_url);
         #[derive(Serialize)]
         struct Payload<'b> {
@@ -333,13 +355,51 @@ impl<'a> Tenants<'a> {
         let payload = Payload {
             name,
             plan,
-            key_name: "default",
+            key_name,
         };
         let resp = self.client.http.post(&url).json(&payload).send()?;
 
         let resp = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {
                 anyhow::anyhow!("signup failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
+    }
+}
+
+/// API key management endpoints. Borrows the parent [`ApiClient`] and
+/// requires the client to have been built with an API key (i.e. NOT via
+/// [`ApiClient::new_anonymous`]).
+pub struct Keys<'a> {
+    client: &'a ApiClient,
+}
+
+impl<'a> Keys<'a> {
+    /// POST `/api/keys` — create an additional API key for the caller's
+    /// tenant. The raw `token` in the response is shown only once and is
+    /// NOT persisted to the local config by the CLI — the caller is
+    /// responsible for storing it.
+    pub fn create(&self, name: &str, role: &str) -> Result<CreateAPIKeyResponse> {
+        let url = format!("{}/api/keys", self.client.base_url);
+        #[derive(Serialize)]
+        struct Payload<'b> {
+            name: &'b str,
+            role: &'b str,
+        }
+        let payload = Payload { name, role };
+        let resp = self
+            .client
+            .http
+            .post(&url)
+            .header("Authorization", self.client.auth_header())
+            .json(&payload)
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys create failed: {status} {body}")
             }
             ApiError::Transient { source } => source,
         })?;
@@ -384,5 +444,39 @@ impl<'a> Auth<'a> {
             }
             ApiError::Transient { source } => source,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F12: the three `From` impls must keep mapping their source errors
+    /// into `ApiError::Transient`. A future "3xx handling" refactor that
+    /// dropped one of these would surface here.
+    #[test]
+    fn from_anyhow_yields_transient() {
+        let e: ApiError = anyhow::anyhow!("boom").into();
+        assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    #[test]
+    fn from_reqwest_yields_transient() {
+        // Construct a real reqwest::Error via a build failure. An
+        // unparseable URL is the cleanest way to get a `reqwest::Error`
+        // without making a network call.
+        let err = reqwest::blocking::Client::new()
+            .get("http://[::1]:not-a-port")
+            .build()
+            .expect_err("build should fail for invalid url");
+        let e: ApiError = err.into();
+        assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    #[test]
+    fn from_serde_json_yields_transient() {
+        let err: serde_json::Error = serde_json::from_str::<i32>("not int").unwrap_err();
+        let e: ApiError = err.into();
+        assert!(matches!(e, ApiError::Transient { .. }));
     }
 }
