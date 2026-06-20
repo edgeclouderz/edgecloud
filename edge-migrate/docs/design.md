@@ -1,8 +1,12 @@
 # edge-migrate Design
 
-> **Status:** Draft v0.1
-> **Date:** 2026-06-15
+> **Status:** Draft v0.3
+> **Date:** 2026-06-19
 > **Owner:** edgeCloud team
+>
+> **v0.3 changes:** Added Rust support end-to-end. `Language` is now a first-class parameter on the CLI (`--language rust`) and on the HTTP API (`language: rust`); the bin dispatches to `RustAnalyzer` + `RustTransformer` and the Go control plane compiles with `rustc --target wasm32-wasip2`. New §4.4 lists the Rust pattern mapping table. The server now requires `rustc` with the `wasm32-wasip2` target installed (alongside the existing `clang` requirement), controlled via `RUSTC_PATH` env var. `pattern` on `PatternMatch` is now a `PatternKind` sum type (`Posix(...)` | `Rust(...)`); the JSON wire format remains a flat string for backward compatibility.
+>
+> **v0.2 changes:** Added §2.2 paragraph on the C preprocessor (always-on when `clang` is reachable, silent fallback to unexpanded source). The `MigrationReport` and `TransformResult` now carry a `preprocessor: Option<PreprocessorInfo>` field.
 
 ---
 
@@ -41,21 +45,61 @@ Crate lives under `edgeCloud/edge-migrate/` as its own workspace member. Install
 
 ### 2.2 Language Scope
 
-| Language | Phase 1 Support |
-|----------|----------------|
-| C | ✅ Full analysis + auto-transform for safe patterns |
-| Rust | Analysis-only (`std::net` detection + suggestions) |
+| Language | Support |
+|----------|---------|
+| C | ✅ Full analysis + auto-transform for safe patterns (with preprocessor expansion — see below) |
+| Rust | ✅ Full analysis + auto-transform for `std::net`, `std::fs`, `std::process` patterns (M3; gated behind the `rust` Cargo feature and `--language rust`) |
 | Other | Future extension |
+
+Rust patterns detected and auto-transformed include `std::net::TcpListener::bind`, `std::net::TcpStream::connect`, `std::net::UdpSocket::bind`, `std::fs::File::open`, `std::fs::read`, `std::fs::write`, and `file.close()` (best-effort). The Rust transformer emits a `use wasi::socket::tcp::TcpSocket; use wasi::socket::udp::UdpSocket; use wasi::filesystem;` prelude and rewrites each match to the canonical WASI Rust API surface (`TcpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()?...`, etc.). `std::process::exit` and `UdpSocket::connect` are flagged as `NotTransformable` because WASM has no process model and `wasi::socket::udp` has no connect analogue. The full mapping table lives in §4.4.
 
 Safe patterns are defined in §4.
 
+**C preprocessor expansion.** POSIX patterns are routinely hidden behind
+project-internal macros: `#define socket(f, t, p) make_socket(f, t, p)` is
+indistinguishable from a user-defined function to a tree-sitter parse. To
+catch these, the analyzer runs the source through `clang -E -nostdinc`
+before tree-sitter analysis whenever a `Preprocessor` is attached.
+
+A preprocessor is **always-on when `clang` is reachable** (PATH lookup,
+falling back to `$WASI_SDK_PATH/bin/clang`). When reachable, patterns
+hidden behind macros become visible to the analyzer; report `line`
+fields are remapped to the **original** source line via the
+preprocessor's `line_map`. When `clang` is not reachable, the analyzer
+**silently falls back to the unexpanded source** — analysis never fails
+because the preprocessor is missing. A `tracing::warn!` is logged on
+fallback.
+
+**Limitations** (documented for honesty):
+
+- `clang -E` emits `# <lineno> "<file>"` linemarkers only at file
+  boundaries, not at every source line. The remap is therefore
+  best-effort: matches on synthetic lines (no preceding user-file
+  linemarker) keep their expanded line number. For most real-world
+  C code this is invisible because the re-entry linemarker for the
+  user file is emitted near the top of the expanded source.
+- `-nostdinc` means project-internal headers are not auto-included.
+  A future `--include-dir` flag will close this gap; tracked as a
+  follow-up issue.
+- The macro count in the report is a best-effort estimate from
+  counting `#define` directives in the original source, not an
+  authoritative expansion count from clang.
+
+Preprocessor metadata (clang version, files processed, macro count)
+is attached to `MigrationReport.preprocessor` and `TransformResult.preprocessor`.
+
 ### 2.3 Source Upload Model
 
-`edge migrate <path>` accepts a **single C file** as input initially (directory/tree support in a later phase).
+The CLI supports two upload modes:
 
-The CLI uploads the file to edgeCloud's migration endpoint. All heavy lifting — analysis, transformation, compilation — happens server-side.
+1. **Single file** — `edge migrate <file.c>` POSTs the file to `POST /api/migrate`. App name is derived from the file stem (`hello_world.c` → `hello_world`).
+2. **Directory / tree** — `edge-migrate --tree <DIR> [--app-name NAME]` walks the directory for `.c`/`.h` files (skipping `build/`, `target/`, `node_modules/`, etc.) and POSTs the whole tree to `POST /api/migrate-tree`. The developer supplies an explicit `--app-name` that must match `^[a-z0-9][a-z0-9-]{0,62}$`. Without `--app-name`, the dir basename is used.
 
-**App name derivation:** The app name is derived from the uploaded filename (without extension). For example, `edge migrate hello_world.c` sets the app name to `hello_world`. This is stored in the deployment record and used by `edge deploy`.
+In tree mode, all transformed `.c` files are compiled together in a single clang invocation (`--target=wasm32-wasip2 -nostdlib -I <tmpdir>`) and produce one wasm binary. The server response includes a per-file `FileReport` with the patterns detected, transformations applied, and any errors.
+
+**App name derivation (single-file mode):** The app name is derived from the uploaded filename (without extension). For example, `edge migrate hello_world.c` sets the app name to `hello_world`. This is stored in the deployment record and used by `edge deploy`.
+
+For directory mode, the explicit `--app-name` is required to be a valid `^[a-z0-9][a-z0-9-]{0,62}$` name (defense-in-depth + DNS-safety for the eventual `*.edgecloud.dev` URL). See §6.1.2 for the full request/response shape.
 
 **Standalone binary:** `edge-migrate` is its own binary, not a subcommand of `edge-cli`. Developers install it separately: `cargo install edge-migrate`.
 
@@ -71,7 +115,11 @@ The CLI requires the user to be authenticated (`edge auth login` or equivalent).
 
 ## 3. Transformation Report
 
-The migration result is a structured report returned to the developer.
+The migration result is a structured report returned to the developer. The
+report carries a `language` discriminator: `c` patterns render as
+`Posix(SocketTcp)` etc., `rust` patterns as `Rust(TcpBind)` etc. The
+human-readable section header switches to "POSIX patterns" (C) or
+"Rust std patterns" (Rust) accordingly.
 
 ### 3.1 Success
 
@@ -91,7 +139,15 @@ Manual review required (1):
 
 Auto-transformable patterns: 3
   Total patterns detected: 4
+
+Preprocessor: 1 files processed, 3 macros expanded
+  (Apple clang version 17.0.0 (clang-1700.3.19.1))
 ```
+
+The `Preprocessor` line is omitted when no preprocessor is reachable or
+the analyzer falls back to the unexpanded source. It is informational
+only — the transformation result does not depend on the preprocessor
+having run.
 
 ### 3.2 Failure
 
@@ -157,6 +213,37 @@ These patterns have no WASI equivalent or require fundamental architectural chan
 | `SOCK_RAW` | Raw sockets not supported in WASI |
 | `shutdown()` (full-duplex) | Not in wasi-sockets |
 
+### 4.4 Rust → WASI Mapping (M3)
+
+When `language == "rust"`, `RustAnalyzer` walks tree-sitter-rust's
+AST and emits `PatternKind::Rust(RustPattern)` matches. The
+`RustTransformer` then rewrites each match to the canonical WASI
+Rust API. The C path is unaffected — `language: c` (the default)
+continues to flow through §4.1–§4.3.
+
+| Rust source | `RustPattern` | `Transformability` | Transformed output |
+|---|---|---|---|
+| `std::net::TcpListener::bind(addr)` | `TcpBind` | `AutoTransformable` | `TcpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()?.start_listen()?.finish_listen()` |
+| `listener.accept()` | `TcpAccept` | `BestEffort` | `loop { match self.accept() { Ok(s) => break s, Err(_) => std::thread::yield_now() } }` (with `// TODO: replace busy-spin with poll subscription` comment) |
+| `std::net::TcpStream::connect(addr)` | `TcpConnect` | `AutoTransformable` | `TcpSocket::new(AddressFamily::Ipv4)?.start_connect(addr)?.finish_connect()` |
+| `std::net::UdpSocket::bind(addr)` | `UdpBind` | `AutoTransformable` | `UdpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()` |
+| `udp.connect(addr)` | `UdpConnect` | `NotTransformable` | No direct `wasi::socket::udp::connect` analogue — flagged for manual review |
+| `std::process::exit(code)` | `ProcessExit` | `NotTransformable` | WASM has no process model — flagged for manual review |
+| `std::fs::File::open(p)` | `FsOpen` | `AutoTransformable` | `wasi::filesystem::open(p, ...)` |
+| `std::fs::read(p)` / `read_to_string` | `FsRead` | `AutoTransformable` | `wasi::filesystem::read(p)?` / `read_to_string` |
+| `std::fs::write(p, ...)` | `FsWrite` | `AutoTransformable` | `wasi::filesystem::write(p, data)?` |
+| `file.close()` (explicit) | `FsClose` | `AutoTransformable` | `drop(var)` (best-effort shim around the `wasi::filesystem` `Drop` impl) |
+
+**Out of scope for v1** (intentional limitations, tracked as
+follow-ups):
+
+- `tokio::net`, `async-std`, `#![no_std]` — only `std` is matched.
+- Rust macros declared via `macro_rules!` may hide patterns from
+  tree-sitter-rust. A future `rustc -Zunpretty=expanded` integration
+  (analogous to the C preprocessor) could close this gap.
+- `tree-sitter-rust` is pinned at 0.24 to match the workspace's
+  `tree-sitter = "0.24"`. Bump in lockstep if `tree-sitter` advances.
+
 ---
 
 ## 5. Architecture
@@ -186,12 +273,20 @@ edge-migrate/
 
 The migration endpoint (`POST /api/migrate`) performs:
 
-1. **Receive** — Accept the uploaded C source file
-2. **Analyze** — Run `edge-migrate-lib` analysis (AST + pattern matching)
-3. **Transform** — Apply auto-transformations for safe patterns
-4. **Compile** — Compile transformed C to wasm32-wasip2 via `clang`
+1. **Receive** — Accept the uploaded source file (single-file mode; `language: c` or `language: rust`)
+2. **Analyze** — Run `edge-migrate-lib` analysis (AST + pattern matching, with preprocessor if `clang` is reachable; Rust path uses `tree-sitter-rust` and skips the preprocessor)
+3. **Transform** — Apply auto-transformations for safe patterns (C: WASI C; Rust: WASI Rust via `wasi::socket` + `wasi::filesystem`)
+4. **Compile** — Compile transformed source to wasm32-wasip2. C: `clang --target=wasm32-wasip2 -nostdlib`. Rust: `rustc --target wasm32-wasip2 --crate-type=cdylib --edition 2021`. The dispatcher is `MigrationService.Migrate` in `edge-control-plane/internal/service/migration.go`.
 5. **Store** — Store wasm binary under tenant + app (or temporary store for deploy)
 6. **Report** — Return structured transformation report to CLI
+
+**Tree mode (`POST /api/migrate-tree`, M2):** Accepts a multipart form with one `file` part per source plus a `tree` JSON manifest, OR a single `tree` part with `Content-Type: application/zip`. For each source file:
+
+1. Run `edge-migrate --transform --language <lang> <path>` → WASI source
+2. Run `edge-migrate --analyze --json --language <lang> <path>` → structured `MigrationReport` JSON (used to populate per-file `FileReport.patterns_detected` / `transformations` / `manual_review`)
+3. On `--analyze --json` failure (older binary), fall back to the language-aware string scanner (`detectTransformedPatterns` for C, `detectTransformedPatternsRust` for Rust)
+
+The `language` form field gates both the per-file subprocess flag and the final compile step. All transformed files are compiled together in a single invocation (clang for C; a single `rustc` invocation listing every transformed `.rs` file with `--crate-type=cdylib` for Rust). The wasm size is checked against `MaxArtifactSize` (100 MiB); oversized builds return a `Failed` tree report with an error entry. The artifact + deployment row are written only on success.
 
 ### 5.3 Pattern Engine
 
@@ -204,13 +299,21 @@ The core engine uses **tree-sitter** for AST-level analysis:
 
 ### 5.4 Compiler
 
-The server uses the **wasi-sdk** — Bytecode Alliance's official WASI SDK (pre-configured clang + wasi-libc targeting wasm32-wasip2).
+The server uses the **wasi-sdk** — Bytecode Alliance's official WASI SDK (pre-configured clang + wasi-libc targeting wasm32-wasip2) — for C compilation. For Rust compilation the server also requires `rustc` with the `wasm32-wasip2` target installed (`rustup target add wasm32-wasip2`); the path is controlled via the `RUSTC_PATH` env var (default: `rustc`).
 
 ```bash
+# C:
 /path/to/wasi-sdk/bin/clang --target=wasm32-wasip2 \
       -nostdlib \
       -o output.wasm \
       transformed.c
+
+# Rust (M3):
+$RUSTC_PATH --target wasm32-wasip2 \
+      --crate-type=cdylib \
+      --edition 2021 \
+      -o output.wasm \
+      transformed.rs
 ```
 
 **Why wasi-sdk over raw clang:**
@@ -264,6 +367,128 @@ Response: 200 OK
 - `app_name`: the app name derived from the uploaded filename (e.g., `hello_world` from `hello_world.c`)
 - `report`: transformation report (see §3)
 
+### 6.1.2 Tree Upload — `POST /api/migrate-tree`
+
+Accepts a multi-file source tree (`language: c` or `language: rust`).
+Two wire formats are supported; the handler dispatches based on
+which `tree` form part is present:
+
+**Variant A — multipart parts** (preferred for small projects):
+
+```
+POST /api/migrate-tree
+Authorization: Bearer <api-key>
+Content-Type: multipart/form-data
+
+Fields:
+  - app_name: <string>             (required; regex ^[a-z0-9][a-z0-9-]{0,62}$)
+  - language: "c" | "rust"         (required; M3 widens to both)
+  - tree: <json string>            (required: {"files": ["src/main.rs", ...]})
+  - file: <binary>                 (one per entry in `tree.files`; the
+                                   multipart part's filename = the
+                                   relative path from the manifest)
+```
+
+The handler validates that every entry in `tree.files` has a
+matching `file` part and that no path contains `..`, starts with `/`,
+or contains a backslash. Mismatch → `400`.
+
+**Variant B — zip archive** (preferred for projects with many files):
+
+```
+POST /api/migrate-tree
+Authorization: Bearer <api-key>
+Content-Type: multipart/form-data
+
+Fields:
+  - app_name: <string>             (required; same regex as variant A)
+  - language: "c" | "rust"         (required)
+  - tree: <binary application/zip> (required; the directory tree zipped;
+                                   entries are the source of truth;
+                                   `tree` JSON manifest is not parsed)
+```
+
+Zip entries are read in order. Non-source entries are skipped (C:
+`.c`/`.h`, Rust: `.rs` — controlled by `treeUploadExts` in
+`handler/migration.go`). Entry names are validated against
+`isSafeFilePath` (rejects `..`, absolute paths, backslashes, and
+Windows drive letters — zip-slip protection). Cap: 256 files, 50
+MiB decompressed.
+
+**Response: 200 OK**
+
+```json
+{
+  "status": "success" | "partial" | "failed",
+  "wasm_stored": true | false,
+  "deployment_id": "d_<uuid>" | null,
+  "app_name": "tree_project",
+  "files": [
+    {
+      "path": "src/main.c",
+      "status": "success" | "partial" | "failed",
+      "patterns_detected": [ ...PatternInfo... ],
+      "transformations":  [ ...PatternInfo... ],
+      "manual_review":    [ ...PatternInfo... ],
+      "errors":           [ ...ErrorInfo... ],
+      "preprocessor":     { "clang_version": "...", "files_processed": 1, "macros_expanded": 0 } | null
+    }
+  ],
+  "errors": [],                       // tree-level errors (clang, wasm size, DB)
+  "files_total": <int>,
+  "files_transformed": <int>,
+  "files_manual_review": <int>
+}
+```
+
+**Tree-level `status` aggregation:**
+
+| Per-file statuses | Tree status |
+|---|---|
+| All `success` | `success` |
+| Any `failed` | `failed` (wasm not stored) |
+| All `success`/`partial`, no `failed` | `partial` (wasm stored) |
+| Empty `files` | `failed` (handler rejects earlier with 400) |
+
+`wasm_stored` is `true` only when at least one file reached
+`success`/`partial` and the clang compile succeeded. A `failed` file
+**does not** prevent other files from compiling — the resulting wasm
+may still build, but the tree-level status reflects the worst file.
+
+**Limits (server-enforced):**
+
+| Limit | Value | Source |
+|---|---|---|
+| Request body | 50 MiB | `maxTreeBodyBytes` in `handler/migration.go` |
+| File count | 256 | `maxTreeFiles` in `handler/migration.go` |
+| Output wasm | 100 MiB | `MaxArtifactSize` in `service/migration.go` |
+| App name length | 1–63 | regex `^[a-z0-9][a-z0-9-]{0,62}$` |
+
+**Per-file data sources:**
+
+| `FileReport` field | Source |
+|---|---|
+| `status` | classified from per-file patterns (see §3 status rules) |
+| `patterns_detected`, `transformations`, `manual_review` | parsed from `edge-migrate --analyze --json --language <lang> <path>` subprocess stdout (one subprocess per source file) |
+| `errors` | per-file parse/transform errors (stderr captured) |
+| `preprocessor` | mirror of the preprocessor's `PreprocessorInfo` for that file (C only — Rust has no preprocessor in v1) |
+
+If `--analyze --json` is unavailable (older `edge-migrate` binary),
+the service falls back to a language-aware string scanner
+(`detectTransformedPatterns` for C, `detectTransformedPatternsRust`
+for Rust). This fallback is tracked for removal once the version
+floor advances. See §5.2 for the full subprocess flow.
+
+**Status codes:**
+
+| HTTP Status | Meaning |
+|---|---|
+| 200 | Migration attempted (any of `success` / `partial` / `failed` in the body) |
+| 400 | Invalid input (bad `app_name`, manifest mismatch, zip-slip, unknown language, too many files, bad manifest JSON) |
+| 401 | Missing or invalid tenant API key |
+| 413 | Request body exceeds 50 MiB (caught mid-stream by `http.MaxBytesReader`) |
+| 500 | Server-side error (DB, internal) |
+
 ### 6.2 Error Responses
 
 | HTTP Status | Meaning |
@@ -292,13 +517,13 @@ The developer specifies the `deployment_id` returned by `edge migrate`. This con
 
 ## 7. Future Extensions
 
-### Phase 2
-- Directory upload (walk tree, transform multiple files)
-- Rust support: auto-transform `std::net` patterns
-- Output to `edge deploy` directly (skip intermediate storage)
+### Phase 2 (shipped in M2)
+- Directory upload (walk tree, transform multiple files) — see §6.1.2
 
-### Phase 3
-- C preprocessor macro expansion (handle `#define socket(...)`)
+### Phase 3 (shipped in M1 + M3)
+- C preprocessor macro expansion (handle `#define socket(...)`) — see §2.2
+- Rust support: auto-transform `std::net`, `std::fs`, `std::process` patterns — see §4.4
+- Output to `edge deploy` directly (skip intermediate storage)
 - IDE integration via LSP
 - VS Code extension using `edge-migrate-lib`
 

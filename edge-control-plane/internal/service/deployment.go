@@ -26,6 +26,36 @@ func IsValidAppName(name string) bool {
 	return !strings.ContainsAny(name, "/\\..")
 }
 
+// IsValidDeploymentAppName enforces the public-facing app name format
+// `^[a-z0-9][a-z0-9-]{0,62}$` for endpoints that accept an explicit
+// `app_name` from the client (currently `POST /api/migrate-tree`).
+//
+// Distinct from `IsValidAppName`, which is a path-safety guard for
+// internal callers. The regex is mirrored in edge-migrate-lib's
+// `is_valid_deployment_app_name` and tested in lockstep — see
+// `edge-migrate/edge-migrate-lib/src/patterns.rs` and
+// `service/migration_test.go::TestIsValidDeploymentAppName`.
+func IsValidDeploymentAppName(name string) bool {
+	if name == "" || len(name) > 63 {
+		return false
+	}
+	for i, r := range name {
+		isLower := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		isHyphen := r == '-'
+		if i == 0 {
+			if !isLower && !isDigit {
+				return false
+			}
+		} else {
+			if !isLower && !isDigit && !isHyphen {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
 const MaxArtifactSize = 100 * 1024 * 1024
 

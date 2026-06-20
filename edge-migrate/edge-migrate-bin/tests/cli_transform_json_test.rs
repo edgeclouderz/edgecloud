@@ -32,20 +32,23 @@ fn test_transform_json_outputs_envelope() {
 
     // Parse as generic JSON Value so this test stays decoupled from the
     // exact internal struct layout.
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
 
     // Version field pins the wire-format contract; bumping
     // TRANSFORM_OUTPUT_VERSION is a breaking change for the Go server.
     assert_eq!(
-        v["version"].as_u64().expect("version must be a non-negative integer"),
+        v["version"]
+            .as_u64()
+            .expect("version must be a non-negative integer"),
         1,
         "envelope version must be 1 (matches domain.MigrateEnvelopeVersion on Go side)"
     );
 
     let report = &v["report"];
     assert_eq!(
-        report["status"].as_str().expect("report.status is a string"),
+        report["status"]
+            .as_str()
+            .expect("report.status is a string"),
         "success",
         "http_client.c is fully transformable, expect status=success"
     );
@@ -81,9 +84,7 @@ fn test_transform_json_outputs_envelope() {
 
     // wasi_c is the raw transformed source — must contain the WASI header
     // so the Go server has something to feed to clang.
-    let wasi_c = v["wasi_c"]
-        .as_str()
-        .expect("wasi_c must be a string");
+    let wasi_c = v["wasi_c"].as_str().expect("wasi_c must be a string");
     assert!(
         wasi_c.contains("#include <wasi/sockets.h>"),
         "wasi_c must contain the WASI sockets header, got first 80 chars: {:?}",
