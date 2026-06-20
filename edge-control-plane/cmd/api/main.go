@@ -22,7 +22,12 @@ import (
 	natsio "github.com/nats-io/nats.go"
 )
 
-//go:embed docs/api/openapi.yaml
+//go:generate cp ../../docs/api/openapi.yaml docs/api/openapi.yaml
+
+// openAPISpec is embedded at build time. The canonical source is
+// docs/api/openapi.yaml (the repo root). The copy at cmd/api/docs/api/openapi.yaml
+// exists solely for //go:embed (which resolves paths relative to this file).
+// Run `go generate` after updating the spec to keep them in sync.
 var openAPISpec embed.FS
 
 func main() {
