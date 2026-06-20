@@ -24,6 +24,7 @@
 //!   entries rather than OOMing the worker. Per-tenant quota and disk
 //!   spool are follow-ups.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -127,6 +128,11 @@ pub struct LogForwarder {
     /// so a burst of large messages doesn't produce a batch the control
     /// plane will reject with 400 (its 1 MiB body cap).
     byte_notify_threshold: usize,
+    /// `true` while a `flush_now` HTTP POST is in flight. `push()` and the
+    /// `flush_loop` short-circuit on a second concurrent flush to avoid
+    /// racing two POSTs that would each drain their own buffer slice and
+    /// produce 2× the request load on the control plane.
+    flush_in_flight: AtomicBool,
 }
 
 impl LogForwarder {
@@ -158,6 +164,7 @@ impl LogForwarder {
             max_buffer_len,
             hard_cap,
             byte_notify_threshold: BYTE_NOTIFY_THRESHOLD,
+            flush_in_flight: AtomicBool::new(false),
         })
     }
 
@@ -192,6 +199,26 @@ impl LogForwarder {
     /// Drain the buffer and POST it. Public-via-`pub(super)` for tests that
     /// want to drive a flush without a ticker / notify.
     pub async fn flush_now(&self) {
+        // Serialize concurrent flushes. If a flush is already in flight,
+        // skip — the in-flight POST already drained the buffer at swap
+        // time and any entries pushed *after* the swap will be sent on
+        // the next tick (1 s default) or on the next notify that fires
+        // after the flag clears. Two concurrent POSTs would each drain
+        // their own buffer slice and produce 2× the request load on the
+        // control plane, which is the regression this guard closes.
+        if self
+            .flush_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // RAII guard: clears the flag on every exit path, including panics
+        // and the `?` early returns below. Do NOT `mem::forget` it.
+        let _in_flight_guard = InFlightGuard {
+            flag: &self.flush_in_flight,
+        };
+
         let entries = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.buffer.is_empty() {
@@ -298,11 +325,30 @@ impl LogSink for LogForwarder {
         // count crosses its threshold. The byte check protects against
         // bursts of large messages (e.g. stack traces) that would
         // otherwise push a single 1 MiB+ batch at the control plane.
-        if state.buffer.len() >= self.max_buffer_len
-            || state.buffered_bytes > self.byte_notify_threshold
+        //
+        // If a flush is in flight, the in-flight POST already drained the
+        // buffer at swap time; the new push will be picked up by the next
+        // tick (1 s default) or the next notify that fires after the flag
+        // clears. Suppressing the notify avoids a wakeup that the loop
+        // would have to drop anyway.
+        if (state.buffer.len() >= self.max_buffer_len
+            || state.buffered_bytes > self.byte_notify_threshold)
+            && !self.flush_in_flight.load(Ordering::Acquire)
         {
             self.notify.notify_one();
         }
+    }
+}
+
+/// RAII guard: clears `flush_in_flight` on drop, including on panic and on
+/// `?` early returns from `flush_now`. Do NOT `mem::forget` it.
+struct InFlightGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -691,5 +737,94 @@ mod tests {
         f.flush_now().await;
 
         assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
+    }
+
+    /// Regression: two concurrent `flush_now` calls must not produce two
+    /// HTTP POSTs. Without the in-flight guard, the second call would
+    /// observe the (now-empty) post-swap buffer, return early, and we'd
+    /// be fine — but a third caller arriving between the swap and the
+    /// in-flight POST's return would race. The guard short-circuits
+    /// explicitly so the second call returns before the buffer drain.
+    #[tokio::test]
+    async fn push_during_inflight_flush_does_not_cause_concurrent_requests() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        // Sleep 200ms before responding so we have a window to attempt a
+        // second flush_now while the first is in flight.
+        Mock::given(method("POST"))
+            .and(path("/api/internal/logs"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+            .expect(1) // exactly one request — the second flush_now is short-circuited
+            .mount(&server)
+            .await;
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(server.uri(), "w_test", "test-region", signer);
+
+        for i in 0..5 {
+            f.push(record(LogLevel::Info, &format!("m{i}")), ctx());
+        }
+
+        // Start the first flush; do NOT await yet.
+        let f1 = f.clone();
+        let h1 = tokio::spawn(async move { f1.flush_now().await });
+
+        // Give the first flush a moment to set the in-flight flag and
+        // make its HTTP call. Yielding twice is enough on every machine
+        // we've tested; we also wait a tiny bit to be safe.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The second flush should be a no-op.
+        f.flush_now().await;
+
+        h1.await.expect("first flush task should complete cleanly");
+    }
+
+    /// When the in-flight flag is set, a `push` that crosses the early-flush
+    /// threshold must NOT call `notify_one`. We assert that
+    /// `notify.notified()` does not resolve within 50ms — i.e. the push
+    /// was suppressed.
+    #[tokio::test]
+    async fn push_notifies_only_when_no_flush_in_flight() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new("http://127.0.0.1:1", "w_test", "test-region", signer);
+
+        // Manually mark a flush as in flight; no real POST will be made.
+        f.flush_in_flight.store(true, std::sync::atomic::Ordering::Release);
+
+        // Push past the byte threshold (768 KiB) so the early-flush
+        // notification would normally fire.
+        let big = "x".repeat(800 * 1024);
+        f.push(record(LogLevel::Info, &big), ctx());
+
+        // If the push had called notify_one, the receiver would resolve.
+        // We expect a 50ms timeout — meaning the push correctly suppressed
+        // the notify.
+        let notified = timeout(Duration::from_millis(50), f.notify.notified()).await;
+        assert!(
+            notified.is_err(),
+            "push must not call notify_one while flush_in_flight is set"
+        );
+
+        // Cleanup: clear the flag so Arc<LogForwarder> can drop.
+        f.flush_in_flight.store(false, std::sync::atomic::Ordering::Release);
     }
 }
