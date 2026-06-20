@@ -231,6 +231,7 @@ async fn test_app_lifecycle() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
 
     let msg = TaskMessage::TaskUpdate {
@@ -390,6 +391,7 @@ async fn test_stop_all_apps() {
             deployment_hash: test_component_hash(),
             env: HashMap::new(),
             allowlist: vec![],
+            max_memory_mb: 256,
         };
         let msg = TaskMessage::TaskUpdate {
             timestamp: "2026-06-15T00:00:00Z".to_string(),
@@ -510,6 +512,7 @@ async fn test_artifact_hash_match_starts_app() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -560,6 +563,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         deployment_hash: wrong_hash,
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let bad_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -588,6 +592,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let good_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:01Z".to_string(),
@@ -648,6 +653,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -712,6 +718,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -759,6 +766,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 256,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
