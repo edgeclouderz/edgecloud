@@ -33,22 +33,28 @@ const (
 )
 
 // VerifyWorkerJWT parses and validates a HMAC-SHA256 JWT.
+//
+// `exp` is required (jwt.WithExpirationRequired) so a token with no
+// expiration cannot be replayed indefinitely after JWT_SECRET rotation.
+// `iss` is enforced inside the parser when cfg.Issuer is set; an empty
+// cfg.Issuer skips iss enforcement (used in tests with various issuers).
 func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, error) {
+	opts := []jwt.ParserOption{jwt.WithExpirationRequired()}
+	if cfg.Issuer != "" {
+		opts = append(opts, jwt.WithIssuer(cfg.Issuer))
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(cfg.Secret), nil
-	})
+	}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
 	claims, ok := token.Claims.(*WorkerClaims)
 	if !ok || !token.Valid {
 		return nil, errors.New("invalid claims")
-	}
-	if cfg.Issuer != "" && claims.Issuer != cfg.Issuer {
-		return nil, fmt.Errorf("invalid issuer: %s", claims.Issuer)
 	}
 	return claims, nil
 }

@@ -78,6 +78,76 @@ func TestVerifyWorkerJWT_WrongSecret(t *testing.T) {
 	}
 }
 
+// TestVerifyWorkerJWT_NoExpRejected pins jwt.WithExpirationRequired:
+// a token without an `exp` claim is rejected instead of being accepted
+// forever. A leaked token with no expiration used to be valid for the
+// lifetime of the worker's signing key.
+func TestVerifyWorkerJWT_NoExpRejected(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer: "edgecloud",
+			// No ExpiresAt set.
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for token without exp, got nil")
+	}
+}
+
+// TestVerifyWorkerJWT_NoIssRejectedWhenConfigured pins jwt.WithIssuer:
+// when cfg.Issuer is set, a token with no `iss` claim is rejected.
+// This is the JWT-bodies-need-an-issuer invariant.
+func TestVerifyWorkerJWT_NoIssRejectedWhenConfigured(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			// No Issuer set.
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for token without iss when cfg.Issuer is set, got nil")
+	}
+}
+
+// TestVerifyWorkerJWT_WrongIssRejected pins the issuer-mismatch case:
+// a token whose iss doesn't match cfg.Issuer is rejected. (Replaces
+// the implicit coverage of the deleted post-parse check.)
+func TestVerifyWorkerJWT_WrongIssRejected(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "other-control-plane",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for wrong iss, got nil")
+	}
+}
+
 func TestWorkerAuth_MissingToken(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
