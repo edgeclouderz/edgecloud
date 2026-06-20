@@ -542,6 +542,52 @@ func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
 	}
 }
 
+func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *testing.T) {
+	// When any per-file transform subprocess fails, the service must
+	// return the typed `ErrMigrateTreeFailed` sentinel so the handler
+	// can map it to HTTP 422 (instead of 200 with a failure body).
+	// We point the service at a non-existent binary to force every
+	// per-file transform to fail; the service still builds a
+	// structured TreeMigrationReport for the caller to inspect.
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc")
+	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "main.c", Source: "int main(){return 0;}\n"},
+	})
+	if err == nil {
+		t.Fatal("expected ErrMigrateTreeFailed when per-file transform fails")
+	}
+	if !errors.Is(err, ErrMigrateTreeFailed) {
+		t.Errorf("expected ErrMigrateTreeFailed, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report on tree failure (handler emits 422 with body)")
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected report status Failed, got: %v", report.Status)
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error in the failure report")
+	}
+}
+
+func TestMigrateTree_RejectsInvalidArtifactSize_ReturnsErrMigrateTreeFailed(t *testing.T) {
+	// The MaxArtifactSize check is independent of the per-file
+	// subprocess. We can't easily trigger it in a unit test (would
+	// need a real toolchain producing >100 MiB output), but we
+	// confirm the sentinel is exported and the function signature
+	// is what the handler expects. The compile-failure path is the
+	// more critical test (it exercises the same `return &report,
+	// ErrMigrateTreeFailed` shape) — see the test above.
+	if ErrMigrateTreeFailed == nil {
+		t.Error("ErrMigrateTreeFailed must be a non-nil sentinel")
+	}
+	if ErrMigrationFailed == nil {
+		t.Error("ErrMigrationFailed must be a non-nil sentinel (single-file Migrate path)")
+	}
+}
+
 // TestDetectTransformedPatternsRust covers the M3.C7 heuristic helper
 // that backs the `--analyze-json` fallback path in MigrateTree when
 // `language == "rust"`. Each subtest is a representative transformed

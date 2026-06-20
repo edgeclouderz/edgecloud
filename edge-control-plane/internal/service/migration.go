@@ -23,6 +23,13 @@ import (
 // the report is still returned in the partial-success case).
 var ErrMigrateTreeFailed = fmt.Errorf("tree migration failed")
 
+// ErrMigrationFailed is returned when the single-file `Migrate` path
+// hits a terminal failure (oversized artifact, missing toolchain,
+// etc.) but the request itself was syntactically valid. The handler
+// maps this to HTTP 422 and emits the structured report body so
+// callers can see the per-pattern error detail.
+var ErrMigrationFailed = fmt.Errorf("migration failed")
+
 // ErrEdgeMigrateFailed is returned when the edge-migrate subprocess fails.
 var ErrEdgeMigrateFailed = fmt.Errorf("edge-migrate transform failed")
 
@@ -345,7 +352,11 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		if len(report.PatternsTransformed) == 0 {
 			report.PatternsTransformed = patternsTransformed
 		}
-		return &report, nil
+		// Return a typed sentinel so the handler can map this to
+		// HTTP 422 (artifact too large is a request-level failure,
+		// not a server-level one). The structured report is still
+		// returned so the client can read the error detail.
+		return &report, ErrMigrationFailed
 	}
 
 	// Generate deployment ID and hash
@@ -713,7 +724,7 @@ func (s *MigrationService) MigrateTree(
 				Line:    0,
 				Message: "one or more files failed to transform; no wasm built",
 			}},
-		}, nil
+		}, ErrMigrateTreeFailed
 	}
 
 	// Compile all transformed files in a single toolchain invocation.
@@ -780,7 +791,7 @@ func (s *MigrationService) MigrateTree(
 				Line:    0,
 				Message: compileErrMsg,
 			}},
-		}, nil
+		}, ErrMigrateTreeFailed
 	}
 
 	// Read + size-check the wasm.
@@ -801,7 +812,7 @@ func (s *MigrationService) MigrateTree(
 				Line:    0,
 				Message: fmt.Sprintf("wasm exceeds %d bytes (MaxArtifactSize)", MaxArtifactSize),
 			}},
-		}, nil
+		}, ErrMigrateTreeFailed
 	}
 	if !validateWasm(wasmBytes) {
 		return &domain.TreeMigrationReport{
@@ -816,7 +827,7 @@ func (s *MigrationService) MigrateTree(
 				Line:    0,
 				Message: "compiled artifact failed wasm magic-number check",
 			}},
-		}, nil
+		}, ErrMigrateTreeFailed
 	}
 
 	// Persist: deployment row + artifact blob.

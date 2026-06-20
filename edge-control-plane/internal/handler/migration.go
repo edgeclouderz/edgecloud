@@ -38,6 +38,20 @@ var treeUploadExts = map[string]bool{
 	".rs": true,
 }
 
+// isClientMigrationError reports whether `err` from the migration
+// service is a request-level failure (the request was syntactically
+// valid but the source didn't transform / compile / fit). The
+// handler maps these to HTTP 422 and emits the structured report
+// body so the caller can read the per-pattern error detail. All
+// other errors are server-level (DB outage, IO, etc.) and map to 500.
+func isClientMigrationError(err error) bool {
+	return errors.Is(err, service.ErrMigrateTreeFailed) ||
+		errors.Is(err, service.ErrMigrationFailed) ||
+		errors.Is(err, service.ErrEdgeMigrateFailed) ||
+		errors.Is(err, service.ErrClangFailed) ||
+		errors.Is(err, service.ErrRustcFailed)
+}
+
 // MigrationHandler handles migration requests.
 type MigrationHandler struct {
 	migrationSvc *service.MigrationService
@@ -102,8 +116,19 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 
 	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename[0], language[0], string(source))
 	if err != nil {
-		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		if isClientMigrationError(err) {
+			// Source-level failure (didn't transform, didn't compile,
+			// etc.). Surface as 422 with the structured report body
+			// so the caller can read the per-pattern error detail.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			if encErr := json.NewEncoder(w).Encode(report); encErr != nil {
+				log.Printf("Migrate encode error after 422: %v", encErr)
+			}
+			return
+		}
+		log.Printf("Migrate internal error: %v", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -243,6 +268,18 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 
 	report, err := h.migrationSvc.MigrateTree(r.Context(), tenantID, appName[0], language[0], entries)
 	if err != nil {
+		if isClientMigrationError(err) {
+			// Source-level failure (a file didn't transform, the
+			// final compile failed, the artifact is oversized, etc.).
+			// Surface as 422 with the structured report body so the
+			// caller can read the per-file / tree-level error detail.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			if encErr := json.NewEncoder(w).Encode(report); encErr != nil {
+				log.Printf("MigrateTree encode error after 422: %v", encErr)
+			}
+			return
+		}
 		log.Printf("MigrateTree internal error: %v", err)
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 		return

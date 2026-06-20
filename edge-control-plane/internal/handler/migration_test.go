@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -564,5 +565,46 @@ func TestMigrateTree_RejectsInvalidManifestJSON(t *testing.T) {
 	h.MigrateTree(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 bad manifest, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestMigrateTree_PerFileTransformFailure_Status422 confirms the
+// handler returns HTTP 422 (Unprocessable Entity) with a
+// structured TreeMigrationReport body when the service hits a
+// request-level failure (per-file transform, compile, oversized
+// artifact, etc.). Before the isClientMigrationError fix, these
+// failures returned 200 OK with `status: "failed"` in the body —
+// silently treated as success by auto-activating tenants.
+func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
+	// Point the service at a non-existent edge-migrate binary so
+	// every per-file transform fails. The service then surfaces
+	// ErrMigrateTreeFailed + a populated TreeMigrationReport.
+	svc := service.NewMigrationService(
+		&mockDeploymentRepo{}, &mockArtifactStore{},
+		"/this/binary/does/not/exist", "/wasi-sdk", "rustc",
+	)
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`,
+		map[string]string{"main.c": "int main(){return 0;}\n"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 on tree failure, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected application/json content type, got %q", ct)
+	}
+	// Body must still be a parseable TreeMigrationReport.
+	var report domain.TreeMigrationReport
+	if err := json.Unmarshal(rr.Body.Bytes(), &report); err != nil {
+		t.Fatalf("response body must be a valid TreeMigrationReport, got: %v\nbody: %s",
+			err, rr.Body.String())
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected report status Failed, got: %v", report.Status)
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error in the report body")
 	}
 }
