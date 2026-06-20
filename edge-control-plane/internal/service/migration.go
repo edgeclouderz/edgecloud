@@ -449,18 +449,27 @@ func validateWasm(b []byte) bool {
 	return bytes.HasPrefix(b, []byte{0x00, 0x61, 0x73, 0x6d})
 }
 
-// detectTransformedPatternsRust scans transformed Rust source for
-// known WASI constructs and returns a list of PatternInfo describing
-// what was transformed. Mirrors the C `detectTransformedPatterns`
-// helper; both will be removed once the analyzer's structured
-// `--analyze-json` output is reliably populated by newer
-// edge-migrate versions (M2 follow-up #2).
+// detectTransformedPatternsRust is a heuristic string-scan fallback
+// for the Rust `--analyze-json` path. It scans transformed Rust
+// source for known WASI constructs and returns a list of
+// PatternInfo describing what was transformed.
 //
-// Note: this is a string-scan heuristic. It does not parse the
-// source; it can produce false positives (a literal string
-// "TcpSocket::new" in a comment would match). The lib's
-// RustAnalyzer is the source of truth via `--analyze-json` in tree
-// mode.
+// **Status: defense-in-depth / effectively dead code.** It is only
+// invoked when `edge-migrate --analyze --json` fails or returns
+// unparseable output, which does not happen with `edge-migrate` >=
+// v0.3 (the version that ships M3 support and always emits
+// structured JSON). Kept as a last-resort fallback in case the
+// subprocess fails to start or the operator is running a pre-v0.3
+// binary.
+//
+// **Limitations:** does not parse the source; can produce false
+// positives (a literal string "TcpSocket::new" in a comment would
+// match). The lib's RustAnalyzer is the source of truth via
+// `--analyze-json` in tree mode.
+//
+// **Tracked for removal** in v0.4 once we can guarantee a minimum
+// `edge-migrate` version across all tenants. See M2 follow-up #2
+// in the project tracker.
 func detectTransformedPatternsRust(wasiRs string) []domain.PatternInfo {
 	transforms := []struct {
 		contains string
