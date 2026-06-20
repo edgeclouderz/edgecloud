@@ -745,3 +745,57 @@ func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
 		t.Errorf("expected 'exceeds' in body, got: %s", rr.Body.String())
 	}
 }
+
+// TestMigrateTree_ZipSlip covers the zip-slip vulnerability: a
+// zip entry whose name contains `../` must be rejected before the
+// handler writes it to disk. The isSafeFilePath check in
+// readZipEntries is the only line of defense — without this test,
+// a regression there would silently let attackers overwrite files
+// outside the temp dir.
+func TestMigrateTree_ZipSlip(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+
+	// Build a zip containing a path-traversal entry. The zip
+	// library happily stores these names; isSafeFilePath is what
+	// must catch them.
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	f, err := zw.Create("../../etc/passwd.c")
+	if err != nil {
+		t.Fatalf("zip.Create: %v", err)
+	}
+	if _, err := f.Write([]byte("int main(){return 0;}\n")); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip.Close: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("app_name", "hello")
+	_ = w.WriteField("language", "c")
+	treePart, err := w.CreateFormFile("tree", "src.zip")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := treePart.Write(zipBuf.Bytes()); err != nil {
+		t.Fatalf("zip write to multipart: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for zip-slip entry, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "unsafe zip entry") {
+		t.Errorf("expected 'unsafe zip entry' in body, got: %s", rr.Body.String())
+	}
+}
