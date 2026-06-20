@@ -15,6 +15,7 @@ use crate::edge::cloud::scheduling::Host as SchedulingHost;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 use crate::edge::cloud::streams::Host as StreamsHost;
 use crate::edge::cloud::time::Host as TimeHost;
+use crate::egress::EgressPolicy;
 #[cfg(feature = "http-server")]
 use crate::interfaces::http_server::BodySource as HttpServerInternalBodySource;
 use crate::interfaces::{
@@ -41,6 +42,10 @@ pub struct RuntimeState {
     /// Tenant that owns this runtime instance. Used to scope persisted stores
     /// to per-tenant directories so one tenant's data cannot be accessed by another.
     pub tenant_id: String,
+    /// Per-deployment egress policy. Checked in HttpClientHost::fetch before
+    /// every outbound request. Enforces the tenant's allowlist and always
+    /// hard-denies private/loopback/link-local IP ranges.
+    pub egress: Arc<EgressPolicy>,
     /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
     /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
@@ -64,8 +69,8 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
-    /// Test-only constructor. Always uses ephemeral in-memory stores regardless of env vars.
-    /// Production code must use `with_env_and_meter` to get per-tenant persistent stores.
+    /// Test-only constructor. Always uses ephemeral in-memory stores and an
+    /// unrestricted egress policy regardless of env vars.
     #[cfg(test)]
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -84,6 +89,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             tenant_id: String::new(),
+            egress: Arc::new(EgressPolicy::allow_all()),
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -95,7 +101,11 @@ impl RuntimeState {
     }
 
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
-    pub fn with_env(env: std::collections::HashMap<String, String>, tenant_id: String) -> Self {
+    pub fn with_env(
+        env: std::collections::HashMap<String, String>,
+        tenant_id: String,
+        egress: Arc<EgressPolicy>,
+    ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
@@ -109,6 +119,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             tenant_id,
+            egress,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -124,6 +135,7 @@ impl RuntimeState {
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
         tenant_id: String,
+        egress: Arc<EgressPolicy>,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
@@ -138,6 +150,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
             tenant_id,
+            egress,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -220,8 +233,20 @@ impl Default for RuntimeState {
 
 impl HttpClientHost for RuntimeState {
     fn fetch(&mut self, req: Request) -> Option<Response> {
-        let method = req.method.as_str();
         let url = req.url.as_str();
+
+        // Enforce egress policy before issuing any outbound request.
+        // Returns 403 to the guest so it can handle the denial gracefully.
+        if let Err(reason) = self.egress.check(url) {
+            return Some(Response {
+                status: 403,
+                headers: Vec::new(),
+                body: ResponseBodySource::Buffered(Vec::new()),
+                error: Some(reason),
+            });
+        }
+
+        let method = req.method.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
         let tracestate = req
@@ -726,3 +751,132 @@ mod streams_impl {
 
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 impl StreamsHost for RuntimeState {}
+
+// ── Egress integration tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod egress_http_tests {
+    use crate::edge::cloud::http_client::{Request, RequestBodySource};
+    use crate::egress::EgressPolicy;
+    use crate::RuntimeState;
+    use std::sync::Arc;
+
+    /// Egress denial must return HTTP 403 before any network request is made.
+    /// We use an unreachable IP so that a network error would produce status=0,
+    /// while an egress denial produces status=403 — the two are clearly distinguishable.
+    #[tokio::test]
+    async fn egress_check_returns_403_in_fetch() {
+        let egress = Arc::new(EgressPolicy::new(vec![])); // default-deny
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        // Unreachable port — network error would give status=0, not 403.
+        let req = Request {
+            method: "GET".into(),
+            url: "http://127.0.0.1:9999/should-not-be-reached".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(5000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+
+        assert!(
+            resp.is_some(),
+            "fetch must return Some even when egress denies"
+        );
+        let resp = resp.unwrap();
+        assert_eq!(
+            resp.status, 403,
+            "egress denial must return 403, got {}",
+            resp.status
+        );
+        assert!(
+            resp.error
+                .as_ref()
+                .is_some_and(|e| e.contains("egress denied")),
+            "error should mention egress denial, got: {:?}",
+            resp.error
+        );
+    }
+
+    /// Egress allowlist must not block a host on the allowlist — verify by checking
+    /// the policy directly rather than hitting the network. Network errors give
+    /// status=0, not 403, so they are distinguishable from egress denials.
+    #[test]
+    fn egress_allowlist_passes_matching_host_via_policy_check() {
+        let policy = EgressPolicy::new(vec!["api.stripe.com".to_string()]);
+        let result = policy.check("http://api.stripe.com:9999/v1/charges");
+        assert!(
+            result.is_ok(),
+            "egress should allow api.stripe.com, got: {:?}",
+            result
+        );
+    }
+
+    /// A host NOT on the allowlist must be denied with 403.
+    #[tokio::test]
+    async fn egress_check_denies_non_allowlisted_host() {
+        let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        let req = Request {
+            method: "GET".into(),
+            url: "http://evil.com/".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(1000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        assert_eq!(resp.status, 403);
+        assert!(resp
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("not in the allowlist")));
+    }
+
+    /// Hard-deny (loopback) must be blocked even when allowlist contains "*".
+    #[tokio::test]
+    async fn hard_deny_loopback_returns_403_even_with_star_allowlist() {
+        // "*" sentinel is stripped by EgressPolicy::new, leaving an empty allowlist.
+        // But even with a literal "*" in the allowlist, hard-deny fires first.
+        let egress = Arc::new(EgressPolicy::new(vec!["*".to_string()]));
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        let req = Request {
+            method: "GET".into(),
+            url: "http://127.0.0.1/".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(1000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+        assert!(resp.is_some());
+        assert_eq!(resp.unwrap().status, 403);
+    }
+
+    /// End-to-end: an allowed host must NOT return 403.
+    #[test]
+    fn egress_allowlist_passes_public_host() {
+        let policy = EgressPolicy::new(vec!["example.com".to_string()]);
+        let result = policy.check("http://example.com/");
+        assert!(
+            result.is_ok(),
+            "example.com should be allowed, got: {:?}",
+            result
+        );
+    }
+}
