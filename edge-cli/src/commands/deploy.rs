@@ -77,6 +77,8 @@ fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
 ///
 /// App name is resolved with precedence: positional `app` > `.edge/state.json.app_name`.
 /// API base URL must come from `edge.toml` (matches `edge activate` semantics).
+/// On success, `.edge/state.json` is updated so subsequent commands
+/// (`status`, `open`, `rollback`) see the new active id.
 #[cfg(feature = "network")]
 fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let state = load_state_optional(path)?;
@@ -89,11 +91,19 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let client = ApiClient::new(base_url)?;
     client.activate(&app_name, deployment_id)?;
 
+    // Update state.json if it exists for this app.
+    if let Some(mut s) = state {
+        if s.app_name == app_name {
+            s.deployment_id = deployment_id.to_string();
+            s.save(path)?;
+        }
+    }
+
     output::success("Activated successfully");
     println!("  ID: {deployment_id}");
     // Only show the URL from state.json when it corresponds to the app we just
     // activated. A stale state.json from a different app would be misleading.
-    match state {
+    match load_state_optional(path)? {
         Some(s) if s.app_name == app_name => println!("  URL: {}", s.live_url),
         _ => println!("  (run `edge status` to view)"),
     }
