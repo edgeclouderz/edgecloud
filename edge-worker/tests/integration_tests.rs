@@ -391,7 +391,7 @@ async fn test_stop_all_apps() {
             deployment_hash: test_component_hash(),
             env: HashMap::new(),
             allowlist: vec![],
-        max_memory_mb: 256,
+            max_memory_mb: 256,
         };
         let msg = TaskMessage::TaskUpdate {
             timestamp: "2026-06-15T00:00:00Z".to_string(),
