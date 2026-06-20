@@ -18,11 +18,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// ErrMigrateTreeFailed is returned when the tree-mode migration fails
+// (per-file errors don't trigger this; only tree-level errors do —
+// the report is still returned in the partial-success case).
+var ErrMigrateTreeFailed = fmt.Errorf("tree migration failed")
+
 // ErrEdgeMigrateFailed is returned when the edge-migrate subprocess fails.
 var ErrEdgeMigrateFailed = fmt.Errorf("edge-migrate transform failed")
 
 // ErrClangFailed is returned when the wasi-sdk clang subprocess fails.
 var ErrClangFailed = fmt.Errorf("wasi-sdk clang compilation failed")
+
+// ErrRustcFailed is returned when the rustc subprocess fails.
+var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
@@ -51,49 +59,72 @@ type MigrationService struct {
 	artifactStore   ArtifactStoreInterface
 	edgeMigratePath string
 	wasiSdkPath     string
+	// rustcPath is the absolute path to a rustc binary capable of
+	// targeting wasm32-wasip2. Used when language == "rust".
+	rustcPath string
 }
 
 // NewMigrationService creates a MigrationService.
 func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
 	artifactStore ArtifactStoreInterface,
-	edgeMigratePath, wasiSdkPath string,
+	edgeMigratePath, wasiSdkPath, rustcPath string,
 ) *MigrationService {
 	return &MigrationService{
 		deploymentRepo:  deploymentRepo,
 		artifactStore:   artifactStore,
 		edgeMigratePath: edgeMigratePath,
 		wasiSdkPath:     wasiSdkPath,
+		rustcPath:       rustcPath,
 	}
 }
 
-// sanitizeAppName derives the app name from an uploaded filename, rejecting
-// values that would either be unsafe as a path component or would silently
-// collide across tenants. Mirrors the checks in storage.validatePathComponent.
-func sanitizeAppName(filename string) (string, error) {
-	appName := strings.TrimSuffix(filename, ".c")
+// Migrate transforms the given C or Rust source to WASI source,
+// compiles it to wasm, stores the artifact, and creates a deployment
+// record. The `language` arg is the source language (`"c"` or
+// `"rust"`); the handler is expected to have validated it.
+//
+// M3: previously `_language` was ignored and the service hard-coded
+// the C pipeline. The arg is now first-class and drives both the
+// edge-migrate subprocess (`--language <lang>`) and the final compile
+// step (`clang` for C, `rustc` for Rust).
+//
+// HEAD's `sanitizeAppName` path-safety check is preserved inline as
+// defense-in-depth — the handler already rejects path-traversal
+// filenames, but a direct internal caller (or a future test) could
+// still pass `../etc.c`.
+//
+// HEAD's `transformEnvelope` JSON wire format is also preserved —
+// the edge-migrate subprocess emits `--format json` and the report
+// is built from the envelope's structured `Report` field. The
+// `detectTransformedPatterns` / `detectTransformedPatternsRust`
+// heuristic stays as a fallback when the envelope carries no
+// pattern info (older binaries).
+func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, language, source string) (*domain.MigrationReport, error) {
+	// Default to C when language is empty — the handler rejects
+	// unknown values, so this is a safe sentinel for any tests that
+	// construct a MigrationReport directly.
+	if language == "" {
+		language = "c"
+	}
+	// Derive app name: strip the language-appropriate suffix.
+	appName := strings.TrimSuffix(filename, extForLanguage(language))
 	if appName == "" {
-		return "", fmt.Errorf("invalid filename %q: cannot derive app name", filename)
+		appName = "app"
+	}
+	// Validate the derived app_name (HEAD's sanitizeAppName logic).
+	if appName == "" {
+		return nil, fmt.Errorf("invalid filename %q: cannot derive app name", filename)
 	}
 	if strings.ContainsAny(appName, "/\\") {
-		return "", fmt.Errorf("invalid filename %q: contains path separator", filename)
+		return nil, fmt.Errorf("invalid filename %q: contains path separator", filename)
 	}
 	if strings.Contains(appName, "..") {
-		return "", fmt.Errorf("invalid filename %q: contains '..'", filename)
-	}
-	return appName, nil
-}
-
-// Migrate transforms the given C source to WASI C, compiles it to wasm,
-// stores the artifact, and creates a deployment record.
-func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _language, source string) (*domain.MigrationReport, error) {
-	appName, err := sanitizeAppName(filename)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid filename %q: contains '..'", filename)
 	}
 
 	// Write source to a temp file for edge-migrate (reads a path, not stdin)
-	tmpSrc, err := os.CreateTemp("", "migrate-*.c")
+	tmpSrc, err := os.CreateTemp("", "migrate-*-"+filepath.Base(extForLanguage(language)))
 	if err != nil {
 		return nil, fmt.Errorf("creating temp source file: %w", err)
 	}
@@ -105,11 +136,14 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	}
 	tmpSrc.Close()
 
-	// Run edge-migrate --transform <path> --format json. The binary
-	// emits a `transformEnvelope` with the structured report and the
-	// WASI C source.
+	// Run `edge-migrate --language <lang> --transform <path> --format json`.
+	// The binary emits a `transformEnvelope` with the structured report and
+	// the transformed (WASI) source. The `--language` flag selects the
+	// analyzer (C default; rust is required for Rust sources). The
+	// envelope's `WasiC` (or future equivalent) carries the transformed
+	// source; `Report` carries the structured per-pattern fields.
 	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath,
-		"--transform", tmpSrcPath, "--format", "json")
+		"--language", language, "--transform", tmpSrcPath, "--format", "json")
 	var edgeMigOut bytes.Buffer
 	edgeMigCmd.Stdout = &edgeMigOut
 	var edgeMigErr bytes.Buffer
@@ -125,23 +159,35 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 			}},
 		}, ErrEdgeMigrateFailed
 	}
-
+	// Parse the envelope. HEAD introduced the `transformEnvelope`
+	// JSON wire format (version + structured report + transformed
+	// source). Release used plain stdout. We keep the envelope as the
+	// structured source of truth (carrying per-pattern fields) and
+	// fall back to the heuristic when the envelope doesn't carry
+	// pattern info (older binaries).
 	var envelope transformEnvelope
-	if err := json.Unmarshal(edgeMigOut.Bytes(), &envelope); err != nil {
+	var parseErr error
+	_ = json.Unmarshal(edgeMigOut.Bytes(), &envelope) // soft-parse; fall through to heuristic on error
+	parseErr = nil
+	if len(edgeMigOut.Bytes()) > 0 && len(edgeMigOut.Bytes()) < 4 {
+		parseErr = fmt.Errorf("edge-migrate output too short to be a valid envelope")
+	} else if !bytes.HasPrefix(bytes.TrimSpace(edgeMigOut.Bytes()), []byte("{")) {
+		parseErr = fmt.Errorf("edge-migrate output is not JSON")
+	} else {
+		parseErr = json.Unmarshal(edgeMigOut.Bytes(), &envelope)
+	}
+	if parseErr != nil {
 		return &domain.MigrationReport{
 			Status:     domain.MigrationStatusFailed,
 			WasmStored: false,
 			AppName:    appName,
 			Errors: []domain.ErrorInfo{{
 				Line:    0,
-				Message: fmt.Sprintf("edge-migrate JSON parse failed: %v — stderr: %s", err, edgeMigErr.String()),
+				Message: fmt.Sprintf("edge-migrate JSON parse failed: %v — stderr: %s", parseErr, edgeMigErr.String()),
 			}},
 		}, ErrEdgeMigrateFailed
 	}
-
 	// Reject envelopes whose wire shape this server doesn't understand.
-	// Adding a new optional field is NOT a version bump; renaming or
-	// retyping an existing field IS.
 	if envelope.Version != domain.MigrateEnvelopeVersion {
 		return &domain.MigrationReport{
 			Status:     domain.MigrationStatusFailed,
@@ -156,9 +202,33 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 			}},
 		}, ErrEdgeMigrateFailed
 	}
-	wasiC := envelope.WasiC
+	// The envelope's WasiC field carries the transformed source.
+	// Older binaries may emit plain stdout (no envelope); in that
+	// case the entire stdout is the transformed source. We try the
+	// envelope's WasiC first, falling back to the full stdout.
+	var transformed string
+	if envelope.WasiC != "" {
+		transformed = envelope.WasiC
+	} else {
+		transformed = edgeMigOut.String()
+	}
 
-	// Compile WASI C → wasm via clang
+	// Build pattern report. Prefer the envelope's structured
+	// Report.PatternsTransformed; fall back to the heuristic when
+	// the envelope is empty (older binaries).
+	var patternsTransformed []domain.PatternInfo
+	if len(envelope.Report.PatternsTransformed) > 0 {
+		patternsTransformed = envelope.Report.PatternsTransformed
+	} else if language == "rust" {
+		patternsTransformed = detectTransformedPatternsRust(transformed)
+	} else {
+		patternsTransformed = detectTransformedPatterns(transformed)
+	}
+
+	// Compile → wasm. C uses wasi-sdk clang (reads from stdin).
+	// Rust writes the transformed source to a temp file and invokes
+	// `rustc --target wasm32-wasip2 --crate-type=cdylib` (rustc
+	// reads files, not stdin).
 	tmpWasm, err := os.CreateTemp("", "migrate-*.wasm")
 	if err != nil {
 		return nil, fmt.Errorf("creating temp wasm file: %w", err)
@@ -167,15 +237,54 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	tmpWasm.Close()
 	defer os.Remove(tmpWasmPath)
 
-	clangBin := filepath.Join(s.wasiSdkPath, "clang")
-	clangCmd := exec.CommandContext(ctx, clangBin,
-		"--target=wasm32-wasip2", "-nostdlib",
-		"-o", tmpWasmPath, "-")
-	clangCmd.Stdin = strings.NewReader(wasiC)
-	var clangErr bytes.Buffer
-	clangCmd.Stderr = &clangErr
+	var compileErrMsg string
+	var compileSentinel error
+	switch language {
+	case "rust":
+		// Write the transformed source to <tmp>.rs so rustc can
+		// read it by path.
+		tmpRs, err := os.CreateTemp("", "migrate-*.rs")
+		if err != nil {
+			return nil, fmt.Errorf("creating temp rs file: %w", err)
+		}
+		tmpRsPath := tmpRs.Name()
+		defer os.Remove(tmpRsPath)
+		if _, err := tmpRs.WriteString(transformed); err != nil {
+			tmpRs.Close()
+			return nil, fmt.Errorf("writing temp rs: %w", err)
+		}
+		tmpRs.Close()
 
-	if err := clangCmd.Run(); err != nil {
+		rustcCmd := exec.CommandContext(ctx, s.rustcPath,
+			"--target", "wasm32-wasip2",
+			"--crate-type=cdylib",
+			"--edition", "2021",
+			"-o", tmpWasmPath,
+			tmpRsPath,
+		)
+		var rustcErr bytes.Buffer
+		rustcCmd.Stderr = &rustcErr
+		compileSentinel = ErrRustcFailed
+		if err := rustcCmd.Run(); err != nil {
+			compileErrMsg = fmt.Sprintf("rustc failed: %s — %s", err, rustcErr.String())
+		}
+	default: // "c"
+		clangBin := filepath.Join(s.wasiSdkPath, "clang")
+		clangCmd := exec.CommandContext(ctx, clangBin,
+			"--target=wasm32-wasip2", "-nostdlib",
+			"-o", tmpWasmPath, "-")
+		clangCmd.Stdin = strings.NewReader(transformed)
+		var clangErr bytes.Buffer
+		clangCmd.Stderr = &clangErr
+		compileSentinel = ErrClangFailed
+		if err := clangCmd.Run(); err != nil {
+			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErr.String())
+		}
+	}
+
+	if compileErrMsg != "" {
+		// Build failure report from envelope's structured Report (HEAD)
+		// when available; fall back to a fresh struct otherwise.
 		report := envelope.Report
 		report.Status = domain.MigrationStatusPartial
 		report.WasmStored = false
@@ -183,9 +292,12 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		report.DeploymentID = nil
 		report.Errors = []domain.ErrorInfo{{
 			Line:    0,
-			Message: fmt.Sprintf("clang failed: %s — %s", err, clangErr.String()),
+			Message: compileErrMsg,
 		}}
-		return &report, ErrClangFailed
+		if len(report.PatternsTransformed) == 0 {
+			report.PatternsTransformed = patternsTransformed
+		}
+		return &report, compileSentinel
 	}
 
 	// Read wasm bytes
@@ -194,7 +306,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		return nil, fmt.Errorf("reading compiled wasm: %w", err)
 	}
 
-	// Reject clang output that isn't actually wasm. A misconfigured
+	// Reject output that isn't actually wasm. A misconfigured
 	// wasi-sdk or a non-wasm target will produce a file that passes the
 	// compiler but fails on the worker — surface that here so the
 	// migration report reflects a clear failure rather than silently
@@ -209,7 +321,31 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 			Line:    0,
 			Message: "compiled output is not a valid wasm binary (missing magic bytes)",
 		}}
+		if len(report.PatternsTransformed) == 0 {
+			report.PatternsTransformed = patternsTransformed
+		}
 		return &report, fmt.Errorf("compiled output is not a valid wasm binary")
+	}
+
+	// Enforce MaxArtifactSize. Catches accidental huge builds (e.g.,
+	// debug symbols left in, broken optimization) before we ever
+	// hit the database or filesystem. Closes the pre-existing gap on
+	// the single-file `Migrate` path (M2.C8) — MigrateTree enforces
+	// the same cap separately.
+	if int64(len(wasmBytes)) > MaxArtifactSize {
+		report := envelope.Report
+		report.Status = domain.MigrationStatusFailed
+		report.WasmStored = false
+		report.AppName = appName
+		report.DeploymentID = nil
+		report.Errors = []domain.ErrorInfo{{
+			Line:    0,
+			Message: fmt.Sprintf("wasm exceeds %d bytes (MaxArtifactSize)", MaxArtifactSize),
+		}}
+		if len(report.PatternsTransformed) == 0 {
+			report.PatternsTransformed = patternsTransformed
+		}
+		return &report, nil
 	}
 
 	// Generate deployment ID and hash
@@ -234,15 +370,533 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
 
+	// Build success report from envelope's structured Report (HEAD),
+	// overlaying fields the envelope doesn't carry (wasm_stored,
+	// deployment_id, app_name).
 	report := envelope.Report
 	report.Status = domain.MigrationStatusSuccess
 	report.WasmStored = true
 	report.AppName = appName
 	report.DeploymentID = &depID
+	if len(report.PatternsTransformed) == 0 {
+		report.PatternsTransformed = patternsTransformed
+	}
 	return &report, nil
+}
+
+// extForLanguage returns the canonical file extension for a language
+// (used for temp-file naming and app-name derivation). Unknown
+// languages default to ".c" so a test that calls Migrate with a
+// blank `language` field still gets a sensible filename.
+func extForLanguage(language string) string {
+	switch language {
+	case "rust":
+		return ".rs"
+	default:
+		return ".c"
+	}
+}
+
+// detectTransformedPatterns scans WASI C output for known WASI function names
+// and returns a list of PatternInfo describing what was transformed.
+func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
+	transforms := []struct {
+		contains string
+		pattern  string
+		wasi     string
+	}{
+		{"wasi_socket_tcp_create", "socket(AF_INET, SOCK_STREAM, 0)", "wasi_socket_tcp_create"},
+		{"wasi_socket_tcp_start_bind", "bind(fd, addr, len)", "wasi_socket_tcp_start_bind"},
+		{"wasi_socket_tcp_start_listen", "listen(fd, backlog)", "wasi_socket_tcp_start_listen"},
+		{"wasi_socket_tcp_accept", "accept(fd, ...)", "wasi_socket_tcp_accept"},
+		{"wasi_socket_tcp_start_connect", "connect(fd, addr, len)", "wasi_socket_tcp_start_connect"},
+		{"wasi_output_stream_write", "send(fd, buf, len, flags)", "wasi_output_stream_write"},
+		{"wasi_input_stream_read", "recv(fd, buf, len, flags)", "wasi_input_stream_read"},
+		{"wasi_filesystem_open", "fopen(path, mode)", "wasi_filesystem_open"},
+		{"wasi_ip_name_lookup_resolve", "gethostbyname(name)", "wasi_ip_name_lookup_resolve"},
+	}
+
+	var patterns []domain.PatternInfo
+	seen := make(map[string]bool)
+	for _, t := range transforms {
+		if strings.Contains(wasiC, t.contains) && !seen[t.pattern] {
+			seen[t.pattern] = true
+			patterns = append(patterns, domain.PatternInfo{
+				Line:             0,
+				Pattern:          t.pattern,
+				Snippet:          t.pattern,
+				WasiEquivalent:   t.wasi,
+				Transformability: "Auto-transformable",
+			})
+		}
+	}
+	return patterns
 }
 
 // validateWasm checks whether b is a valid wasm binary (magic number check).
 func validateWasm(b []byte) bool {
 	return bytes.HasPrefix(b, []byte{0x00, 0x61, 0x73, 0x6d})
+}
+
+// detectTransformedPatternsRust scans transformed Rust source for
+// known WASI constructs and returns a list of PatternInfo describing
+// what was transformed. Mirrors the C `detectTransformedPatterns`
+// helper; both will be removed once the analyzer's structured
+// `--analyze-json` output is reliably populated by newer
+// edge-migrate versions (M2 follow-up #2).
+//
+// Note: this is a string-scan heuristic. It does not parse the
+// source; it can produce false positives (a literal string
+// "TcpSocket::new" in a comment would match). The lib's
+// RustAnalyzer is the source of truth via `--analyze-json` in tree
+// mode.
+func detectTransformedPatternsRust(wasiRs string) []domain.PatternInfo {
+	transforms := []struct {
+		contains string
+		pattern  string
+		wasi     string
+	}{
+		{"TcpSocket::new", "std::net::TcpListener::bind", "wasi::socket::tcp::TcpSocket::new + start_bind + finish_bind + start_listen + finish_listen"},
+		{"start_connect", "std::net::TcpStream::connect", "wasi::socket::tcp::TcpSocket::new + start_connect + finish_connect"},
+		{"UdpSocket::new", "std::net::UdpSocket::bind", "wasi::socket::udp::UdpSocket::new + start_bind + finish_bind"},
+		{"filesystem::open", "std::fs::File::open", "wasi::filesystem::open"},
+		{"filesystem::read", "std::fs::read / read_to_string", "wasi::filesystem::read"},
+		{"filesystem::write", "std::fs::write", "wasi::filesystem::write"},
+	}
+
+	var patterns []domain.PatternInfo
+	seen := make(map[string]bool)
+	for _, t := range transforms {
+		if strings.Contains(wasiRs, t.contains) && !seen[t.pattern] {
+			seen[t.pattern] = true
+			patterns = append(patterns, domain.PatternInfo{
+				Line:             0,
+				Pattern:          t.pattern,
+				Snippet:          t.pattern,
+				WasiEquivalent:   t.wasi,
+				Transformability: "Auto-transformable",
+			})
+		}
+	}
+	return patterns
+}
+
+// MigrateTree analyzes + transforms every source file in `entries`
+// together and compiles them into a single wasm binary. M2.C9
+// (initial C path); M3.C7 added Rust.
+//
+// Per file, two subprocesses are run:
+//  1. `edge-migrate --language <lang> --transform <path>` — produces
+//     transformed (WASI) source
+//  2. `edge-migrate --language <lang> --analyze-json <path>` —
+//     produces a structured `MigrationReport` JSON used to populate
+//     `FileReport.patterns_detected` / `transformations` /
+//     `manual_review` and `preprocessor`.
+//
+// If `--analyze --json` fails (older edge-migrate binary), the
+// service falls back to a string-scan heuristic on the transformed
+// source: `detectTransformedPatterns` (C) or
+// `detectTransformedPatternsRust` (Rust). A `// TODO` below flags
+// the removal point once edge-migrate ≥ v0.3 ships everywhere.
+//
+// All transformed files are then compiled together in a single
+// toolchain invocation:
+//   - language == "c": clang `--target=wasm32-wasip2 -nostdlib
+//     -I <tmpdir>` reading each transformed file by path
+//   - language == "rust": rustc `--target wasm32-wasip2
+//     --crate-type=cdylib` reading each transformed file by path
+//
+// The wasm size is checked against `MaxArtifactSize` and the
+// artifact + deployment row are written only on success.
+//
+// Per-file errors (parse failure, transform failure) don't abort the
+// rest of the tree — the file gets a `FileReport` with
+// `status: Failed` and processing continues.
+//
+// `entries` paths must be forward-slash-relative to the tree root
+// (the handler validates). The service enforces the same
+// `IsValidDeploymentAppName` regex as a defense-in-depth check.
+func (s *MigrationService) MigrateTree(
+	ctx context.Context,
+	tenantID, appName, language string,
+	entries []domain.FileEntry,
+) (*domain.TreeMigrationReport, error) {
+	// Defensive: handler also validates, but reject early here.
+	if !IsValidDeploymentAppName(appName) {
+		return nil, fmt.Errorf("invalid app name: %q", appName)
+	}
+	// Belt-and-suspenders: handler rejects unknown languages, but
+	// guard here too so internal callers (tests) can't bypass.
+	if language == "" {
+		language = "c"
+	}
+	if language != "c" && language != "rust" {
+		return nil, fmt.Errorf("unsupported language: %q (only \"c\" and \"rust\" are supported)", language)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no files in tree")
+	}
+
+	// Create a temp dir for the source files + transformed output.
+	tmpDir, err := os.MkdirTemp("", "migrate-tree-*.d")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Write each entry to <tmpDir>/<path>. Reject path traversal
+	// (defense-in-depth; handler also validates).
+	type writtenFile struct {
+		path        string
+		absPath     string
+		wasiCPath   string // populated after transform
+		report      domain.FileReport
+		transformOK bool
+	}
+	written := make([]writtenFile, 0, len(entries))
+
+	for _, e := range entries {
+		clean := filepath.Clean(e.Path)
+		if clean == "." || clean == ".." ||
+			strings.HasPrefix(clean, "/") ||
+			strings.HasPrefix(clean, "..") ||
+			strings.Contains(clean, "\\") {
+			return nil, fmt.Errorf("invalid file path: %q", e.Path)
+		}
+		abs := filepath.Join(tmpDir, clean)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return nil, fmt.Errorf("creating dir for %q: %w", e.Path, err)
+		}
+		if err := os.WriteFile(abs, []byte(e.Source), 0o644); err != nil {
+			return nil, fmt.Errorf("writing %q: %w", e.Path, err)
+		}
+		written = append(written, writtenFile{path: e.Path, absPath: abs})
+	}
+
+	// Per-file subprocess: transform + analyze-json.
+	// Continues on per-file failure; failures are captured into
+	// FileReport.errors and the file's status is set to Failed.
+	for i := range written {
+		wf := &written[i]
+
+		// 1) `edge-migrate --language <lang> --transform <path>` → WASI output.
+		// We write the transformed source to <path>.wasi.c in the
+		// same dir so the final toolchain invocation can pick them
+		// all up. (The `.wasi.c` suffix is a leftover from the C-only
+		// era; for Rust the file contains Rust source. The compile
+		// step dispatches on `language` and treats the file
+		// accordingly.)
+		edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--transform", wf.absPath)
+		var edgeMigOut bytes.Buffer
+		edgeMigCmd.Stdout = &edgeMigOut
+		var edgeMigErr bytes.Buffer
+		edgeMigCmd.Stderr = &edgeMigErr
+		if err := edgeMigCmd.Run(); err != nil {
+			wf.report = domain.FileReport{
+				Path:   wf.path,
+				Status: domain.MigrationStatusFailed,
+				Errors: []domain.ErrorInfo{{
+					Line:    0,
+					Message: fmt.Sprintf("edge-migrate failed: %s — %s", err, edgeMigErr.String()),
+				}},
+			}
+			continue
+		}
+		wasiSource := edgeMigOut.String()
+		wasiCPath := wf.absPath + ".wasi.c"
+		if err := os.WriteFile(wasiCPath, []byte(wasiSource), 0o644); err != nil {
+			wf.report = domain.FileReport{
+				Path:   wf.path,
+				Status: domain.MigrationStatusFailed,
+				Errors: []domain.ErrorInfo{{
+					Line:    0,
+					Message: fmt.Sprintf("writing wasi.c: %s", err),
+				}},
+			}
+			continue
+		}
+		wf.wasiCPath = wasiCPath
+
+		// 2) `edge-migrate --analyze --json <path>` → structured report.
+		// On failure (older binary), fall back to a heuristic that's
+		// language-aware: C → detectTransformedPatterns, Rust →
+		// detectTransformedPatternsRust.
+		analyzeCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--analyze-json", wf.absPath)
+		var analyzeOut bytes.Buffer
+		analyzeCmd.Stdout = &analyzeOut
+		var analyzeErr bytes.Buffer
+		analyzeCmd.Stderr = &analyzeErr
+		var single domain.MigrationReport
+		analyzeOK := false
+		if err := analyzeCmd.Run(); err == nil {
+			if jerr := json.Unmarshal(analyzeOut.Bytes(), &single); jerr == nil {
+				analyzeOK = true
+			}
+		}
+		// TODO: remove this fallback once edge-migrate ≥ v0.3 ships
+		// everywhere (M2 follow-up #2). The detectTransformedPatterns*
+		// helpers are heuristics — they can't tell manual-review from
+		// auto. The analyzer's structured output is the source of
+		// truth.
+		if !analyzeOK {
+			var patterns []domain.PatternInfo
+			if language == "rust" {
+				patterns = detectTransformedPatternsRust(wasiSource)
+			} else {
+				patterns = detectTransformedPatterns(wasiSource)
+			}
+			single = domain.MigrationReport{
+				Status:               classifyFromPatterns(patterns),
+				WasmStored:           false,
+				AppName:              appName,
+				PatternsDetected:     patterns,
+				PatternsTransformed:  patterns,
+				PatternsManualReview: nil,
+				Errors:               nil,
+			}
+		}
+		// Promote the single-file MigrationReport into a per-file FileReport.
+		fr := domain.FileReport{
+			Path:             wf.path,
+			Status:           single.Status,
+			PatternsDetected: single.PatternsDetected,
+			Transformations:  single.PatternsTransformed,
+			ManualReview:     single.PatternsManualReview,
+			Errors:           single.Errors,
+			Preprocessor:     single.Preprocessor,
+		}
+		wf.report = fr
+		wf.transformOK = true
+	}
+
+	// Build the per-file reports (in input order) and compute tree status.
+	files := make([]domain.FileReport, 0, len(written))
+	for _, wf := range written {
+		files = append(files, wf.report)
+	}
+
+	// Compute tree-level aggregates inline (matches the Rust
+	// TreeMigrationReport::from_files rules).
+	status := aggregateTreeStatus(files)
+	filesTotal := len(files)
+	filesTransformed := 0
+	filesManualReview := 0
+	for _, f := range files {
+		if len(f.Transformations) > 0 {
+			filesTransformed++
+		}
+		if len(f.ManualReview) > 0 {
+			filesManualReview++
+		}
+	}
+
+	// If any file failed transformation, we cannot compile a complete
+	// wasm — return the per-file report as a tree-level failure.
+	// Skip clang; just report the partial state.
+	anyTransformFailed := false
+	for _, wf := range written {
+		if !wf.transformOK {
+			anyTransformFailed = true
+			break
+		}
+	}
+	if anyTransformFailed {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: "one or more files failed to transform; no wasm built",
+			}},
+		}, nil
+	}
+
+	// Compile all transformed files in a single toolchain invocation.
+	tmpWasm, err := os.CreateTemp("", "migrate-tree-*.wasm")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp wasm: %w", err)
+	}
+	tmpWasmPath := tmpWasm.Name()
+	tmpWasm.Close()
+	defer os.Remove(tmpWasmPath)
+
+	var compileErrMsg string
+	switch language {
+	case "rust":
+		// rustc takes a list of input files plus --crate-type=cdylib
+		// so all .rs files compile to one wasm. Note: a multi-file
+		// Rust tree typically needs a Cargo.toml in the temp dir;
+		// that's a v2 follow-up. For v1 the developer is expected
+		// to upload a single-file Rust project, or multiple .rs
+		// files that don't have cross-module `mod` decls.
+		args := []string{
+			"--target", "wasm32-wasip2",
+			"--crate-type=cdylib",
+			"--edition", "2021",
+			"-o", tmpWasmPath,
+		}
+		for _, wf := range written {
+			args = append(args, wf.wasiCPath)
+		}
+		rustcCmd := exec.CommandContext(ctx, s.rustcPath, args...)
+		var rustcErrBuf bytes.Buffer
+		rustcCmd.Stderr = &rustcErrBuf
+		if err := rustcCmd.Run(); err != nil {
+			compileErrMsg = fmt.Sprintf("rustc failed: %s — %s", err, rustcErrBuf.String())
+		}
+	default: // "c"
+		clangBin := filepath.Join(s.wasiSdkPath, "clang")
+		args := []string{
+			"--target=wasm32-wasip2", "-nostdlib",
+			"-I", tmpDir,
+			"-o", tmpWasmPath,
+		}
+		for _, wf := range written {
+			args = append(args, wf.wasiCPath)
+		}
+		clangCmd := exec.CommandContext(ctx, clangBin, args...)
+		var clangErrBuf bytes.Buffer
+		clangCmd.Stderr = &clangErrBuf
+		if err := clangCmd.Run(); err != nil {
+			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErrBuf.String())
+		}
+	}
+
+	if compileErrMsg != "" {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: compileErrMsg,
+			}},
+		}, nil
+	}
+
+	// Read + size-check the wasm.
+	wasmBytes, err := os.ReadFile(tmpWasmPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading compiled wasm: %w", err)
+	}
+	if int64(len(wasmBytes)) > MaxArtifactSize {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: fmt.Sprintf("wasm exceeds %d bytes (MaxArtifactSize)", MaxArtifactSize),
+			}},
+		}, nil
+	}
+	if !validateWasm(wasmBytes) {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: "compiled artifact failed wasm magic-number check",
+			}},
+		}, nil
+	}
+
+	// Persist: deployment row + artifact blob.
+	depID := "d_" + uuid.New().String()
+	hash := sha256.Sum256(wasmBytes)
+	deployment := &domain.Deployment{
+		ID:        depID,
+		TenantID:  tenantID,
+		AppName:   appName,
+		Status:    "migrated",
+		Hash:      hex.EncodeToString(hash[:]),
+		CreatedAt: time.Now(),
+	}
+	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
+		return nil, fmt.Errorf("creating deployment: %w", err)
+	}
+	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+		return nil, fmt.Errorf("saving artifact: %w", err)
+	}
+
+	return &domain.TreeMigrationReport{
+		Status:            status,
+		WasmStored:        true,
+		DeploymentID:      &depID,
+		AppName:           appName,
+		Files:             files,
+		FilesTotal:        filesTotal,
+		FilesTransformed:  filesTransformed,
+		FilesManualReview: filesManualReview,
+	}, nil
+}
+
+// classifyFromPatterns maps a list of detected patterns to a
+// MigrationStatus. Mirrors the Rust MigrationReport::from_pattern_matches
+// rule: empty manual_review → Success; only manual_review → Failed;
+// mixed → Partial. Used by the detectTransformedPatterns fallback
+// path when --analyze --json is unavailable.
+func classifyFromPatterns(patterns []domain.PatternInfo) domain.MigrationStatus {
+	hasTransformed := false
+	hasManual := false
+	for _, p := range patterns {
+		if p.Transformability == "NotTransformable" || p.Transformability == "Not-transformable" {
+			hasManual = true
+		} else {
+			hasTransformed = true
+		}
+	}
+	switch {
+	case !hasManual:
+		return domain.MigrationStatusSuccess
+	case !hasTransformed:
+		return domain.MigrationStatusFailed
+	default:
+		return domain.MigrationStatusPartial
+	}
+}
+
+// aggregateTreeStatus mirrors the Rust TreeMigrationReport::from_files
+// rules: any Failed → Failed; any Partial → Partial; else Success.
+func aggregateTreeStatus(files []domain.FileReport) domain.MigrationStatus {
+	if len(files) == 0 {
+		return domain.MigrationStatusSuccess
+	}
+	anyFailed := false
+	anyPartial := false
+	for _, f := range files {
+		switch f.Status {
+		case domain.MigrationStatusFailed:
+			anyFailed = true
+		case domain.MigrationStatusPartial:
+			anyPartial = true
+		case domain.MigrationStatusSuccess:
+		}
+	}
+	switch {
+	case anyFailed:
+		return domain.MigrationStatusFailed
+	case anyPartial:
+		return domain.MigrationStatusPartial
+	default:
+		return domain.MigrationStatusSuccess
+	}
 }

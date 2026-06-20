@@ -80,7 +80,7 @@ func main() {
 	envSvc := service.NewEnvService(appEnvRepo)
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
 	clusterSvc := service.NewClusterService(workerRepo)
-	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath)
+	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
@@ -115,6 +115,7 @@ func main() {
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/deploy/{appName}", deploymentHandler.Deploy)
 	api.HandleFunc("POST /api/migrate", migrationHandler.Migrate)
+	api.HandleFunc("POST /api/migrate-tree", migrationHandler.MigrateTree)
 	api.HandleFunc("GET /api/status/{deploymentID}", deploymentHandler.GetStatus)
 	api.HandleFunc("GET /api/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
