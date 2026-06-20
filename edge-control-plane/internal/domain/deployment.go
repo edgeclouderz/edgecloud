@@ -42,10 +42,16 @@ const (
 )
 
 // ActiveDeployment maps an app name to its active deployment for a tenant.
+//
+// LastGoodDeploymentID is the prior deployment that was active before the
+// most recent Activate. Used by RollbackDeployment to swap back to it
+// without requiring the tenant to remember the id. Nullable: pre-existing
+// rows (no history) read back as nil; rollback on such a row returns 409.
 type ActiveDeployment struct {
-	TenantID     string `db:"tenant_id"`
-	AppName      string `db:"app_name"`
-	DeploymentID string `db:"deployment_id"`
+	TenantID             string  `db:"tenant_id"`
+	AppName              string  `db:"app_name"`
+	DeploymentID         string  `db:"deployment_id"`
+	LastGoodDeploymentID *string `db:"last_good_deployment_id"`
 }
 
 // AppEnv stores environment variables for an app.
