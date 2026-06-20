@@ -747,9 +747,9 @@ mod tests {
     /// explicitly so the second call returns before the buffer drain.
     #[tokio::test]
     async fn push_during_inflight_flush_does_not_cause_concurrent_requests() {
+        use std::time::Duration;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use std::time::Duration;
 
         let server = MockServer::start().await;
         // Sleep 200ms before responding so we have a window to attempt a
@@ -808,7 +808,8 @@ mod tests {
         let f = LogForwarder::new("http://127.0.0.1:1", "w_test", "test-region", signer);
 
         // Manually mark a flush as in flight; no real POST will be made.
-        f.flush_in_flight.store(true, std::sync::atomic::Ordering::Release);
+        f.flush_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // Push past the byte threshold (768 KiB) so the early-flush
         // notification would normally fire.
@@ -825,6 +826,7 @@ mod tests {
         );
 
         // Cleanup: clear the flag so Arc<LogForwarder> can drop.
-        f.flush_in_flight.store(false, std::sync::atomic::Ordering::Release);
+        f.flush_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }

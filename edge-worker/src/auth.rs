@@ -159,6 +159,13 @@ impl WorkerJwtSigner {
 /// to round-trip the signed token back through the same wire format the
 /// control plane expects.
 ///
+/// `expected_iss` is the issuer this code path is willing to accept; the
+/// `jsonwebtoken` crate's `Validation::set_issuer` pins it. This is
+/// defense-in-depth on top of the control plane's middleware check
+/// (see `edge-control-plane/internal/middleware/worker.go`) — if the
+/// signer drifts away from the canonical issuer, the round-trip test
+/// fails here too, before the request ever hits the wire.
+///
 /// Production code on the worker doesn't need to verify its own tokens —
 /// `sign()` always produces valid output — but the function is public so
 /// the integration test can import it via `edge_worker::auth::verify`. The
@@ -166,11 +173,10 @@ impl WorkerJwtSigner {
 /// lib builds don't link against `tests/integration_tests.rs`, so neither
 /// compilation unit has a non-test call site.
 #[allow(dead_code)]
-pub fn verify(secret: &[u8], token: &str) -> anyhow::Result<WorkerClaims> {
+pub fn verify(secret: &[u8], expected_iss: &str, token: &str) -> anyhow::Result<WorkerClaims> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-    // Don't enforce an `iss` here — tests use various issuers; the control
-    // plane does enforce, see middleware.VerifyWorkerJWT.
     validation.validate_aud = false;
+    validation.set_issuer(&[expected_iss]);
 
     let data = jsonwebtoken::decode::<WorkerClaims>(
         token,
@@ -230,7 +236,7 @@ mod tests {
     fn signed_token_parses_with_correct_claims() {
         let s = signer();
         let t = s.sign();
-        let claims = verify(b"test-secret", &t).expect("verify should succeed");
+        let claims = verify(b"test-secret", "edgecloud", &t).expect("verify should succeed");
         assert_eq!(claims.iss, "edgecloud");
         assert_eq!(claims.worker_id, "w_fra_abc123");
         assert_eq!(claims.tenant_id, "t_tenant1");
@@ -247,6 +253,24 @@ mod tests {
     fn verify_rejects_wrong_secret() {
         let s = signer();
         let t = s.sign();
-        assert!(verify(b"wrong-secret", &t).is_err());
+        assert!(verify(b"wrong-secret", "edgecloud", &t).is_err());
+    }
+
+    /// `verify` pins the issuer via `Validation::set_issuer`. A token
+    /// whose `iss` does not match the expected value must be rejected —
+    /// this is the Rust-side mirror of the control plane's middleware
+    /// check (Commit 1) and catches issuer drift in the signer.
+    #[test]
+    fn verify_rejects_wrong_issuer() {
+        let s = signer(); // mints with iss = "edgecloud"
+        let t = s.sign();
+        let err = verify(b"test-secret", "some-other-issuer", &t)
+            .expect_err("verify with wrong expected_iss must fail");
+        assert!(
+            err.to_string().to_lowercase().contains("issuer")
+                || err.to_string().to_lowercase().contains("iss"),
+            "error should mention issuer, got: {}",
+            err
+        );
     }
 }
