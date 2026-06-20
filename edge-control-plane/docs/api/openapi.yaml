@@ -807,7 +807,12 @@ paths:
       operationId: createApp
       summary: Create a new app
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       requestBody:
         required: true
         content:
@@ -836,7 +841,12 @@ paths:
       operationId: getApp
       summary: Get a specific app
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       responses:
         '200':
           description: App details.
@@ -865,7 +875,12 @@ paths:
         the app record if it does not already exist. The artifact is
         validated as a WebAssembly binary before storage.
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       requestBody:
         required: true
         content:
@@ -920,7 +935,12 @@ paths:
       operationId: listDeployments
       summary: List deployments for an app with pagination
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
         - name: limit
           in: query
           schema:
@@ -953,7 +973,12 @@ paths:
         can be active at a time — activating a new one replaces the current
         live deployment atomically.
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
         - name: deploymentID
           in: path
           required: true
@@ -978,7 +1003,12 @@ paths:
       operationId: getActiveDeployment
       summary: Get the currently active deployment for an app
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       responses:
         '200':
           description: Active deployment.
@@ -1006,7 +1036,12 @@ paths:
         URL is actually routable. Only returns data for the authenticated
         tenant's own apps.
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       responses:
         '200':
           description: App is running.
@@ -1035,7 +1070,12 @@ paths:
       operationId: listEnvVars
       summary: List all environment variables for an app
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       responses:
         '200':
           description: Map of environment variable key-value pairs.
@@ -1052,7 +1092,12 @@ paths:
       operationId: setEnvVar
       summary: Set or update an environment variable
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       requestBody:
         required: true
         content:
@@ -1077,7 +1122,12 @@ paths:
       operationId: deleteEnvVar
       summary: Delete an environment variable
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
         - name: key
           in: path
           required: true
@@ -1324,7 +1374,12 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
-        - $ref: '#/components/parameters/appName'
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
       responses:
         '204':
           description: App deleted.
