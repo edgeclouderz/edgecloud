@@ -84,7 +84,7 @@ func main() {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo)
 	deploymentSvc := service.NewDeploymentService(
-		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
+		db, deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
@@ -218,6 +218,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/status/{deploymentID}", deploymentHandler.GetStatus)
 	api.HandleFunc("GET /api/v1/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
+	api.HandleFunc("POST /api/v1/apps/{appName}/rollback", deploymentHandler.Rollback)
 	api.HandleFunc("GET /api/v1/apps/{appName}/active", deploymentHandler.GetActive)
 	api.HandleFunc("GET /api/v1/auth/whoami", authHandler.Whoami)
 	api.HandleFunc("POST /api/v1/apps/{appName}/env", envHandler.Set)
@@ -227,6 +228,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
+	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
