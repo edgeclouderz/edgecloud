@@ -14,12 +14,12 @@ import (
 
 type mockLogGCRepo struct {
 	mu    sync.Mutex
-	calls []time.Time // cutoff timestamps passed to each DeleteOlderThan call
+	calls []time.Duration // retention durations passed to each DeleteOlderThanBatched call
 	err   error
 	delay time.Duration // optional sleep before returning (simulates slow DB)
 }
 
-func (m *mockLogGCRepo) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+func (m *mockLogGCRepo) DeleteOlderThanBatched(ctx context.Context, retention time.Duration, batchSize, maxBatches int) (int64, error) {
 	if m.delay > 0 {
 		select {
 		case <-time.After(m.delay):
@@ -29,7 +29,7 @@ func (m *mockLogGCRepo) DeleteOlderThan(ctx context.Context, cutoff time.Time) (
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, cutoff)
+	m.calls = append(m.calls, retention)
 	if m.err != nil {
 		return 0, m.err
 	}
@@ -42,11 +42,11 @@ func (m *mockLogGCRepo) callCount() int {
 	return len(m.calls)
 }
 
-func (m *mockLogGCRepo) lastCutoff() (time.Time, bool) {
+func (m *mockLogGCRepo) lastRetention() (time.Duration, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.calls) == 0 {
-		return time.Time{}, false
+		return 0, false
 	}
 	return m.calls[len(m.calls)-1], true
 }
@@ -81,19 +81,15 @@ func TestLogGC_DeletesOldRows(t *testing.T) {
 	// yield makes the assertion deterministic on busy CI.
 	time.Sleep(20 * time.Millisecond)
 
-	cutoff, ok := repo.lastCutoff()
+	gotRetention, ok := repo.lastRetention()
 	if !ok {
-		t.Fatal("DeleteOlderThan was not called on first sweep")
+		t.Fatal("DeleteOlderThanBatched was not called on first sweep")
 	}
 	if got := repo.callCount(); got != 1 {
-		t.Errorf("DeleteOlderThan call count = %d, want 1 (interval hasn't elapsed yet)", got)
+		t.Errorf("DeleteOlderThanBatched call count = %d, want 1 (interval hasn't elapsed yet)", got)
 	}
-
-	// Cutoff should be roughly now - retention.
-	wantCutoff := time.Now().Add(-retention)
-	delta := cutoff.Sub(wantCutoff)
-	if delta < -2*time.Second || delta > 2*time.Second {
-		t.Errorf("cutoff = %s, want ~%s (delta %s)", cutoff, wantCutoff, delta)
+	if gotRetention != retention {
+		t.Errorf("retention = %s, want %s", gotRetention, retention)
 	}
 
 	cancel()
@@ -104,8 +100,9 @@ func TestLogGC_DeletesOldRows(t *testing.T) {
 	}
 }
 
-// TestLogGC_RetentionFromConfig: different retention values produce
-// different cutoffs. Verifies the retention parameter is plumbed through.
+// TestLogGC_RetentionFromConfig: different retention values are
+// plumbed through to the repo. Verifies the retention parameter
+// (now passed as a Duration, not a Go-computed cutoff) is preserved.
 func TestLogGC_RetentionFromConfig(t *testing.T) {
 	repo := &mockLogGCRepo{}
 	svc := NewLogGCService(repo)
@@ -118,7 +115,7 @@ func TestLogGC_RetentionFromConfig(t *testing.T) {
 	// First run with 1-hour retention.
 	go svc.Run(ctx, interval, 1*time.Hour)
 	time.Sleep(20 * time.Millisecond)
-	cutoff1, _ := repo.lastCutoff()
+	got1, _ := repo.lastRetention()
 	cancel()
 	time.Sleep(20 * time.Millisecond) // give Run a moment to exit
 
@@ -127,14 +124,14 @@ func TestLogGC_RetentionFromConfig(t *testing.T) {
 	defer cancel2()
 	go svc.Run(ctx2, interval, 7*24*time.Hour)
 	time.Sleep(20 * time.Millisecond)
-	cutoff2, _ := repo.lastCutoff()
+	got2, _ := repo.lastRetention()
 	cancel2()
 
-	// cutoff2 should be ~7 days earlier than cutoff1.
-	delta := cutoff1.Sub(cutoff2)
-	wantDelta := 7*24*time.Hour - 1*time.Hour
-	if delta < wantDelta-time.Second || delta > wantDelta+time.Second {
-		t.Errorf("cutoff delta = %s, want ~%s", delta, wantDelta)
+	if got1 != 1*time.Hour {
+		t.Errorf("first retention = %s, want 1h", got1)
+	}
+	if got2 != 7*24*time.Hour {
+		t.Errorf("second retention = %s, want 7d", got2)
 	}
 }
 

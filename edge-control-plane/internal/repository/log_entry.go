@@ -96,17 +96,63 @@ func (r *LogEntryRepository) InsertBatch(ctx context.Context, entries []domain.L
 	return nil
 }
 
-// DeleteOlderThan removes log rows with ts < cutoff. Returns the number of
-// rows deleted. Used by the retention GC service (LogGCService.Run).
-func (r *LogEntryRepository) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM logs WHERE ts < $1`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("deleting old logs: %w", err)
+// DeleteOlderThanBatched deletes up to `batchSize` rows whose ts is older than
+// `retention` (server-side: NOW() - retention), looping until either the DB
+// has no more matching rows or `maxBatches` is hit. Returns the total rows
+// deleted across all batches.
+//
+// Two correctness reasons for the paginated shape:
+//
+//  1. Lock duration: a single unbounded DELETE on the logs table can hold
+//     row locks long enough to stall ingest (`POST /api/internal/logs` blocks
+//     on INSERTs that need to acquire the same lock). Batches of 10k rows
+//     amortize the round-trip cost and bound worst-case lock duration.
+//
+//  2. Clock-skew immunity: the cutoff is computed server-side as
+//     `NOW() - make_interval(secs => $1)`, so the DB clock — not the Go
+//     process clock — is the time authority. If the control plane and DB
+//     hosts disagree on wall-clock time, the wrong rows used to be deleted
+//     or kept (e.g. a 5-minute skew with a 7-day retention would push the
+//     cutoff into the future and wipe the table).
+//
+// `retention <= 0` is rejected up front. The service layer also refuses
+// to start with non-positive retention; this is defense in depth.
+func (r *LogEntryRepository) DeleteOlderThanBatched(
+	ctx context.Context, retention time.Duration, batchSize, maxBatches int,
+) (int64, error) {
+	if retention <= 0 {
+		return 0, fmt.Errorf("retention must be positive, got %s", retention)
 	}
-	if res == nil {
-		return 0, nil
+	const cap = 10_000
+	if batchSize <= 0 || batchSize > cap {
+		batchSize = cap
 	}
-	return res.RowsAffected()
+	if maxBatches <= 0 {
+		maxBatches = 1
+	}
+
+	var total int64
+	for i := 0; i < maxBatches; i++ {
+		if ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+		res, err := r.db.ExecContext(ctx,
+			`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE ts < NOW() - make_interval(secs => $1) LIMIT $2)`,
+			retention.Seconds(), batchSize)
+		if err != nil {
+			return total, fmt.Errorf("deleting old logs (batch %d): %w", i, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("rows affected (batch %d): %w", i, err)
+		}
+		total += n
+		if n < int64(batchSize) {
+			// Last batch was short — DB has no more matching rows.
+			break
+		}
+	}
+	return total, nil
 }
 
 // GetByID is a test/debug helper that fetches a single row by its BIGSERIAL id.
