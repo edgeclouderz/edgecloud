@@ -145,7 +145,7 @@ func TestVerifyAPIKey_RejectsBadKeyLength(t *testing.T) {
 		wantErrSubs string
 	}{
 		{"empty_key", "", "key length"},
-		{"short_key", "AAAA", "key length"},                                // 3 bytes
+		{"short_key", "AAAA", "key length"}, // 3 bytes
 		{"long_key", base64.RawStdEncoding.EncodeToString(make([]byte, 64)), "key length"},
 		{"one_byte_short", base64.RawStdEncoding.EncodeToString(make([]byte, 31)), "key length"},
 		{"one_byte_long", base64.RawStdEncoding.EncodeToString(make([]byte, 33)), "key length"},
