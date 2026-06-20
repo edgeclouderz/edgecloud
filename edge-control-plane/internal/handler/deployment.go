@@ -254,7 +254,7 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
 			return
 		}
-		if err.Error() == "app not found" {
+		if errors.Is(err, service.ErrNoActiveDeployment) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 			return
 		}

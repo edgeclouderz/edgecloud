@@ -100,6 +100,12 @@ var (
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
 	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
+	// ErrNoActiveDeployment is returned by RollbackDeployment when there
+	// is no active-deployment row for this app (user never activated any
+	// deployment). Distinct from ErrAppNotFound (which is for the app
+	// row in the apps table) so handlers can map to HTTP 404 without
+	// false matches. Handler maps to HTTP 404.
+	ErrNoActiveDeployment = fmt.Errorf("no active deployment")
 )
 
 // DeploymentService handles deployment business logic.
@@ -455,7 +461,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("reading current active deployment: %w", err)
 		}
 		if current == nil {
-			return fmt.Errorf("app not found")
+			return ErrNoActiveDeployment
 		}
 		if current.LastGoodDeploymentID == nil {
 			return ErrNoLastGood

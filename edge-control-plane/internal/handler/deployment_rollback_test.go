@@ -122,9 +122,10 @@ func TestRollback_NoLastGood_Returns409(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRollback_AppNotFound_Returns404(t *testing.T) {
-	// Service returns the literal "app not found" string that the
-	// RollbackDeployment body emits when GetForUpdate returns nil.
-	svc := &stubRollbacker{err: errors.New("app not found")}
+	// Service returns ErrNoActiveDeployment when GetForUpdate yields nil
+	// (no active-deployment row for this app). Handler maps via
+	// errors.Is, so the stub must return the typed sentinel.
+	svc := &stubRollbacker{err: service.ErrNoActiveDeployment}
 	mux := newRollbackMux(svc)
 
 	req := httptest.NewRequest("POST", "/api/apps/missing/rollback", nil)
