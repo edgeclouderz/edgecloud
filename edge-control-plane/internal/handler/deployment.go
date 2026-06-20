@@ -242,6 +242,20 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 	deploymentID := r.PathValue("deploymentID")
 
+	// Validate both path parameters. The deployment id flows into the
+	// /registry/{tenant}/{app}/{deployment}.wasm path on the worker
+	// (see Download handler) — a ".." or "/" in the id lets a caller
+	// reference arbitrary files on the worker's filesystem. Reject
+	// 400 here rather than 500 from the storage layer.
+	if appName == "" || containsPathTraversal(appName) {
+		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		return
+	}
+	if deploymentID == "" || containsPathTraversal(deploymentID) {
+		http.Error(w, `{"error": "invalid deployment id"}`, http.StatusBadRequest)
+		return
+	}
+
 	if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 		if errors.Is(err, service.ErrPublishFailed) {
 			http.Error(w,

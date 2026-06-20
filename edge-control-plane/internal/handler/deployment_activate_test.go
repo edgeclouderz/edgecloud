@@ -155,3 +155,63 @@ func TestActivate_ServiceError_Returns500(t *testing.T) {
 		t.Errorf("status = 502, want 500; non-publish errors must not become 502")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Activate — 400 (path traversal in appName or deploymentID)
+// ---------------------------------------------------------------------------
+
+// TestActivate_InvalidAppName_Returns400 verifies that path-traversal
+// characters in the appName path segment are rejected before reaching
+// the service layer. The deployment id flows into the worker's
+// /registry/{tenant}/{app}/{deployment}.wasm path — a "/" or ".."
+// would let a caller reference arbitrary files on the worker.
+//
+// Note: Go's net/http mux percent-decodes path values before matching
+// and normalizes "/.." segments before routing — so a literal
+// "../etc" in the URL becomes a redirect, not a 400. The realistic
+// attack is percent-encoded traversal that decodes to ".." or "/"
+// AFTER the mux has parsed the segments; those reach the handler
+// post-decode and must be rejected here.
+func TestActivate_InvalidAppName_Returns400(t *testing.T) {
+	svc := &stubActivator{}
+	mux := newActivateMux(svc)
+
+	for _, name := range []string{"%2e%2e", "foo%2fbar", "foo%5cbar"} {
+		req := httptest.NewRequest("POST", "/api/apps/"+name+"/activate/d_x", nil)
+		req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("appName %q: status = %d, want 400; body: %s", name, rr.Code, rr.Body.String())
+		}
+		if svc.called {
+			t.Errorf("appName %q: ActivateDeployment must not be called for invalid appName", name)
+		}
+	}
+}
+
+// TestActivate_InvalidDeploymentID_Returns400 mirrors the appName
+// check for the deploymentID path segment. deploymentID feeds into
+// file paths on the worker download side and into SQL queries here,
+// so a "/" or ".." injection would be at minimum a logging/UX bug,
+// at worst a cross-tenant read primitive. See TestActivate_InvalidAppName_Returns400
+// for why we use percent-encoded inputs.
+func TestActivate_InvalidDeploymentID_Returns400(t *testing.T) {
+	svc := &stubActivator{}
+	mux := newActivateMux(svc)
+
+	for _, id := range []string{"%2e%2e", "d_x%2f..%2fd_y", "d_x%5cd_y"} {
+		req := httptest.NewRequest("POST", "/api/apps/myapp/activate/"+id, nil)
+		req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("deploymentID %q: status = %d, want 400; body: %s", id, rr.Code, rr.Body.String())
+		}
+		if svc.called {
+			t.Errorf("deploymentID %q: ActivateDeployment must not be called for invalid deploymentID", id)
+		}
+	}
+}
