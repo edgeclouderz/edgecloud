@@ -203,36 +203,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // --transform: analyze + transform, output WASI source to stdout,
-    // exit immediately. Used by the Go control-plane as:
-    //   edge-migrate --transform --language <c|rust> <file>
-    if let Some(ref source_path) = args.transform {
-        let source = read_file(source_path).await?;
-        let transformed = match language {
-            Language::C => {
-                // When clang is reachable, attach a preprocessor so
-                // patterns hidden behind macros become visible. When
-                // clang is missing, the analyzer falls back to the
-                // unexpanded source silently — no user-visible error.
-                let (mut analyzer, preprocessor_info) = build_c_analyzer_with_preprocessor(&source);
-                let matches = analyzer.analyze(&source);
-                let result = Transformer::transform(&source, matches, preprocessor_info);
-                result.transformed_source
-            }
-            Language::Rust => {
-                // No preprocessor for Rust in v1. See the
-                // rust_analyzer.rs header comment for the future
-                // rustc -Zunpretty=expanded hook.
-                let mut analyzer = RustAnalyzer::new();
-                let matches = analyzer.analyze(&source);
-                let result = RustTransformer.transform(&source, matches);
-                result.transformed_source
-            }
-        };
-        print!("{}", transformed);
-        return Ok(());
-    }
-
     // --tree DIR [--app-name NAME]: walk a directory, analyze each
     // source file, then upload the whole tree to
     // POST /api/migrate-tree.
