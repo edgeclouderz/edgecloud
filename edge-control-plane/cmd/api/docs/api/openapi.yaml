@@ -1363,7 +1363,7 @@ paths:
   # -------------------------------------------------------------------------
   # Internal: Worker-facing
   # -------------------------------------------------------------------------
-  /api/v1/internal/download/{deploymentID}:
+  /api/internal/download/{deploymentID}:
     get:
       operationId: downloadArtifact
       summary: Download the Wasm artifact for a deployment
@@ -1392,7 +1392,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /api/v1/internal/workers:
+  /api/internal/workers:
     post:
       operationId: registerWorker
       summary: Register a worker with the control plane

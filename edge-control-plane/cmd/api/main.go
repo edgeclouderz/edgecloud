@@ -155,6 +155,61 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("POST /api/v1/tenants", tenantHandler.Bootstrap) // Self-signup: create tenant + first API key
 	mux.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)       // Create API key (would need tenant creation first)
 
+	// Deprecated: redirect old /api/... paths to /api/v1/... for clients still
+	// on the old contract. Workers use /api/internal/... (unversioned).
+	// These are registered on the mux before the sub-muxes so they intercept
+	// old-path requests; Go 1.22 mux matches longest pattern first, so
+	// /api/v1/... sub-mux routes still win for new-path requests.
+	sunsetDate := "2026-09-20"
+	redirectTo := func(to string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", to)
+			w.Header().Set("X-Redirected-From", r.URL.Path)
+			w.Header().Set("Sunset", sunsetDate)
+			w.WriteHeader(http.StatusMovedPermanently)
+		}
+	}
+	// Tenant routes
+	mux.HandleFunc("GET /api/tenants", redirectTo("/api/v1/tenants"))
+	mux.HandleFunc("POST /api/tenants", redirectTo("/api/v1/tenants"))
+	// Tenant+API key combined
+	mux.HandleFunc("GET /api/keys", redirectTo("/api/v1/keys"))
+	mux.HandleFunc("DELETE /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
+	// Apps
+	mux.HandleFunc("GET /api/apps", redirectTo("/api/v1/apps"))
+	mux.HandleFunc("GET /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
+	mux.HandleFunc("POST /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
+	mux.HandleFunc("DELETE /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
+	// App sub-resources
+	mux.HandleFunc("GET /api/apps/{appName}/active", redirectTo("/api/v1/apps/"+"{appName}/active"))
+	mux.HandleFunc("GET /api/apps/{appName}/ingress", redirectTo("/api/v1/apps/"+"{appName}/ingress"))
+	mux.HandleFunc("GET /api/apps/{appName}/env", redirectTo("/api/v1/apps/"+"{appName}/env"))
+	mux.HandleFunc("POST /api/apps/{appName}/env", redirectTo("/api/v1/apps/"+"{appName}/env"))
+	mux.HandleFunc("DELETE /api/apps/{appName}/env/{key}", redirectTo("/api/v1/apps/"+"{appName}/env/"+"{key}"))
+	mux.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", redirectTo("/api/v1/apps/"+"{appName}/activate/"+"{deploymentID}"))
+	// Deploy & status
+	mux.HandleFunc("POST /api/deploy/{appName}", redirectTo("/api/v1/deploy/"+"{appName}"))
+	mux.HandleFunc("GET /api/status/{deploymentID}", redirectTo("/api/v1/status/"+"{deploymentID}"))
+	mux.HandleFunc("GET /api/list/{appName}", redirectTo("/api/v1/list/"+"{appName}"))
+	// Auth & quota
+	mux.HandleFunc("GET /api/auth/whoami", redirectTo("/api/v1/auth/whoami"))
+	mux.HandleFunc("GET /api/quotas", redirectTo("/api/v1/quotas"))
+	// Migration
+	mux.HandleFunc("POST /api/migrate", redirectTo("/api/v1/migrate"))
+	// Admin: tenants
+	mux.HandleFunc("GET /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
+	mux.HandleFunc("POST /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
+	mux.HandleFunc("GET /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
+	mux.HandleFunc("PUT /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
+	mux.HandleFunc("DELETE /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
+	// Admin: apps & cluster
+	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
+	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
+	// Internal: redirect old /api/internal/ paths to the new unversioned /api/internal/
+	mux.HandleFunc("GET /api/internal/download/{deploymentID}", redirectTo("/api/internal/download/"+"{deploymentID}"))
+	mux.HandleFunc("POST /api/internal/workers", redirectTo("/api/internal/workers"))
+	mux.HandleFunc("GET /api/internal/workers", redirectTo("/api/internal/workers"))
+
 	// Protected API routes
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/v1/deploy/{appName}", deploymentHandler.Deploy)
@@ -195,19 +250,21 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.Handle("/api/v1/admin/", apiWithOwner)
 
 	// Internal endpoints (worker-facing, JWT auth)
+	// Workers consume the latest contract; these paths are intentionally unversioned.
 	internalMux := http.NewServeMux()
-	internalMux.HandleFunc("GET /api/v1/internal/download/{deploymentID}", internalHandler.Download)
-	internalMux.HandleFunc("POST /api/v1/internal/workers", internalHandler.RegisterWorker)
-	internalMux.HandleFunc("GET /api/v1/internal/workers", internalHandler.ListWorkers)
+	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
+	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
 	}
-	mux.Handle("/api/v1/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
+	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
 	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	// Wrap with request ID tracing — outermost middleware runs for every request.
+	srv := &http.Server{Addr: addr, Handler: middleware.RequestID(mux)}
 
 	go func() {
 		log.Printf("Starting edge-cloud control plane on %s", addr)
