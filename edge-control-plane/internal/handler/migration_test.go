@@ -608,3 +608,49 @@ func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
 		t.Error("expected at least one error in the report body")
 	}
 }
+
+// TestMigrateTree_RejectsUnknownExtensionMultipartPart covers the
+// symmetry between the multipart and zip variants: a file part
+// whose extension is not in `treeUploadExts` (`.c`/`.h`/`.rs`)
+// must be rejected at the handler (400), not silently accepted
+// and passed to clang/rustc. The zip variant has filtered on
+// `treeUploadExts` since M2; this brings the multipart variant
+// in line.
+func TestMigrateTree_RejectsUnknownExtensionMultipartPart(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+	// .txt is not a recognized source extension — the handler
+	// must reject it before reaching the service.
+	req := makeTreeReq(t, "hello", "c", `{"files":["notes.txt"]}`,
+		map[string]string{"notes.txt": "this is a doc"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for .txt part, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "unsupported file extension") {
+		t.Errorf("expected 'unsupported file extension' in body, got: %s", rr.Body.String())
+	}
+}
+
+// TestMigrateTree_RejectsUnknownExtensionInManifest covers the
+// manifest-side filter: a manifest entry with an extension outside
+// `treeUploadExts` must be rejected, even if the corresponding file
+// part is present (e.g. the part is `foo.txt` and the manifest
+// also says `foo.txt`).
+func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+	req := makeTreeReq(t, "hello", "rust", `{"files":["main.py"]}`,
+		map[string]string{"main.py": "print('hi')"})
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for .py manifest entry, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "unsupported file extension") {
+		t.Errorf("expected 'unsupported file extension' in body, got: %s", rr.Body.String())
+	}
+}

@@ -239,11 +239,35 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf(`{"error":"unsafe file path: %q"}`, fp.Filename), http.StatusBadRequest)
 				return
 			}
+			// Filter by language-appropriate extension. Mirrors the
+			// zip variant's `treeUploadExts` check at line 291. Without
+			// this, a user uploading `language: rust` with a `foo.c`
+			// part would have those bytes passed to `rustc` and fail
+			// opaquely at compile time.
+			ext := strings.ToLower(filepath.Ext(fp.Filename))
+			if !treeUploadExts[ext] {
+				http.Error(w, fmt.Sprintf(
+					`{"error":"unsupported file extension in multipart part: %q (allowed: .c .h .rs)"}`,
+					fp.Filename,
+				), http.StatusBadRequest)
+				return
+			}
 			partByName[normalizeFileName(fp.Filename)] = fp
 		}
 		for _, p := range manifest.Files {
 			if !isSafeFilePath(p) {
 				http.Error(w, fmt.Sprintf(`{"error":"unsafe manifest path: %q"}`, p), http.StatusBadRequest)
+				return
+			}
+			// Same extension filter on the manifest side. A
+			// `language: rust` upload with a `foo.c` entry in the
+			// manifest must be rejected here, not at compile time.
+			ext := strings.ToLower(filepath.Ext(p))
+			if !treeUploadExts[ext] {
+				http.Error(w, fmt.Sprintf(
+					`{"error":"unsupported file extension in manifest: %q (allowed: .c .h .rs)"}`,
+					p,
+				), http.StatusBadRequest)
 				return
 			}
 			part := partByName[normalizeFileName(p)]
