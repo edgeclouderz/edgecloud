@@ -52,7 +52,6 @@ pub struct TransformResult {
 const WASI_INCLUDES: &str = r#"#include <wasi/sockets.h>
 #include <wasi/io/streams.h>
 #include <wasi/filesystem.h>
-#include <wasi/ip-name-lookup.h>
 
 "#;
 
@@ -273,10 +272,15 @@ impl Transformer {
                 )
             }
             PatternKind::Posix(PosixPattern::GetHostByName) => {
-                format!(
-                    "wasi_ip_name_lookup_resolve({})",
-                    Self::extract_first_arg(m)
-                )
+                // G3: downgraded to NotTransformable. The previous
+                // emit produced `wasi_ip_name_lookup_resolve(host)`
+                // but the runtime's `edge:cloud/networking.resolve`
+                // returns `list<string>`, not the
+                // `wasi:ip-name-lookup.resolve-address` resource
+                // stream shape. Keep the call verbatim in source;
+                // partition in `transform()` routes it to
+                // manual_review before this arm is reached.
+                String::new()
             }
             PatternKind::Posix(PosixPattern::Close) => {
                 format!("wasi_socket_close({})", Self::extract_first_arg(m))
