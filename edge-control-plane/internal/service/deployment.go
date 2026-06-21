@@ -480,7 +480,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 		// Confirm the target still exists. Defends against the (unlikely)
 		// case where the last_good row was deleted out from under us.
-		dep, err := s.deploymentRepo.GetByID(ctx, rolledBackID)
+		dep, err := s.deploymentRepo.WithTx(tx).GetByID(ctx, rolledBackID)
 		if err != nil || dep == nil {
 			return fmt.Errorf("previous deployment %s not found", rolledBackID)
 		}
@@ -505,17 +505,22 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// Snapshot the publish inputs inside the tx so the message
 		// reflects post-rollback state even if another activate lands
 		// between commit and publish (which would itself race with this
-		// publish; see plan §"Risk register").
-		envsList, err := s.appEnvRepo.List(ctx, tenantID, appName)
+		// publish; see plan §"Risk register"). All four reads below use
+		// WithTx(tx) so they participate in the same atomic transaction
+		// as the active_deployments Set above — without the wrapper the
+		// reads would happen on the main connection pool and could
+		// observe a different snapshot than the one we're about to
+		// commit.
+		envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("listing env vars: %w", err)
 		}
 		envs = envsList
-		tenant, err = s.tenantRepo.GetByID(ctx, tenantID)
+		tenant, err = s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
 		if err != nil || tenant == nil {
 			return fmt.Errorf("getting tenant: %w", err)
 		}
-		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
 		if err != nil {
 			return fmt.Errorf("getting quota: %w", err)
 		}
