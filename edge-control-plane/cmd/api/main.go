@@ -84,13 +84,13 @@ func main() {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo)
 	deploymentSvc := service.NewDeploymentService(
-		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
+		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
 	clusterSvc := service.NewClusterService(workerRepo)
-	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath)
+	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
@@ -214,6 +214,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/v1/deploy/{appName}", deploymentHandler.Deploy)
 	api.HandleFunc("POST /api/v1/migrate", migrationHandler.Migrate)
+	api.HandleFunc("POST /api/v1/migrate-tree", migrationHandler.MigrateTree)
 	api.HandleFunc("GET /api/v1/status/{deploymentID}", deploymentHandler.GetStatus)
 	api.HandleFunc("GET /api/v1/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)

@@ -16,6 +16,15 @@ type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	JWT       JWTConfig       `yaml:"jwt"`
 	Migration MigrationConfig `yaml:"migration"`
+	// Region is this control plane's own region. Used as the default
+	// `regions` list for deployments that don't explicitly opt into
+	// multi-region — preserves today's "publish one TaskMessage to a
+	// single subject" behavior. The wildcard NATS subject
+	// `edgecloud.tasks.>` (configured in cmd/api/main.go) means the
+	// literal default `"global"` works for any worker regardless of
+	// its own region. See `service.ActivateDeployment` for the
+	// fallback path. (Issue #82, v1.)
+	Region string `yaml:"region"`
 }
 
 type DatabaseConfig struct {
@@ -122,6 +131,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
 	}
+	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
+		cfg.Region = v
+	}
 
 	// Override with migration config env vars
 	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
@@ -130,6 +142,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("WASI_SDK_PATH"); v != "" {
 		cfg.Migration.WasiSdkPath = v
 	}
+	if v := os.Getenv("RUSTC_PATH"); v != "" {
+		cfg.Migration.RustcPath = v
+	}
 
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
@@ -137,6 +152,17 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.JWT.TTL == 0 {
 		cfg.JWT.TTL = 24
+	}
+
+	// Default for the control plane's own region. `"global"` matches the
+	// long-standing literal used at `service/deployment.go` call site
+	// (PublishTaskUpdate("global", ...)) and works with the wildcard
+	// NATS subject `edgecloud.tasks.>` so any worker in any region
+	// receives the message. Operators who run region-specific control
+	// planes (e.g. "us-east", "eu-west") can override via config or
+	// `CONTROL_PLANE_REGION` env var. See issue #82.
+	if cfg.Region == "" {
+		cfg.Region = "global"
 	}
 
 	// Reject insecure JWT secrets. Operators frequently ship with the
@@ -191,4 +217,10 @@ func validateJWTSecret(s string) error {
 type MigrationConfig struct {
 	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
 	WasiSdkPath     string `yaml:"wasi_sdk_path"     env:"WASI_SDK_PATH"     envDefault:"/usr/local/wasi-sdk/bin"`
+	// RustcPath is the absolute path to a rustc binary capable of
+	// targeting wasm32-wasip2 (i.e. `rustup target add wasm32-wasip2`
+	// has been run on the host). Used by the migration service when
+	// language == "rust" to compile the transformed source into a
+	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
+	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
 }
