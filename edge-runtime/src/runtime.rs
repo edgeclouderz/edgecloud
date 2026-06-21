@@ -246,6 +246,33 @@ impl HttpClientHost for RuntimeState {
             });
         }
 
+        // DNS rebinding guard: resolve the destination hostname and verify none
+        // of the returned IPs fall in a hard-deny range. This catches the common
+        // attack where an allowlisted domain is redirected to a metadata/private
+        // IP via a zero-TTL DNS record. A residual race exists between our
+        // resolver call and reqwest's own DNS query, but this blocks the most
+        // common pattern.
+        {
+            use url::Url;
+            if let Ok(parsed) = Url::parse(url) {
+                if let Some(url::Host::Domain(hostname)) = parsed.host() {
+                    let resolved = self.networking.resolve(hostname).unwrap_or_default();
+                    for ip_str in &resolved {
+                        if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                            if let Err(reason) = self.egress.check_resolved_ip(ip) {
+                                return Some(Response {
+                                    status: 403,
+                                    headers: Vec::new(),
+                                    body: ResponseBodySource::Buffered(Vec::new()),
+                                    error: Some(reason),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let method = req.method.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
@@ -489,6 +516,16 @@ impl ProcessHost for RuntimeState {
 
 impl NetworkingHost for RuntimeState {
     fn resolve(&mut self, hostname: String) -> Vec<String> {
+        // Enforce egress policy on DNS lookups: deny resolution of hostnames
+        // that wouldn't be permitted for outbound HTTP. This prevents tenants
+        // with an empty allowlist from using DNS to enumerate internal services.
+        if self
+            .egress
+            .check(&format!("https://{}/", hostname))
+            .is_err()
+        {
+            return Vec::new();
+        }
         self.networking.resolve(&hostname).unwrap_or_default()
     }
 }
@@ -808,5 +845,33 @@ mod egress_http_tests {
         let policy = EgressPolicy::new(vec!["example.com".to_string()]);
         let result = policy.check("http://example.com/");
         assert!(result.is_ok());
+    }
+
+    // ── NetworkingHost::resolve egress gate ───────────────────────────────
+
+    #[test]
+    fn resolve_blocked_when_empty_allowlist() {
+        use crate::edge::cloud::networking::Host as NetworkingHost;
+        let egress = Arc::new(EgressPolicy::new(vec![]));
+        let env = std::collections::HashMap::new();
+        let mut rs = RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+        let ips = NetworkingHost::resolve(&mut rs, "example.com".to_string());
+        assert!(
+            ips.is_empty(),
+            "deny-all policy must return empty vec from resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_blocked_for_disallowed_host() {
+        use crate::edge::cloud::networking::Host as NetworkingHost;
+        let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
+        let env = std::collections::HashMap::new();
+        let mut rs = RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+        let ips = NetworkingHost::resolve(&mut rs, "evil.com".to_string());
+        assert!(
+            ips.is_empty(),
+            "host not in allowlist must return empty vec from resolve"
+        );
     }
 }
