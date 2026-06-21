@@ -112,8 +112,24 @@ impl Transformer {
                 continue;
             }
 
-            let orig_start = m.start_byte;
-            let orig_end = m.end_byte;
+            // For socket calls bound to a declared variable
+            // (`int fd = socket(...)`), the analyzer captured the
+            // surrounding declaration's byte range so we can rewrite
+            // the whole `int fd = socket(...)` line — replacing the
+            // stale `int` type with `wasi_socket_tcp_t *` to match
+            // the WASI create() return type. Otherwise replace just
+            // the call itself.
+            let (orig_start, orig_end) = match &m.bound_var {
+                Some(bv)
+                    if matches!(
+                        m.pattern,
+                        PatternKind::Posix(PosixPattern::SocketTcp | PosixPattern::SocketUdp)
+                    ) =>
+                {
+                    (bv.decl_start_byte, bv.decl_end_byte)
+                }
+                _ => (m.start_byte, m.end_byte),
+            };
 
             // Copy original content from prev_end to orig_start — the
             // gap between the previous match's end and this match's
@@ -164,10 +180,31 @@ impl Transformer {
     fn generate_wasi_code(m: &PatternMatch) -> String {
         match &m.pattern {
             PatternKind::Posix(PosixPattern::SocketTcp) => {
-                "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
+                // When the call was bound to a declared variable
+                // (`int fd = socket(...)`), emit a full declaration
+                // with the correct WASI return type so the variable
+                // stays in scope for the bind/listen/close lines.
+                // For bare-expression socket calls (e.g.
+                // `socket(AF_INET, SOCK_STREAM, 0);` as a standalone
+                // statement) keep the existing bare-expression form.
+                if let Some(bv) = &m.bound_var {
+                    format!(
+                        "wasi_socket_tcp_t *{} = wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4);",
+                        bv.name
+                    )
+                } else {
+                    "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
+                }
             }
             PatternKind::Posix(PosixPattern::SocketUdp) => {
-                "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
+                if let Some(bv) = &m.bound_var {
+                    format!(
+                        "wasi_socket_udp_t *{} = wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4);",
+                        bv.name
+                    )
+                } else {
+                    "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
+                }
             }
             PatternKind::Posix(PosixPattern::Bind) => {
                 // Two-phase: start-bind + finish-bind.
@@ -324,6 +361,7 @@ int main() {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -350,6 +388,7 @@ int main() {
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
             transformability: Transformability::NotTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 0);
@@ -379,6 +418,7 @@ int main() {
                 "sizeof(addr)".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -413,6 +453,7 @@ int main() {
                 "sizeof(addr)".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -448,6 +489,7 @@ int main() {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -478,6 +520,7 @@ int main() {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -505,6 +548,7 @@ int main() {
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
             transformability: Transformability::BestEffort,
+            bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
@@ -529,6 +573,7 @@ int main() {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         assert_eq!(Transformer::extract_first_arg(&m), "AF_INET");
 
@@ -541,6 +586,7 @@ int main() {
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         assert_eq!(Transformer::extract_first_arg(&m), "fd");
     }
@@ -556,6 +602,7 @@ int main() {
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         assert_eq!(Transformer::extract_second_arg(&m), "&addr");
 
@@ -568,6 +615,7 @@ int main() {
             snippet: "listen(fd, 128)".to_string(),
             arg_nodes: vec!["fd".to_string(), "128".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         assert_eq!(Transformer::extract_second_arg(&m), "128");
     }
@@ -584,10 +632,134 @@ int main() {
             snippet: r#"fopen("foo,bar", "r")"#.to_string(),
             arg_nodes: vec![r#"foo,bar"#.to_string(), r#""r""#.to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         // extract_first_arg must return "foo,bar" (with the comma inside the string)
         assert_eq!(Transformer::extract_first_arg(&m), r#"foo,bar"#);
         assert_eq!(Transformer::extract_second_arg(&m), r#""r""#);
+    }
+
+    /// Regression test for #129: when `socket(...)` is the
+    /// initializer of a C `declaration` (e.g. `int fd =
+    /// socket(...)`), the transformer must rewrite the WHOLE
+    /// declaration — replacing the stale `int` type with the
+    /// correct WASI return type (`wasi_socket_tcp_t *`) — so the
+    /// `fd` references in downstream bind/listen/close calls stay
+    /// valid C.
+    #[test]
+    fn test_transform_socket_preserves_declared_fd_binding() {
+        let source = "\
+int main() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    bind(fd, &addr, sizeof(addr));
+    listen(fd, 128);
+    return 0;
+}
+";
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches, None);
+
+        // The whole `int fd = socket(...)` line is rewritten to
+        // `wasi_socket_tcp_t *fd = wasi_socket_tcp_create(...)` —
+        // both the type AND the trailing `;` are replaced. This is
+        // the fix for #129.
+        assert!(
+            result.transformed_source.contains(
+                "wasi_socket_tcp_t *fd = wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4);"
+            ),
+            "expected full declaration rewrite; got:\n{}",
+            result.transformed_source
+        );
+        // The stale `int fd = socket(...)` line is gone.
+        assert!(
+            !result.transformed_source.contains("int fd = socket"),
+            "stale int fd = socket declaration still present"
+        );
+        // Downstream `fd` references still resolve to the same
+        // variable name (we didn't rename it).
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_bind(fd,"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_listen(fd, 128)"));
+        // No manual_review entry — this case is in scope for the MVP fix.
+        assert_eq!(
+            result.manual_review.len(),
+            0,
+            "expected 0 manual_review entries, got {}",
+            result.manual_review.len()
+        );
+    }
+
+    /// When `socket(...)` appears as a bare expression statement
+    /// (not the initializer of a declaration), there's no `fd`
+    /// binding to preserve. The transformer emits the WASI call
+    /// alone, without the bare expression's leading whitespace or
+    /// trailing `;` (those are spliced from the original gap).
+    #[test]
+    fn test_transform_socket_bare_expression() {
+        let source = "int main() { socket(AF_INET, SOCK_STREAM, 0); return 0; }\n";
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches, None);
+
+        // Bare-expression emit: just the call, no `wasi_socket_tcp_t *` prefix.
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)"));
+        // The original bare-expression's `socket(...)` is replaced.
+        assert!(
+            !result.transformed_source.contains("socket(AF_INET"),
+            "stale socket() bare expression still present"
+        );
+        // Critically: no type was added — the bare expression form is preserved.
+        assert!(
+            !result.transformed_source.contains("wasi_socket_tcp_t *"),
+            "bare expression should not get a type prefix"
+        );
+    }
+
+    /// `static int fd = socket(...)` (or any other declaration
+    /// with a storage-class / type qualifier on the declarator)
+    /// must NOT be silently rewritten — dropping the `static`
+    /// would change semantics. The MVP fix conservatively routes
+    /// these to `manual_review` so the developer sees the call
+    /// needs attention rather than getting subtly-wrong code.
+    #[test]
+    fn test_transform_socket_weird_initializer_marks_manual_review() {
+        let source = "int main() { static int fd = socket(AF_INET, SOCK_STREAM, 0); return 0; }\n";
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches, None);
+
+        // No WASI emit for the socket call — the bound_var detection
+        // skipped this case (saw `storage_class_specifier` in the
+        // parent declaration).
+        assert!(
+            !result.transformed_source.contains("wasi_socket_tcp_create"),
+            "weird initializer should not emit a wasi_socket_tcp_create call"
+        );
+        // The original POSIX call is preserved verbatim.
+        assert!(
+            result
+                .transformed_source
+                .contains("static int fd = socket(AF_INET, SOCK_STREAM, 0)"),
+            "original static initializer should be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        // And it shows up in manual_review so the developer knows.
+        assert_eq!(
+            result.manual_review.len(),
+            1,
+            "expected 1 manual_review entry, got {}",
+            result.manual_review.len()
+        );
+        assert!(matches!(
+            result.manual_review[0].pattern,
+            PatternKind::Posix(PosixPattern::SocketTcp)
+        ));
     }
 
     /// Integration test: verify that a full socket sequence transforms to valid C
@@ -714,14 +886,10 @@ int main() {
 
         let pid = std::process::id();
         let tmp_path = std::env::temp_dir().join(format!("edge_migrate_e2e_{}.c", pid));
-        std::fs::write(&tmp_path, &result.transformed_source)
-            .expect("write transformed source");
+        std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
 
         let include_flag = format!("-I{}", testdata_dir.display());
-        let force_include_flag = format!(
-            "-include{}",
-            testdata_dir.join("wasi_stubs.h").display()
-        );
+        let force_include_flag = format!("-include{}", testdata_dir.join("wasi_stubs.h").display());
         let output = std::process::Command::new("clang")
             .args([
                 "-fsyntax-only",

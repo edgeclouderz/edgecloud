@@ -23,6 +23,31 @@
 
 #define IP_ADDRESS_FAMILY_IPV4 0
 
+// Minimal POSIX socket-API stubs so the test fixture
+// (`testdata/http_client.c`) compiles. The fixture uses
+// `AF_INET` / `SOCK_STREAM` / `struct sockaddr_in` as the POSIX
+// types that get rewritten to the WASI equivalents below. These
+// declarations are NEVER linked — they're here so `clang
+// -fsyntax-only` can type-check the input source before the
+// transformer's emit replaces the POSIX calls with WASI calls.
+#define AF_INET 2
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+
+struct sockaddr {
+  unsigned short sa_family;
+  char sa_data[14];
+};
+
+struct sockaddr_in {
+  unsigned short sin_family;
+  unsigned short sin_port;
+  struct in_addr {
+    unsigned int s_addr;
+  } sin_addr;
+  char sin_zero[8];
+};
+
 typedef struct wasi_socket_tcp_t wasi_socket_tcp_t;
 typedef struct wasi_socket_udp_t wasi_socket_udp_t;
 

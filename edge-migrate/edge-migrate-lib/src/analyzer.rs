@@ -9,7 +9,7 @@
 //! analyzer silently falls back to the unexpanded source — never
 //! fail analysis because the preprocessor failed.
 
-use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
+use crate::patterns::{BoundVarDecl, PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::{Preprocessor, PreprocessorInfo};
 use tree_sitter::Parser;
 
@@ -236,6 +236,25 @@ impl CAnalyzer {
         let end_byte = node.end_byte();
         let arg_nodes = self.get_call_args(source, node);
 
+        // For socket calls, classify the parent declaration context
+        // so we can either (a) capture a clean binding to rewrite the
+        // whole `int fd = socket(...)` line, or (b) flip the match
+        // to NotTransformable when the declaration is too complex to
+        // safely rewrite (e.g. `static int fd = socket(...)` — we
+        // can't drop the `static` without changing semantics).
+        let (bound_var, transformability) = if matches!(
+            pattern,
+            PatternKind::Posix(PosixPattern::SocketTcp | PosixPattern::SocketUdp)
+        ) {
+            match classify_socket_declaration_context(source, node) {
+                SocketDeclContext::Simple(bv) => (Some(bv), pattern.transformability()),
+                SocketDeclContext::Unsupported => (None, Transformability::NotTransformable),
+                SocketDeclContext::Bare => (None, pattern.transformability()),
+            }
+        } else {
+            (None, pattern.transformability())
+        };
+
         let mut results = vec![PatternMatch {
             line,
             column: Some(column),
@@ -244,7 +263,8 @@ impl CAnalyzer {
             pattern,
             snippet: snippet.clone(),
             arg_nodes: arg_nodes.clone(),
-            transformability: pattern.transformability(),
+            transformability,
+            bound_var,
         }];
 
         // Check for O_NONBLOCK in socket calls — adds a second PatternMatch
@@ -263,6 +283,11 @@ impl CAnalyzer {
                     snippet,
                     arg_nodes,
                     transformability: Transformability::NotTransformable,
+                    // NonBlocking is a side-effect match — there's
+                    // no socket declaration to bind. Reuse the
+                    // socket call's bound_var if it had one (so the
+                    // socket emission still rewrites the whole line).
+                    bound_var: None,
                 });
             }
         }
@@ -306,6 +331,81 @@ impl CAnalyzer {
         }
         args
     }
+}
+
+/// Result of inspecting the parent context of a `socket(...)`
+/// `call_expression`. See `classify_socket_declaration_context`.
+enum SocketDeclContext {
+    /// `socket(AF_INET, SOCK_STREAM, 0);` as a standalone statement
+    /// — no declaration to bind to.
+    Bare,
+    /// `int fd = socket(...)` — clean binding; rewrite the whole
+    /// declaration with the WASI return type.
+    Simple(BoundVarDecl),
+    /// `static int fd = socket(...)`, complex declarators
+    /// (`int arr[10] = socket(...)`, `int (*fp)() = socket(...)`),
+    /// etc. — the transformer cannot produce a valid emit. Caller
+    /// flips `transformability` to `NotTransformable` so the call
+    /// lands in `manual_review` with the original source preserved.
+    Unsupported,
+}
+
+/// Classifies the parent context of a `socket(...)` call so the
+/// analyzer can decide what binding info (if any) to attach and
+/// whether to mark the match as `NotTransformable`. The MVP fix
+/// for #129 only handles the `Simple` case — everything in a
+/// `declaration` is rewritten as a single line with the right
+/// WASI return type. Other declaration contexts (complex
+/// declarators, storage-class qualifiers) are routed to
+/// `manual_review` rather than producing invalid C.
+fn classify_socket_declaration_context(
+    source: &str,
+    call_node: tree_sitter::Node,
+) -> SocketDeclContext {
+    let Some(init) = call_node.parent() else {
+        return SocketDeclContext::Bare;
+    };
+    if init.kind() != "init_declarator" {
+        return SocketDeclContext::Bare;
+    }
+    let Some(decl) = init.parent() else {
+        return SocketDeclContext::Bare;
+    };
+    if decl.kind() != "declaration" {
+        return SocketDeclContext::Bare;
+    }
+    // We're inside an `init_declarator` of a `declaration`.
+    // Determine whether the declaration is "simple enough" to
+    // safely rewrite.
+    //
+    // The init_declarator's first child should be the declarator.
+    // For simple cases it's an `identifier` (e.g. `fd`). For complex
+    // declarators it's a `pointer_declarator` / `array_declarator` /
+    // `function_declarator` — those we don't attempt to handle in MVP.
+    let Some(name_node) = init.child(0) else {
+        return SocketDeclContext::Unsupported;
+    };
+    if name_node.kind() != "identifier" {
+        return SocketDeclContext::Unsupported;
+    }
+    // Storage-class or type qualifiers on the surrounding declaration
+    // (static, extern, volatile, const, ...) would be silently dropped
+    // by a type-only rewrite. Conservatively refuse.
+    for i in 0..decl.child_count() {
+        if let Some(child) = decl.child(i) {
+            if matches!(child.kind(), "storage_class_specifier" | "type_qualifier") {
+                return SocketDeclContext::Unsupported;
+            }
+        }
+    }
+    let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+        return SocketDeclContext::Unsupported;
+    };
+    SocketDeclContext::Simple(BoundVarDecl {
+        name: name.to_string(),
+        decl_start_byte: decl.start_byte(),
+        decl_end_byte: decl.end_byte(),
+    })
 }
 
 impl Default for CAnalyzer {

@@ -74,6 +74,41 @@ pub struct PatternMatch {
     pub arg_nodes: Vec<String>,
     /// Whether this pattern can be auto-transformed.
     pub transformability: Transformability,
+    /// For `socket()` calls that appear as the initializer of a C
+    /// declaration (e.g. `int fd = socket(...)`), the captured
+    /// variable binding so the transformer can rewrite the whole
+    /// `int fd = socket(...)` line with a correct WASI return type
+    /// (`wasi_socket_tcp_t *fd = wasi_socket_tcp_create(...)`)
+    /// instead of leaving the stale `int` type in place.
+    ///
+    /// `None` for bare-expression socket calls (e.g.
+    /// `socket(AF_INET, SOCK_STREAM, 0);` as a statement on its
+    /// own) and for all non-socket patterns. See
+    /// `edge-migrate/docs/design.md` §4.1 (Accepting the fd binding).
+    #[serde(default)]
+    pub bound_var: Option<BoundVarDecl>,
+}
+
+/// Captured variable binding for a `socket()` call that appears as
+/// the initializer of a C `declaration`.
+///
+/// The byte range is the whole declaration INCLUDING the trailing
+/// `;` (tree-sitter C grammar's `declaration` node covers the
+/// semicolon). The transformer uses this range as the replacement
+/// span so it can swap `int fd = socket(...)` for
+/// `wasi_socket_tcp_t *fd = wasi_socket_tcp_create(...);`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundVarDecl {
+    /// The declarator's identifier text (e.g. `fd`). Extracted from
+    /// the `init_declarator`'s first child, which is expected to be
+    /// an `identifier` node. Complex declarators (array, pointer,
+    /// function-pointer) are not captured — see `analyzer.rs::extract_socket_bound_var`.
+    pub name: String,
+    /// Byte offset of the start of the surrounding `declaration` node.
+    pub decl_start_byte: usize,
+    /// Byte offset of the end of the surrounding `declaration` node
+    /// (past the trailing `;`).
+    pub decl_end_byte: usize,
 }
 
 impl Default for PatternMatch {
@@ -90,6 +125,7 @@ impl Default for PatternMatch {
             snippet: String::new(),
             arg_nodes: Vec::new(),
             transformability: Transformability::NotTransformable,
+            bound_var: None,
         }
     }
 }
@@ -509,6 +545,7 @@ mod tests {
             snippet: "bind(...)".to_string(),
             arg_nodes: vec![],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         let j = serde_json::to_string(&m).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
@@ -527,6 +564,7 @@ mod tests {
             snippet: "TcpListener::bind(\"127.0.0.1:8080\")".to_string(),
             arg_nodes: vec!["\"127.0.0.1:8080\"".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         let j = serde_json::to_string(&m).unwrap();
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
