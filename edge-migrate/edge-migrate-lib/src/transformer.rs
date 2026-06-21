@@ -672,4 +672,90 @@ int main() {
             );
         }
     }
+
+    /// End-to-end regression net: transform `testdata/http_client.c`
+    /// (the canonical socket + bind + listen + accept sequence) and
+    /// verify the output is syntactically valid C under
+    /// `clang -fsyntax-only -Werror`. Gated on `EDGE_TEST_CLANG=1`
+    /// AND `clang --version` succeeding, so CI without the wasi-sdk
+    /// image still passes.
+    ///
+    /// This is the test that caught the pollable (#128) and fd (#129)
+    /// bugs — the per-pattern unit tests only check marker substrings
+    /// and would still pass with those bugs present. The fix path is
+    /// to make this test green; both #128 and #129 surface here as
+    /// `error: use of undeclared identifier`.
+    ///
+    /// Fixtures:
+    /// - `testdata/http_client.c` — input source
+    /// - `testdata/wasi_stubs.h` — declarations for every symbol the
+    ///   transformer emits (force-included via `-include`)
+    /// - `testdata/wasi/{sockets,io/streams,filesystem,ip-name-lookup}.h` —
+    ///   empty `#pragma once` shims so the transformer's emitted
+    ///   `#include` directives resolve.
+    #[test]
+    fn test_transform_e2e_wasi_stubs_compile() {
+        if !clang_available() {
+            // Silent no-op: keep CI green when clang is unavailable
+            // or EDGE_TEST_CLANG is unset. The unit tests above still
+            // exercise the marker-substring contract.
+            return;
+        }
+        let testdata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("testdata");
+        let fixture_path = testdata_dir.join("http_client.c");
+        let source = std::fs::read_to_string(&fixture_path).expect("read http_client.c");
+
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(&source);
+        let result = Transformer::transform(&source, matches, None);
+
+        let pid = std::process::id();
+        let tmp_path = std::env::temp_dir().join(format!("edge_migrate_e2e_{}.c", pid));
+        std::fs::write(&tmp_path, &result.transformed_source)
+            .expect("write transformed source");
+
+        let include_flag = format!("-I{}", testdata_dir.display());
+        let force_include_flag = format!(
+            "-include{}",
+            testdata_dir.join("wasi_stubs.h").display()
+        );
+        let output = std::process::Command::new("clang")
+            .args([
+                "-fsyntax-only",
+                "-Werror",
+                "-Wno-unused-variable",
+                "-Wno-unused-but-set-variable",
+                &include_flag,
+                &force_include_flag,
+                tmp_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("clang runs");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        assert!(
+            output.status.success(),
+            "clang syntax check failed (transformer emit no longer compiles).\n\
+             stderr:\n{}\n\
+             --- transformed source ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            result.transformed_source
+        );
+    }
+
+    /// Returns true iff `EDGE_TEST_CLANG=1` is set in the environment
+    /// AND a `clang` binary is reachable on PATH and responds to
+    /// `--version`. Mirrors the gate on the marker-substring test
+    /// above (`test_transform_socket_sequence_valid_c`).
+    fn clang_available() -> bool {
+        std::env::var("EDGE_TEST_CLANG").is_ok()
+            && std::process::Command::new("clang")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    }
 }
