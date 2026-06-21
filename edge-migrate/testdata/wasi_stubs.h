@@ -48,6 +48,18 @@ struct sockaddr_in {
   char sin_zero[8];
 };
 
+// POSIX `accept()` stub. The MVP leaves accept() verbatim in the
+// source (it's downgraded to NotTransformable per #128 — the
+// poll-loop wrapper was syntactically wrong and referenced an
+// undeclared `pollable`). The e2e regression net still needs the
+// symbol declared so the verbatim `accept(fd, NULL, NULL)` line
+// type-checks under clang. `fd` is typed as `void *` because the
+// surrounding transformer rewrites `int fd = socket(...)` to
+// `wasi_socket_tcp_t *fd = wasi_socket_tcp_create(...)`, so the
+// verbatim accept() call now passes a pointer where POSIX would
+// have passed an int.
+int accept(void *fd, void *addr, int *addrlen);
+
 typedef struct wasi_socket_tcp_t wasi_socket_tcp_t;
 typedef struct wasi_socket_udp_t wasi_socket_udp_t;
 

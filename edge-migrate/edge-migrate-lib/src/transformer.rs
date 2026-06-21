@@ -245,11 +245,16 @@ impl Transformer {
                 )
             }
             PatternKind::Posix(PosixPattern::Accept) => {
-                // Wrap in poll loop
-                format!(
-                    "// WASI: accept with poll loop\n{{\n  wasi_socket_tcp_accept_result_t result;\n  do {{\n    result = wasi_socket_tcp_accept({});\n    if (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK) {{\n      wasi_poll_pollable_block(pollable);\n    }}\n  }} while (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK);\n  /* accepted socket in result.val */\n}}",
-                    Self::extract_first_arg(m)
-                )
+                // #128: downgraded to NotTransformable. The previous
+                // poll-loop wrapper referenced an undeclared
+                // `pollable` (no wasi-sdk subscription API in MVP) and
+                // produced a brace-wrapped block that didn't fit the
+                // `int client = accept(...)` shape. Accept is left in
+                // the source verbatim and routed to manual_review by
+                // the partition in `transform()` (line 84-86). Nothing
+                // to emit here — the partition catches it before this
+                // match is iterated.
+                String::new()
             }
             PatternKind::Posix(PosixPattern::Recv) => {
                 format!(
@@ -530,7 +535,16 @@ int main() {
     }
 
     #[test]
-    fn test_transform_accept_poll_loop() {
+    fn test_transform_accept_not_transformable_in_mvp() {
+        // #128: Accept was downgraded from BestEffort to
+        // NotTransformable. The previous emit wrapped the call in a
+        // `wasi_poll_pollable_block(pollable)` loop that referenced
+        // an undeclared `pollable` (no wasi-sdk subscription API in
+        // MVP) and produced a brace-wrapped block that didn't fit
+        // the `int client = accept(...)` shape. The MVP fix: leave
+        // the original accept() in the source verbatim and report
+        // it as manual_review so the developer sees the call needs
+        // attention, rather than getting silently broken code.
         let source = r#"
 int main() {
     accept(fd, NULL, NULL);
@@ -547,15 +561,38 @@ int main() {
             pattern: PatternKind::Posix(PosixPattern::Accept),
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
-            transformability: Transformability::BestEffort,
+            transformability: Transformability::NotTransformable,
             bound_var: None,
         }];
         let result = Transformer::transform(source, matches, None);
-        assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
-        assert!(result
-            .transformed_source
-            .contains("wasi_poll_pollable_block"));
+        // 0 transformations applied — the match was routed to
+        // manual_review by the partition in `transform()`.
+        assert_eq!(result.transformations_applied.len(), 0);
+        // 1 manual_review entry — the developer sees the call.
+        assert_eq!(result.manual_review.len(), 1);
+        assert_eq!(
+            result.manual_review[0].pattern,
+            PatternKind::Posix(PosixPattern::Accept)
+        );
+        // The original POSIX accept() is preserved verbatim — no
+        // broken emit, no undeclared `pollable` reference, no
+        // brace-wrapped block.
+        assert!(
+            result.transformed_source.contains("accept(fd, NULL, NULL)"),
+            "original accept() should be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        // And the broken-poll-loop emit is GONE.
+        assert!(
+            !result
+                .transformed_source
+                .contains("wasi_poll_pollable_block"),
+            "the broken poll-loop wrapper should NOT appear in the output"
+        );
+        assert!(
+            !result.transformed_source.contains("wasi_socket_tcp_accept"),
+            "no wasi_socket_tcp_accept emit should be present (call is not transformable in MVP)"
+        );
     }
 
     #[test]
@@ -791,7 +828,9 @@ int main() {
         assert!(result
             .transformed_source
             .contains("wasi_socket_tcp_start_listen"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
+        // #128: accept is NOT transformed in MVP — no
+        // `wasi_socket_tcp_accept` emit. The original accept() call
+        // is preserved verbatim (asserted below).
 
         // Original POSIX calls must NOT be present. The substrings
         // here include the FULL original arg list so they don't
@@ -814,9 +853,20 @@ int main() {
              distinguishes the original call from the wasi emit, which \
              starts with `    // WASI: two-phase listen`)"
         );
+        // #128: accept is NOT transformed in MVP — the original
+        // `accept(fd, NULL, NULL)` MUST be present in the output
+        // (verbatim, since it's routed to manual_review). Also assert
+        // it landed in manual_review so the developer sees it.
         assert!(
-            !result.transformed_source.contains("accept(fd, NULL, NULL)"),
-            "accept original still present"
+            result.transformed_source.contains("accept(fd, NULL, NULL)"),
+            "accept original must be preserved verbatim (downgraded to NotTransformable)"
+        );
+        assert!(
+            result
+                .manual_review
+                .iter()
+                .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::Accept))),
+            "accept should be in manual_review"
         );
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.

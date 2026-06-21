@@ -310,7 +310,9 @@ impl PosixPattern {
             PosixPattern::SocketUdp => "create-udp-socket(ipv4)",
             PosixPattern::Bind => "start-bind() + finish-bind()",
             PosixPattern::Listen => "start-listen() + finish-listen()",
-            PosixPattern::Accept => "accept() with poll loop",
+            PosixPattern::Accept => {
+                "accept() — not transformable in MVP (was: poll loop wrapper; #128)"
+            }
             PosixPattern::Connect => "start-connect() + finish-connect()",
             PosixPattern::Recv => "input-stream read via wasi:io/streams",
             PosixPattern::Send => "output-stream write via wasi:io/streams",
@@ -348,7 +350,16 @@ impl PosixPattern {
             | PosixPattern::Fread
             | PosixPattern::Fwrite
             | PosixPattern::Fclose => Transformability::AutoTransformable,
-            PosixPattern::Accept => Transformability::BestEffort,
+            // Resolves #128: the previous BestEffort emit wrapped
+            // accept in a `wasi_poll_pollable_block(pollable)` poll
+            // loop, but `pollable` was never declared (the
+            // subscription API it would come from isn't in WASI
+            // Preview 2 yet) and the surrounding `int client = …`
+            // initialization shape was syntactically wrong for the
+            // brace-wrapped block. Downgrade to NotTransformable for
+            // MVP — the call stays in the source verbatim and lands
+            // in manual_review.
+            PosixPattern::Accept => Transformability::NotTransformable,
             PosixPattern::Poll
             | PosixPattern::Select
             | PosixPattern::Fork
@@ -402,7 +413,7 @@ impl RustPattern {
             | RustPattern::FsRead
             | RustPattern::FsWrite
             | RustPattern::FsClose => Transformability::AutoTransformable,
-            RustPattern::TcpAccept => Transformability::BestEffort,
+            RustPattern::TcpAccept => Transformability::NotTransformable,
             RustPattern::UdpConnect | RustPattern::ProcessExit => {
                 Transformability::NotTransformable
             }
@@ -418,7 +429,9 @@ impl RustPattern {
                 "wasi::socket::tcp::TcpSocket::new + start_bind + finish_bind + \
                  start_listen + finish_listen"
             }
-            RustPattern::TcpAccept => "wasi::socket::tcp::TcpSocket::accept wrapped in poll loop",
+            RustPattern::TcpAccept => {
+                "TcpListener::accept() — not transformable in MVP (was: poll loop wrapper; #128)"
+            }
             RustPattern::TcpConnect => {
                 "wasi::socket::tcp::TcpSocket::new + start_connect + finish_connect"
             }
@@ -588,6 +601,11 @@ mod tests {
         assert_eq!(m.line, 3);
         assert!(m.column.is_none());
         assert_eq!(m.pattern, PatternKind::Posix(PosixPattern::Accept));
+        // #128: legacy M1 reports deserializing as Accept now have
+        // whatever transformability the on-wire JSON said (here:
+        // best-effort). The wire format is unchanged — the
+        // transformability flip lives in `transformability()` for
+        // freshly-detected matches only.
         assert_eq!(m.transformability, Transformability::BestEffort);
     }
 
@@ -603,30 +621,33 @@ mod tests {
 
     #[test]
     fn test_pattern_kind_transformability_matrix() {
-        // C path: AutoTransformable for the bulk, BestEffort for Accept,
-        // NotTransformable for the un-fixables.
+        // C path: AutoTransformable for the bulk, NotTransformable
+        // for the un-fixables. #128: Accept flipped from BestEffort
+        // to NotTransformable (poll-loop wrapper was syntactically
+        // wrong + referenced an undeclared pollable).
         assert_eq!(
             PatternKind::Posix(PosixPattern::Listen).transformability(),
             Transformability::AutoTransformable
         );
         assert_eq!(
             PatternKind::Posix(PosixPattern::Accept).transformability(),
-            Transformability::BestEffort
+            Transformability::NotTransformable
         );
         assert_eq!(
             PatternKind::Posix(PosixPattern::Poll).transformability(),
             Transformability::NotTransformable
         );
-        // Rust path: TcpAccept is BestEffort (poll loop wrapper),
-        // UdpConnect and ProcessExit are NotTransformable, the rest
-        // are AutoTransformable.
+        // Rust path: TcpAccept was BestEffort (busy-spin poll loop)
+        // and is now NotTransformable — same MVP reason as the C
+        // Accept flip. UdpConnect and ProcessExit are
+        // NotTransformable; the rest are AutoTransformable.
         assert_eq!(
             PatternKind::Rust(RustPattern::TcpBind).transformability(),
             Transformability::AutoTransformable
         );
         assert_eq!(
             PatternKind::Rust(RustPattern::TcpAccept).transformability(),
-            Transformability::BestEffort
+            Transformability::NotTransformable
         );
         assert_eq!(
             PatternKind::Rust(RustPattern::UdpConnect).transformability(),
