@@ -3,9 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"regexp"
 	"testing"
-	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -174,9 +172,3 @@ func TestActiveDeploymentRepository_GetForUpdate_NoRowsReturnsNil(t *testing.T) 
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
-
-// keep time import used by future tests
-var _ = time.Now
-
-// keep regexp import used elsewhere — guards against accidental removal.
-var _ = regexp.QuoteMeta
