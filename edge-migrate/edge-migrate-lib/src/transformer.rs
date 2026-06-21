@@ -3,7 +3,8 @@
 //! Transforms detected POSIX patterns to WASI equivalents,
 //! generating transformed source code and a transformation report.
 
-use crate::patterns::{PatternMatch, PosixPattern, Transformability};
+use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
+use crate::preprocessor::PreprocessorInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 
@@ -12,8 +13,8 @@ use std::cmp::Reverse;
 pub struct Transformation {
     /// 1-based line number where the transformation was applied.
     pub line: usize,
-    /// The pattern that was transformed.
-    pub pattern: PosixPattern,
+    /// The pattern that was transformed (M3: `PatternKind`, was `PosixPattern`).
+    pub pattern: PatternKind,
     /// A description of what was changed.
     pub description: String,
 }
@@ -23,8 +24,8 @@ pub struct Transformation {
 pub struct TransformError {
     /// 1-based line number where the error occurred.
     pub line: usize,
-    /// The pattern that failed.
-    pub pattern: PosixPattern,
+    /// The pattern that failed (M3: `PatternKind`, was `PosixPattern`).
+    pub pattern: PatternKind,
     /// Human-readable error message.
     pub message: String,
 }
@@ -40,6 +41,12 @@ pub struct TransformResult {
     pub manual_review: Vec<PatternMatch>,
     /// Errors that occurred during transformation.
     pub errors: Vec<TransformError>,
+    /// Preprocessor metadata, when a preprocessor was used during
+    /// analysis. `None` when no preprocessor was attached, when the
+    /// preprocessor was not discovered, or when the analyzer fell
+    /// back to the unexpanded source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessor: Option<PreprocessorInfo>,
 }
 
 /// WASI header includes to prepend to the transformed source.
@@ -62,7 +69,15 @@ impl Transformer {
     /// BETWEEN the current match's end and the PREVIOUS match's end (in
     /// original source coordinates). After all matches, append any remaining
     /// original content from byte 0 to the first match's start.
-    pub fn transform(source: &str, matches: Vec<PatternMatch>) -> TransformResult {
+    ///
+    /// `preprocessor_info` is attached to the result so callers (the CLI
+    /// bin, the control plane) can report "Preprocessor: expanded N macros"
+    /// back to the user. Pass `None` when no preprocessor was used.
+    pub fn transform(
+        source: &str,
+        matches: Vec<PatternMatch>,
+        preprocessor_info: Option<PreprocessorInfo>,
+    ) -> TransformResult {
         let mut transformations_applied = Vec::new();
         let mut manual_review = Vec::new();
 
@@ -109,7 +124,7 @@ impl Transformer {
 
             transformations_applied.push(Transformation {
                 line: m.line,
-                pattern: m.pattern.clone(),
+                pattern: m.pattern,
                 description: format!(
                     "Transformed {} → {}",
                     m.snippet.split('(').next().unwrap_or(&m.snippet),
@@ -123,27 +138,34 @@ impl Transformer {
             output.extend_from_slice(&source_bytes[..prev_end]);
         }
 
-        let transformed_source = String::from_utf8(output)
-            .expect("Transformed source is not valid UTF-8");
+        let transformed_source =
+            String::from_utf8(output).expect("Transformed source is not valid UTF-8");
 
         TransformResult {
             transformed_source,
             transformations_applied,
             manual_review,
             errors: Vec::new(),
+            preprocessor: preprocessor_info,
         }
     }
 
     /// Generate WASI C code for a pattern match.
+    ///
+    /// M3 added `PatternKind` (a sum type with `Posix(...)` and
+    /// `Rust(...)` variants). The C `Transformer` only handles the
+    /// `Posix` arm; `Rust` matches are caught by the `_ => String::new()`
+    /// fallback (they have no place in C source). M3.C4 introduces
+    /// `RustTransformer` for the Rust path.
     fn generate_wasi_code(m: &PatternMatch) -> String {
-        match m.pattern {
-            PosixPattern::SocketTcp => {
+        match &m.pattern {
+            PatternKind::Posix(PosixPattern::SocketTcp) => {
                 "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
             }
-            PosixPattern::SocketUdp => {
+            PatternKind::Posix(PosixPattern::SocketUdp) => {
                 "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
             }
-            PosixPattern::Bind => {
+            PatternKind::Posix(PosixPattern::Bind) => {
                 // Two-phase: start-bind + finish-bind
                 format!(
                     "// WASI: two-phase bind\n{{\n  wasi_socket_tcp_start_bind({}, {});\n  wasi_socket_tcp_finish_bind({});\n}}",
@@ -152,7 +174,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Listen => {
+            PatternKind::Posix(PosixPattern::Listen) => {
                 // Two-phase: start-listen + finish-listen
                 // listen(fd, backlog) — arg0=fd(socket), arg1=backlog
                 format!(
@@ -162,7 +184,7 @@ impl Transformer {
                     Self::extract_first_arg(m)   // socket fd again
                 )
             }
-            PosixPattern::Connect => {
+            PatternKind::Posix(PosixPattern::Connect) => {
                 // Two-phase: start-connect + finish-connect
                 format!(
                     "// WASI: two-phase connect\n{{\n  wasi_socket_tcp_start_connect({}, {});\n  wasi_socket_tcp_finish_connect({});\n}}",
@@ -171,14 +193,14 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Accept => {
+            PatternKind::Posix(PosixPattern::Accept) => {
                 // Wrap in poll loop
                 format!(
                     "// WASI: accept with poll loop\n{{\n  wasi_socket_tcp_accept_result_t result;\n  do {{\n    result = wasi_socket_tcp_accept({});\n    if (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK) {{\n      wasi_poll_pollable_block(pollable);\n    }}\n  }} while (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK);\n  /* accepted socket in result.val */\n}}",
                     Self::extract_first_arg(m)
                 )
             }
-            PosixPattern::Recv => {
+            PatternKind::Posix(PosixPattern::Recv) => {
                 format!(
                     "wasi_input_stream_read({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -186,7 +208,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Send => {
+            PatternKind::Posix(PosixPattern::Send) => {
                 format!(
                     "wasi_output_stream_write({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -194,23 +216,23 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::GetHostByName => {
+            PatternKind::Posix(PosixPattern::GetHostByName) => {
                 format!(
                     "wasi_ip_name_lookup_resolve({})",
                     Self::extract_first_arg(m)
                 )
             }
-            PosixPattern::Close => {
+            PatternKind::Posix(PosixPattern::Close) => {
                 format!("wasi_socket_close({})", Self::extract_first_arg(m))
             }
-            PosixPattern::Fopen => {
+            PatternKind::Posix(PosixPattern::Fopen) => {
                 format!(
                     "wasi_filesystem_open({}, {})",
                     Self::extract_first_arg(m),
                     Self::extract_second_arg(m)
                 )
             }
-            PosixPattern::Fread => {
+            PatternKind::Posix(PosixPattern::Fread) => {
                 format!(
                     "wasi_filesystem_read({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -218,7 +240,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Fwrite => {
+            PatternKind::Posix(PosixPattern::Fwrite) => {
                 format!(
                     "wasi_filesystem_write({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -226,30 +248,38 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Fclose => {
-                format!(
-                    "wasi_filesystem_close({})",
-                    Self::extract_first_arg(m)
-                )
+            PatternKind::Posix(PosixPattern::Fclose) => {
+                format!("wasi_filesystem_close({})", Self::extract_first_arg(m))
             }
-            // These should not reach here (NotTransformable patterns)
+            // Rust variants (handled by RustTransformer in M3.C4) and
+            // NotTransformable Posix patterns (should not reach here)
+            // are caught by the catch-all and emit an empty string.
             _ => String::new(),
         }
     }
 
     /// Extract the first argument from a call via arg_nodes (avoids comma-re-parsing bugs).
     fn extract_first_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.first().cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 
     /// Extract the second argument from a call via arg_nodes.
     fn extract_second_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.get(1).cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 
     /// Extract the third argument from a call via arg_nodes.
     fn extract_third_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.get(2).cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 }
 
@@ -269,14 +299,19 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::SocketTcp,
+            pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert_eq!(result.manual_review.len(), 0);
         assert!(result.transformed_source.contains("wasi_socket_tcp_create"));
@@ -294,14 +329,15 @@ int main() {
         let call_end = source.find("timeout);").unwrap() + 9; // include "timeout);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Poll,
+            pattern: PatternKind::Posix(PosixPattern::Poll),
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
             transformability: Transformability::NotTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 0);
         assert_eq!(result.manual_review.len(), 1);
     }
@@ -318,17 +354,26 @@ int main() {
         let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
-            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_bind"));
     }
 
     #[test]
@@ -343,17 +388,26 @@ int main() {
         let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Connect,
+            pattern: PatternKind::Posix(PosixPattern::Connect),
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
-            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_connect"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_connect"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_connect"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_connect"));
     }
 
     #[test]
@@ -368,14 +422,20 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Recv,
+            pattern: PatternKind::Posix(PosixPattern::Recv),
             snippet: "recv(fd, buf, len, 0)".to_string(),
-            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "buf".to_string(),
+                "len".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_input_stream_read"));
     }
@@ -392,16 +452,24 @@ int main() {
         let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Send,
+            pattern: PatternKind::Posix(PosixPattern::Send),
             snippet: "send(fd, buf, len, 0)".to_string(),
-            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "buf".to_string(),
+                "len".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_output_stream_write"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_output_stream_write"));
     }
 
     #[test]
@@ -416,37 +484,46 @@ int main() {
         let call_end = source.find("NULL);").unwrap() + 6; // include "NULL);"
         let matches = vec![PatternMatch {
             line: 3,
+            column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Accept,
+            pattern: PatternKind::Posix(PosixPattern::Accept),
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
             transformability: Transformability::BestEffort,
         }];
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
-        assert!(result.transformed_source.contains("wasi_poll_pollable_block"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_poll_pollable_block"));
     }
 
     #[test]
     fn test_extract_first_arg() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::SocketTcp,
+            pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         };
         assert_eq!(Transformer::extract_first_arg(&m), "AF_INET");
 
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -458,9 +535,10 @@ int main() {
     fn test_extract_second_arg() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -469,9 +547,10 @@ int main() {
 
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Listen,
+            pattern: PatternKind::Posix(PosixPattern::Listen),
             snippet: "listen(fd, 128)".to_string(),
             arg_nodes: vec!["fd".to_string(), "128".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -484,9 +563,10 @@ int main() {
     fn test_extract_arg_with_comma_in_string_literal() {
         let m = PatternMatch {
             line: 0,
+            column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Fopen,
+            pattern: PatternKind::Posix(PosixPattern::Fopen),
             snippet: r#"fopen("foo,bar", "r")"#.to_string(),
             arg_nodes: vec![r#"foo,bar"#.to_string(), r#""r""#.to_string()],
             transformability: Transformability::AutoTransformable,
@@ -512,30 +592,54 @@ int main() {
 "#;
         let mut analyzer = crate::analyzer::CAnalyzer::new();
         let matches = analyzer.analyze(source);
-        let result = Transformer::transform(source, matches);
+        let result = Transformer::transform(source, matches, None);
 
         // Smoke checks: key WASI markers must be present
         assert!(result.transformed_source.contains("wasi_socket_tcp_create"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_listen"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_listen"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
 
         // Original POSIX calls must NOT be present
-        assert!(!result.transformed_source.contains("socket(AF_INET"), "socket(AF_INET still present");
-        assert!(!result.transformed_source.contains("bind(fd, (struct sockaddr*)&addr"), "bind original still present");
-        assert!(!result.transformed_source.contains("listen(fd, 128)"), "listen original still present");
-        assert!(!result.transformed_source.contains("accept(fd, NULL, NULL)"), "accept original still present");
+        assert!(
+            !result.transformed_source.contains("socket(AF_INET"),
+            "socket(AF_INET still present"
+        );
+        assert!(
+            !result
+                .transformed_source
+                .contains("bind(fd, (struct sockaddr*)&addr"),
+            "bind original still present"
+        );
+        assert!(
+            !result.transformed_source.contains("listen(fd, 128)"),
+            "listen original still present"
+        );
+        assert!(
+            !result.transformed_source.contains("accept(fd, NULL, NULL)"),
+            "accept original still present"
+        );
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
         // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
         // since WASI SDK is only available in the server-side build environment (Phase 6).
         if std::env::var("EDGE_TEST_CLANG").is_ok()
-            && std::process::Command::new("clang").arg("--version").output().is_ok()
+            && std::process::Command::new("clang")
+                .arg("--version")
+                .output()
+                .is_ok()
         {
             let pid = std::process::id();
             let tmp_path = std::env::temp_dir().join(format!("edge_migrate_test_{}.c", pid));
-            std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
+            std::fs::write(&tmp_path, &result.transformed_source)
+                .expect("write transformed source");
             let output = std::process::Command::new("clang")
                 .args(["-fsyntax-only", "-Werror", tmp_path.to_str().unwrap()])
                 .output()

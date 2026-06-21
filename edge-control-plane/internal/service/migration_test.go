@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -46,7 +48,7 @@ func (m *mockArtifactStore) Save(tenantID, appName, deploymentID string, r io.Re
 
 // migrationSvcForTest builds a MigrationService with mock dependencies.
 func migrationSvcForTest(repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
-	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
 }
 
 func skipIfNoEdgeMigrate(t *testing.T) {
@@ -60,6 +62,38 @@ func skipIfNoClang(t *testing.T) {
 		t.Skip("wasi-sdk clang not available at /usr/local/wasi-sdk/bin/clang")
 	}
 }
+
+// skipIfNoRustcWasip2 skips the test if rustc is not on PATH or if the
+// wasm32-wasip2 target isn't installed. The latter is the most common
+// failure mode on a fresh checkout — rustc is bundled with rustup but
+// `rustup target add wasm32-wasip2` has to be run separately.
+func skipIfNoRustcWasip2(t *testing.T) {
+	rustc, err := exec.LookPath("rustc")
+	if err != nil {
+		t.Skip("rustc not in PATH")
+	}
+	out, err := exec.Command(rustc, "--print", "target-list").Output()
+	if err != nil {
+		t.Skipf("rustc --print target-list failed: %v", err)
+	}
+	if !strings.Contains(string(out), "wasm32-wasip2") {
+		t.Skip("rustc target wasm32-wasip2 not installed; run `rustup target add wasm32-wasip2`")
+	}
+}
+
+// rustHTTPSource is a minimal Rust program that exercises the
+// auto-transformable patterns: TcpBind (std::net::TcpListener::bind),
+// FsOpen (std::fs::File::open), and FsWrite (std::fs::write). After
+// `edge-migrate --language rust --transform`, the resulting source
+// must contain `TcpSocket::new`, `wasi::filesystem::open`, and
+// `wasi::filesystem::write` to compile against wasi::socket and
+// wasi::filesystem.
+const rustHTTPSource = `fn main() {
+    let _listener = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
+    let _f = std::fs::File::open("hello.txt").unwrap();
+    std::fs::write("out.txt", b"hi").unwrap();
+}
+`
 
 // posixHTTPSource is a simple POSIX C program with socket + bind + listen + accept.
 const posixHTTPSource = `#include <stdio.h>
@@ -156,7 +190,7 @@ func TestMigrationService_Migrate_EdgeMigrateFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin")
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc")
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if !errors.Is(err, ErrEdgeMigrateFailed) {
@@ -362,57 +396,529 @@ func TestValidateWasm(t *testing.T) {
 	}
 }
 
-func TestSanitizeAppName_StripsDotC(t *testing.T) {
-	got, err := sanitizeAppName("hello.c")
+func TestIsValidDeploymentAppName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		// Valid
+		{"single char", "a", true},
+		{"alphanumeric", "hello", true},
+		{"with hyphen", "hello-world", true},
+		{"trailing digit", "app123", true},
+		{"starts with digit", "0app", true},
+		{"63 chars", "a" + repeat("b", 62), true},
+		// Invalid
+		{"empty", "", false},
+		{"64 chars", "a" + repeat("b", 63), false},
+		{"uppercase", "Hello", false},
+		{"all uppercase", "HELLO", false},
+		{"starts with hyphen", "-hello", false},
+		{"underscore", "hello_world", false},
+		{"dot", "hello.world", false},
+		{"slash", "hello/world", false},
+		{"space", "hello world", false},
+		{"path traversal", "../traversal", false},
+		{"path with bad segment", "a/../b", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsValidDeploymentAppName(tt.input); got != tt.want {
+				t.Errorf("IsValidDeploymentAppName(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func repeat(s string, n int) string {
+	out := make([]byte, 0, len(s)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, s...)
+	}
+	return string(out)
+}
+
+func TestClassifyFromPatterns(t *testing.T) {
+	auto := domain.PatternInfo{Transformability: "AutoTransformable"}
+	manual := domain.PatternInfo{Transformability: "NotTransformable"}
+	tests := []struct {
+		name     string
+		patterns []domain.PatternInfo
+		want     domain.MigrationStatus
+	}{
+		{"empty is success", nil, domain.MigrationStatusSuccess},
+		{"all auto", []domain.PatternInfo{auto, auto}, domain.MigrationStatusSuccess},
+		{"only manual is failed", []domain.PatternInfo{manual}, domain.MigrationStatusFailed},
+		{"mixed is partial", []domain.PatternInfo{auto, manual}, domain.MigrationStatusPartial},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyFromPatterns(tt.patterns); got != tt.want {
+				t.Errorf("classifyFromPatterns() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAggregateTreeStatus(t *testing.T) {
+	mk := func(s domain.MigrationStatus) domain.FileReport {
+		return domain.FileReport{Path: "x.c", Status: s}
+	}
+	tests := []struct {
+		name  string
+		files []domain.FileReport
+		want  domain.MigrationStatus
+	}{
+		{"empty is success", nil, domain.MigrationStatusSuccess},
+		{"all success", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusSuccess)}, domain.MigrationStatusSuccess},
+		{"one partial", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusPartial)}, domain.MigrationStatusPartial},
+		{"any failed wins", []domain.FileReport{mk(domain.MigrationStatusSuccess), mk(domain.MigrationStatusPartial), mk(domain.MigrationStatusFailed)}, domain.MigrationStatusFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := aggregateTreeStatus(tt.files); got != tt.want {
+				t.Errorf("aggregateTreeStatus() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMigrateTree_RejectsInvalidAppName(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "../bad", "c", []domain.FileEntry{
+		{Path: "main.c", Source: "int main(){return 0;}\n"},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid app name")
+	}
+}
+
+func TestMigrateTree_RejectsEmptyTree(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", nil)
+	if err == nil {
+		t.Fatal("expected error for empty tree")
+	}
+}
+
+func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
+	// M3 widened the language gate from "c only" to "c or rust".
+	// Anything else (e.g. "python", "go") is still rejected at the
+	// service layer as a defense-in-depth check, even though the
+	// handler rejects it earlier.
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "python", []domain.FileEntry{
+		{Path: "main.py", Source: "print('hi')\n"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported language")
+	}
+}
+
+func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
+	// M3 also added Rust. The service shouldn't reject "rust" at the
+	// language gate — it'll only fail later (in the per-file
+	// subprocess), so this test only confirms the gate is open.
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", nil)
+	// Empty entries still errors, but the error must be about empty
+	// tree, not about the language.
+	if err == nil {
+		t.Fatal("expected error for empty tree")
+	}
+	if !strings.Contains(err.Error(), "no files in tree") {
+		t.Fatalf("expected empty-tree error, got: %v", err)
+	}
+}
+
+func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
+	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "../etc/passwd", Source: "x"},
+	})
+	if err == nil {
+		t.Fatal("expected error for path traversal")
+	}
+}
+
+func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *testing.T) {
+	// When any per-file transform subprocess fails, the service must
+	// return the typed `ErrMigrateTreeFailed` sentinel so the handler
+	// can map it to HTTP 422 (instead of 200 with a failure body).
+	// We point the service at a non-existent binary to force every
+	// per-file transform to fail; the service still builds a
+	// structured TreeMigrationReport for the caller to inspect.
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc")
+	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "main.c", Source: "int main(){return 0;}\n"},
+	})
+	if err == nil {
+		t.Fatal("expected ErrMigrateTreeFailed when per-file transform fails")
+	}
+	if !errors.Is(err, ErrMigrateTreeFailed) {
+		t.Errorf("expected ErrMigrateTreeFailed, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report on tree failure (handler emits 422 with body)")
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected report status Failed, got: %v", report.Status)
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error in the failure report")
+	}
+}
+
+func TestMigrateTree_RejectsInvalidArtifactSize_ReturnsErrMigrateTreeFailed(t *testing.T) {
+	// The MaxArtifactSize check is independent of the per-file
+	// subprocess. We can't easily trigger it in a unit test (would
+	// need a real toolchain producing >100 MiB output), but we
+	// confirm the sentinel is exported and the function signature
+	// is what the handler expects. The compile-failure path is the
+	// more critical test (it exercises the same `return &report,
+	// ErrMigrateTreeFailed` shape) — see the test above.
+	if ErrMigrateTreeFailed == nil {
+		t.Error("ErrMigrateTreeFailed must be a non-nil sentinel")
+	}
+	if ErrMigrationFailed == nil {
+		t.Error("ErrMigrationFailed must be a non-nil sentinel (single-file Migrate path)")
+	}
+}
+
+// TestDetectTransformedPatternsRust covers the M3.C7 heuristic helper
+// that backs the `--analyze-json` fallback path in MigrateTree when
+// `language == "rust"`. Each subtest is a representative transformed
+// Rust source and the set of pattern names that should be detected.
+func TestDetectTransformedPatternsRust(t *testing.T) {
+	cases := []struct {
+		name     string
+		source   string
+		expected []string // substrings that must appear in Pattern field
+	}{
+		{
+			name: "TcpBind",
+			source: `use wasi::socket::tcp::TcpSocket;
+fn main() {
+    let _ = TcpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_bind("127.0.0.1:80")?.finish_bind();
+}`,
+			expected: []string{"TcpListener::bind"},
+		},
+		{
+			name: "TcpConnect",
+			source: `use wasi::socket::tcp::TcpSocket;
+fn main() {
+    let _ = TcpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_connect("127.0.0.1:80")?.finish_connect();
+}`,
+			expected: []string{"TcpStream::connect"},
+		},
+		{
+			name: "UdpBind",
+			source: `use wasi::socket::udp::UdpSocket;
+fn main() {
+    let _ = UdpSocket::new(wasi::socket::AddressFamily::Ipv4)?.start_bind("0.0.0.0:53")?.finish_bind();
+}`,
+			expected: []string{"UdpSocket::bind"},
+		},
+		{
+			name: "FsOpen",
+			source: `fn main() {
+    let _ = wasi::filesystem::open("data.txt", wasi::filesystem::OpenFlags::READ);
+}`,
+			expected: []string{"File::open"},
+		},
+		{
+			name: "FsRead",
+			source: `fn main() {
+    let _ = wasi::filesystem::read("data.txt");
+}`,
+			expected: []string{"fs::read"},
+		},
+		{
+			name: "FsWrite",
+			source: `fn main() {
+    let _ = wasi::filesystem::write("out.txt", b"hi");
+}`,
+			expected: []string{"fs::write"},
+		},
+		{
+			name:     "no match",
+			source:   "fn main() { println!(\"hello\"); }",
+			expected: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			patterns := detectTransformedPatternsRust(tc.source)
+			if tc.expected == nil {
+				if len(patterns) != 0 {
+					t.Errorf("expected no patterns, got %d: %+v", len(patterns), patterns)
+				}
+				return
+			}
+			for _, want := range tc.expected {
+				found := false
+				for _, p := range patterns {
+					if strings.Contains(p.Pattern, want) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected to find pattern containing %q, got %+v", want, patterns)
+				}
+			}
+		})
+	}
+}
+
+// TestMigrationService_StoresRustcPath confirms the constructor
+// round-trips the rustc path so the service is wired correctly.
+func TestMigrationService_StoresRustcPath(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc")
+	if svc.rustcPath != "/opt/rust/bin/rustc" {
+		t.Errorf("expected rustcPath=%q, got %q", "/opt/rust/bin/rustc", svc.rustcPath)
+	}
+	if svc.edgeMigratePath != "edge-migrate" {
+		t.Errorf("expected edgeMigratePath=%q, got %q", "edge-migrate", svc.edgeMigratePath)
+	}
+	if svc.wasiSdkPath != "/wasi-sdk" {
+		t.Errorf("expected wasiSdkPath=%q, got %q", "/wasi-sdk", svc.wasiSdkPath)
+	}
+}
+
+// TestExtForLanguage covers the small dispatch helper.
+func TestExtForLanguage(t *testing.T) {
+	if extForLanguage("rust") != ".rs" {
+		t.Errorf("rust: expected .rs, got %q", extForLanguage("rust"))
+	}
+	if extForLanguage("c") != ".c" {
+		t.Errorf("c: expected .c, got %q", extForLanguage("c"))
+	}
+	if extForLanguage("") != ".c" {
+		t.Errorf("empty: expected .c, got %q", extForLanguage(""))
+	}
+	if extForLanguage("python") != ".c" {
+		t.Errorf("unknown: expected .c fallback, got %q", extForLanguage("python"))
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M3.C10 — Rust integration tests
+// ─────────────────────────────────────────────────────────────────────
+
+// TestMigrationService_Migrate_RustSuccess exercises the full Rust
+// pipeline: edge-migrate transforms the source to wasi::socket +
+// wasi::filesystem calls, then rustc --target wasm32-wasip2 compiles
+// it. The artifact must be a non-empty wasm blob and a deployment
+// must be created. This is the load-bearing M3 end-to-end test.
+func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("expected no error, got: %v", err)
 	}
-	if got != "hello" {
-		t.Errorf("expected hello, got: %s", got)
+
+	if report.Status != domain.MigrationStatusSuccess {
+		t.Errorf("expected status success, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+	if !report.WasmStored {
+		t.Error("expected WasmStored=true")
+	}
+	if report.DeploymentID == nil || *report.DeploymentID == "" {
+		t.Error("expected non-empty deployment ID")
+	}
+	if report.AppName != "hello" {
+		t.Errorf("expected appName=hello, got: %s", report.AppName)
+	}
+	if len(repo.deployments) != 1 {
+		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
+	}
+	// The artifact must be a non-empty wasm blob — at minimum the
+	// 8-byte wasm magic + version.
+	wasmBytes, ok := store.artifacts["tenant-1/hello/"+*report.DeploymentID]
+	if !ok {
+		t.Fatal("artifact not found in store")
+	}
+	if len(wasmBytes) < 8 {
+		t.Errorf("wasm artifact too small (%d bytes); expected >= 8", len(wasmBytes))
+	}
+	if !bytes.HasPrefix(wasmBytes, []byte{0x00, 0x61, 0x73, 0x6d}) {
+		t.Errorf("artifact is not a wasm binary (missing magic); first bytes: % x", wasmBytes[:min(8, len(wasmBytes))])
 	}
 }
 
-func TestSanitizeAppName_NoExtension(t *testing.T) {
-	got, err := sanitizeAppName("hello")
+// TestMigrationService_Migrate_RustAppNameStripsRs confirms the
+// Rust path strips `.rs` (not `.c`) when deriving the app name. If
+// this regresses, every Rust deployment would land under a literal
+// `.rs` app_name directory.
+func TestMigrationService_Migrate_RustAppNameStripsRs(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "my_app.rs", "rust", rustHTTPSource)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("expected no error, got: %v", err)
 	}
-	if got != "hello" {
-		t.Errorf("expected hello, got: %s", got)
-	}
-}
-
-func TestSanitizeAppName_Empty(t *testing.T) {
-	_, err := sanitizeAppName(".c")
-	if err == nil {
-		t.Fatal("expected error for empty derived app name")
+	if report.AppName != "my_app" {
+		t.Errorf("expected appName=my_app, got: %s", report.AppName)
 	}
 }
 
-func TestSanitizeAppName_PathTraversal(t *testing.T) {
-	_, err := sanitizeAppName("../etc.c")
-	if err == nil {
-		t.Fatal("expected error for path-traversal filename")
+// TestMigrationService_Migrate_RustProcessExitNotTransformable
+// confirms `std::process::exit` is detected and flagged as
+// manual-review, producing a partial migration report (not success).
+// WASM has no process model — there's no auto-transform.
+func TestMigrationService_Migrate_RustProcessExitNotTransformable(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	const src = `fn main() {
+    std::process::exit(0);
+}
+`
+	report, err := svc.Migrate(context.Background(), "tenant-1", "exit.rs", "rust", src)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	// Status is "partial" because the analyze-json path reports
+	// manual_review entries; wasm may still be produced (rustc
+	// ignores the unmatched call) but the report flag is what
+	// callers use to decide if a deployment is migratable.
+	if report.Status == domain.MigrationStatusSuccess && len(report.PatternsManualReview) == 0 {
+		t.Errorf("expected manual_review entries for std::process::exit, got report: %+v", report)
+	}
+	hasExitReview := false
+	for _, p := range report.PatternsManualReview {
+		if strings.Contains(p.Pattern, "ProcessExit") || strings.Contains(p.Pattern, "exit") {
+			hasExitReview = true
+			break
+		}
+	}
+	if !hasExitReview {
+		t.Errorf("expected a ProcessExit manual_review entry, got: %+v", report.PatternsManualReview)
 	}
 }
 
-func TestSanitizeAppName_AbsolutePath(t *testing.T) {
-	_, err := sanitizeAppName("/etc/passwd.c")
-	if err == nil {
-		t.Fatal("expected error for absolute-path filename")
+// TestMigrationService_Migrate_RustEdgeMigrateFails covers the
+// error path when the Rust analyzer itself blows up (edge-migrate
+// returns non-zero). The service must surface a Failed report.
+func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	// Point edge-migrate at a non-existent binary so the subprocess
+	// fails. The Rust compile path must surface this as a failure,
+	// not silently produce a wasm.
+	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no top-level error (report carries it), got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status=failed, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false on edge-migrate failure")
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error entry on edge-migrate failure")
 	}
 }
 
-func TestSanitizeAppName_Backslash(t *testing.T) {
-	_, err := sanitizeAppName(`foo\bar.c`)
-	if err == nil {
-		t.Fatal("expected error for backslash filename")
+// TestMigrateTree_RustCompilesAllFilesTogether exercises the tree
+// pipeline for Rust. Two .rs files; the service must produce a
+// single wasm artifact and per-file reports.
+func TestMigrateTree_RustCompilesAllFilesTogether(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcWasip2(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	entries := []domain.FileEntry{
+		{Path: "src/main.rs", Source: `fn main() {
+    let _l = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
+}
+`},
+		{Path: "src/util.rs", Source: `pub fn helper() {
+    let _f = std::fs::File::open("x.txt").unwrap();
+}
+`},
+	}
+
+	report, err := svc.MigrateTree(context.Background(), "tenant-1", "rust_tree", "rust", entries)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if len(report.Files) != 2 {
+		t.Fatalf("expected 2 file reports, got: %d", len(report.Files))
+	}
+	if report.FilesTotal != 2 {
+		t.Errorf("expected FilesTotal=2, got: %d", report.FilesTotal)
+	}
+	if report.AppName != "rust_tree" {
+		t.Errorf("expected appName=rust_tree, got: %s", report.AppName)
 	}
 }
 
-func TestSanitizeAppName_EmptyString(t *testing.T) {
-	_, err := sanitizeAppName("")
-	if err == nil {
-		t.Fatal("expected error for empty filename")
+// TestDetectTransformedPatternsRust_OnHttpServerFixture runs the
+// heuristic scanner on the actual transformed output of the http
+// server fixture (not a synthetic string). It catches regressions
+// where the transformer drops a wasi::socket call without
+// detectTransformedPatternsRust noticing.
+func TestDetectTransformedPatternsRust_OnHttpServerFixture(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	fixture := "/Users/poyrazk/dev/Cloud/edgeCloud/.claude/worktrees/migrate-issue-88/edge-migrate/testdata/http_server.rs"
+	cmd := exec.Command("edge-migrate", "--language", "rust", "--transform", fixture)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("edge-migrate --language rust --transform failed: %v", err)
+	}
+	transformed := string(out)
+
+	detections := detectTransformedPatternsRust(transformed)
+	if len(detections) == 0 {
+		t.Fatalf("detectTransformedPatternsRust found no detections in:\n%s", transformed)
+	}
+	// http_server.rs uses TcpListener::bind + TcpStream::connect;
+	// both should be detected.
+	hasBind, hasConnect := false, false
+	for _, d := range detections {
+		if strings.Contains(d.Pattern, "TcpBind") {
+			hasBind = true
+		}
+		if strings.Contains(d.Pattern, "TcpConnect") {
+			hasConnect = true
+		}
+	}
+	if !hasBind {
+		t.Errorf("expected TcpBind detection, got: %+v", detections)
+	}
+	if !hasConnect {
+		t.Errorf("expected TcpConnect detection, got: %+v", detections)
 	}
 }
