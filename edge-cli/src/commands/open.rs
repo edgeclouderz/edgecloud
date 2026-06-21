@@ -34,12 +34,16 @@ pub fn run(path: &Path, force: bool) -> Result<()> {
     // (the URL staleness follow-up).
     if !force && !state.live_url.is_empty() {
         if let Err(e) = preflight(path, &state) {
-            // Preflight errors are already user-facing — print and exit
-            // non-zero without trying to open a known-bad URL.
+            // Preflight errors are already user-facing — print the
+            // error and the recovery hints, then return Err so main()
+            // exits non-zero. Other commands (rollback, activate,
+            // deploy) follow the same Result<()> contract; calling
+            // std::process::exit here would skip destructors and
+            // bypass main's exit-code path.
             output::error(&format!("{e:#}"));
             output::hint("run `edge rollback` to roll back to the last good deployment");
             output::hint("or run `edge open --force` to open anyway");
-            std::process::exit(1);
+            return Err(e).context("preflight failed");
         }
     }
 
