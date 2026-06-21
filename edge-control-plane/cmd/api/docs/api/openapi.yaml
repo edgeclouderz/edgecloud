@@ -433,6 +433,90 @@ components:
           items:
             $ref: '#/components/schemas/ErrorInfo'
 
+    # FullPatternInfo mirrors the Go PatternInfo struct (line-level detail
+    # with snippet and wasi_equivalent). Used by FileReport in the tree
+    # migration response.
+    FullPatternInfo:
+      type: object
+      properties:
+        line:
+          type: integer
+          example: 42
+        pattern:
+          type: string
+          example: socket
+        snippet:
+          type: string
+          example: int fd = socket(AF_INET, SOCK_STREAM, 0);
+        wasi_equivalent:
+          type: string
+          example: wasi:network/tcp-socket
+        transformability:
+          type: string
+          enum: [auto-transformable, best-effort, not-transformable]
+
+    # FileReport is the per-file result in a tree migration response.
+    FileReport:
+      type: object
+      properties:
+        path:
+          type: string
+          example: src/main.c
+        status:
+          type: string
+          enum: [success, partial, failed]
+        patterns_detected:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        transformations:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        manual_review:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorInfo'
+
+    # TreeMigrationReport is the JSON response returned by POST /api/v1/migrate-tree.
+    TreeMigrationReport:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, partial, failed]
+        wasm_stored:
+          type: boolean
+          example: true
+        deployment_id:
+          type: string
+          nullable: true
+          example: d_abc123
+        app_name:
+          type: string
+          example: hello-world
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileReport'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorInfo'
+        files_total:
+          type: integer
+          example: 5
+        files_transformed:
+          type: integer
+          example: 3
+        files_manual_review:
+          type: integer
+          example: 1
+
     PatternInfo:
       type: object
       properties:
@@ -1185,6 +1269,68 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/migrate-tree:
+    post:
+      operationId: migrateTree
+      summary: Submit a multi-file source tree for auto-transformation and WASI compilation
+      description: |
+        Accepts either a zip archive or multipart parts + JSON manifest
+        containing C or Rust source files. Each file is analyzed for
+        POSIX/WASI migration patterns, auto-transformed where safe, and
+        compiled to a WebAssembly component. The resulting artifact is
+        stored and a deployment record is created.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [tree, app_name, language]
+              properties:
+                app_name:
+                  type: string
+                  pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+                  description: Unique app name (alphanumeric, hyphens, 1-63 chars).
+                  example: my-app
+                language:
+                  type: string
+                  enum: [c, rust]
+                  description: Source language.
+                tree:
+                  type: string
+                  format: binary
+                  description: |
+                    Either a zip archive (Content-Type application/zip) or a
+                    JSON manifest `{"files":["path1","path2",...]}` referencing
+                    individual `file` parts. Zip is the recommended format.
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    One `file` part per entry in the tree manifest. Required
+                    when `tree` is a JSON manifest. Ignored when `tree` is zip.
+      responses:
+        '200':
+          description: Tree migration report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeMigrationReport'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Request body too large.
+        '422':
+          description: Migration failed (source errors or compile failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeMigrationReport'
         '500':
           $ref: '#/components/responses/InternalError'
 
