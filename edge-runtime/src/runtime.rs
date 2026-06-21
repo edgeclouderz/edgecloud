@@ -100,7 +100,7 @@ impl RuntimeState {
         }
     }
 
-/// Create a RuntimeState with per-app environment variables, log sink,
+    /// Create a RuntimeState with per-app environment variables, log sink,
     /// and app context for tenant isolation. `log_sink` receives every record
     /// emitted by `edge:observe.emit_log`; `app_ctx` is stamped onto each
     /// forwarded record so downstream sinks know the tenant/app/deployment.
@@ -745,10 +745,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn egress_check_returns_403_in_fetch() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),
@@ -779,10 +781,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn egress_check_denies_non_allowlisted_host() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),
@@ -805,10 +809,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn hard_deny_loopback_returns_403_even_with_star_allowlist() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec!["*".to_string()]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),

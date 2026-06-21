@@ -205,7 +205,6 @@ impl Supervisor {
                 max_memory_mb,
                 epoch_deadline_ticks,
                 health_check_timeout_secs,
-                tenant_id_str,
                 allowlist,
                 log_forwarder,
             )
@@ -328,7 +327,6 @@ impl Supervisor {
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
-        tenant_id: String,
         allowlist: Vec<String>,
         log_forwarder: Arc<LogForwarder>,
     ) {
@@ -361,7 +359,6 @@ impl Supervisor {
                         env.clone(),
                         max_memory_mb,
                         epoch_deadline_ticks,
-                        &tenant_id,
                         allowlist.clone(),
                         &app_name,
                         &log_forwarder,
@@ -444,13 +441,13 @@ impl Supervisor {
     /// Returns `Ok(true)` if the component wants to keep running (blocking call
     /// returned normally). Returns `Ok(false)` if the guest explicitly called
     /// `process.exit`. Returns `Err` on a wasm trap/error.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_app(
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
         env: HashMap<String, String>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
-        tenant_id: &str,
         allowlist: Vec<String>,
         app_name: &str,
         log_forwarder: &Arc<LogForwarder>,
@@ -476,7 +473,6 @@ impl Supervisor {
             Some(Arc::clone(meter)),
             log_forwarder.clone(),
             app_ctx,
-            tenant_id.to_string(),
             egress,
         );
 
