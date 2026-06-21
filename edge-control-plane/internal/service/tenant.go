@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -10,6 +12,40 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 )
+
+// MaxEgressAllowlistEntries is the maximum number of entries a tenant may specify.
+const MaxEgressAllowlistEntries = 50
+
+// hostnameRe accepts a plain hostname or FQDN: alphanumeric labels separated
+// by dots, hyphens allowed in the interior of each label.
+var hostnameRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$`)
+
+// validateEgressAllowlist returns an error if any entry is malformed.
+// Accepted forms: "foo.example.com" or "*.example.com" (one wildcard label).
+// The bare "*" sentinel is rejected so tenants cannot bypass enforcement.
+func validateEgressAllowlist(entries []string) error {
+	if len(entries) > MaxEgressAllowlistEntries {
+		return fmt.Errorf("allowlist exceeds maximum of %d entries", MaxEgressAllowlistEntries)
+	}
+	for _, e := range entries {
+		if e == "*" {
+			return fmt.Errorf("wildcard-only entry %q is not allowed; use a hostname or *.suffix pattern", e)
+		}
+		host := e
+		if strings.HasPrefix(e, "*.") {
+			host = e[2:]
+			if !strings.Contains(host, ".") {
+				return fmt.Errorf("wildcard entry %q must have at least two labels after *. (e.g. *.example.com)", e)
+			}
+		} else if strings.ContainsAny(e, "*/") || strings.HasPrefix(e, "http") {
+			return fmt.Errorf("entry %q must be a plain hostname or *.suffix (no scheme, no path, no slash)", e)
+		}
+		if !hostnameRe.MatchString(host) {
+			return fmt.Errorf("entry %q is not a valid hostname", e)
+		}
+	}
+	return nil
+}
 
 // TenantServiceInterface abstracts tenant operations for testing.
 type TenantServiceInterface interface {
@@ -151,4 +187,37 @@ func (s *TenantService) UpdateTenant(ctx context.Context, t *domain.Tenant) erro
 
 func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {
 	return s.tenantRepo.Delete(ctx, id)
+}
+
+// GetEgressAllowlist returns the current outbound allowlist for a tenant.
+// Returns an empty slice (not nil) when no allowlist is configured (allow-all).
+func (s *TenantService) GetEgressAllowlist(ctx context.Context, tenantID string) ([]string, error) {
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return nil, fmt.Errorf("tenant not found")
+	}
+	if len(tenant.AllowlistedDestinations) == 0 {
+		return []string{}, nil
+	}
+	return []string(tenant.AllowlistedDestinations), nil
+}
+
+// UpdateEgressAllowlist replaces the tenant's outbound allowlist after validation.
+// Passing an empty slice clears the list (restores allow-all behaviour).
+func (s *TenantService) UpdateEgressAllowlist(ctx context.Context, tenantID string, allowlist []string) error {
+	if err := validateEgressAllowlist(allowlist); err != nil {
+		return err
+	}
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return fmt.Errorf("tenant not found")
+	}
+	tenant.AllowlistedDestinations = pq.StringArray(allowlist)
+	return s.tenantRepo.Update(ctx, tenant)
 }

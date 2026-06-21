@@ -93,6 +93,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -134,6 +135,8 @@ func main() {
 	api.HandleFunc("GET /api/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/keys/{keyID}", apiKeyHandler.Delete)
+	api.HandleFunc("GET /api/egress", egressHandler.Get)
+	api.HandleFunc("PUT /api/egress", egressHandler.Update)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
