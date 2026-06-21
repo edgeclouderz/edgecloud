@@ -182,12 +182,20 @@ impl CAnalyzer {
 
         let pattern = match func_name {
             "socket" => {
-                // Check if we can determine TCP vs UDP from arguments
+                // Check if we can determine TCP vs UDP from arguments.
+                // The POSIX signature is `socket(int domain, int type, int protocol)`
+                // so the type token (SOCK_STREAM / SOCK_DGRAM) is the
+                // SECOND argument. The previous version inspected the
+                // first arg because `get_call_args` returned the entire
+                // argument list as a single string (so the first "arg"
+                // was actually `(AF_INET, SOCK_STREAM, 0)`); that hack
+                // stopped working once `get_call_args` started returning
+                // individual args.
                 let args = self.get_call_args(source, node);
-                let p = if let Some(first_arg) = args.first() {
-                    if first_arg.contains("SOCK_STREAM") {
+                let p = if let Some(type_arg) = args.get(1) {
+                    if type_arg.contains("SOCK_STREAM") {
                         PosixPattern::SocketTcp
-                    } else if first_arg.contains("SOCK_DGRAM") {
+                    } else if type_arg.contains("SOCK_DGRAM") {
                         PosixPattern::SocketUdp
                     } else {
                         PosixPattern::SocketTcp // default to TCP
@@ -264,17 +272,37 @@ impl CAnalyzer {
 
     fn get_call_args(&self, source: &str, node: tree_sitter::Node) -> Vec<String> {
         let mut args = Vec::new();
-        // The call_expression structure: function arg1 arg2 ...
-        // child(0) = function, child(1..) = arguments
-        let _cursor = node.walk();
-        for i in 1..node.child_count() {
-            if let Some(arg_node) = node.child(i) {
-                let arg_text = arg_node
-                    .utf8_text(source.as_bytes())
-                    .unwrap_or("")
-                    .to_string();
-                args.push(arg_text);
+        // tree-sitter's C grammar structures a `call_expression` as:
+        //   child(0): the function expression (e.g. `accept`)
+        //   child(1): an `argument_list` node wrapping the parenthesized
+        //             arg list (e.g. `(fd, NULL, NULL)`)
+        //
+        // The previous version of this function iterated over
+        // `call_expression` children starting at index 1 and pushed the
+        // entire `argument_list` node (including its outer parens) as a
+        // single string. The transformer then emitted calls like
+        // `wasi_socket_tcp_accept((fd, NULL, NULL))` — the leading `(` is
+        // the original POSIX call's outer paren. Walk into the
+        // `argument_list` node and skip its `(` / `)` / `,` punctuation
+        // children so each emitted arg is a single C expression.
+        let Some(arg_list_node) = node.child(1) else {
+            return args;
+        };
+        if arg_list_node.kind() != "argument_list" {
+            return args;
+        }
+        for i in 0..arg_list_node.child_count() {
+            let Some(arg_node) = arg_list_node.child(i) else {
+                continue;
+            };
+            if matches!(arg_node.kind(), "(" | ")" | ",") {
+                continue;
             }
+            let arg_text = arg_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            args.push(arg_text);
         }
         args
     }
@@ -545,5 +573,56 @@ int main(void) {
             .expect("socket match should be present");
         let col = socket_match.column.expect("column must be populated");
         assert_eq!(col, 13, "expected column 13, got {}", col);
+    }
+
+    #[test]
+    fn test_get_call_args_extracts_individual_arguments() {
+        // Regression test for the pre-fix `get_call_args` bug: the
+        // old version returned the entire argument list as a single
+        // string, so a call like `bind(fd, (struct sockaddr*)&addr,
+        // sizeof(addr))` produced `arg_nodes = ["(fd, (struct
+        // sockaddr*)&addr, sizeof(addr))"]` — including the outer
+        // parens. The transformer then emitted calls like
+        // `wasi_socket_tcp_start_bind((fd, ...), ...)` with extra
+        // parens that the clang syntax check would reject.
+        let mut analyzer = CAnalyzer::new();
+        let source = "int main() {\n    bind(fd, (struct sockaddr*)&addr, sizeof(addr));\n}\n";
+        let matches = analyzer.analyze(source);
+        let bind_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::Bind)))
+            .expect("bind match should be present");
+        assert_eq!(
+            bind_match.arg_nodes,
+            vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
+            "arg_nodes must hold three individual C expressions, \
+             NOT a single string containing the outer parens"
+        );
+    }
+
+    #[test]
+    fn test_get_call_args_three_arg_socket_call() {
+        // `socket(AF_INET, SOCK_STREAM, 0)` — three primitive args.
+        // Each should be returned verbatim with no leading/trailing
+        // parens or commas.
+        let mut analyzer = CAnalyzer::new();
+        let source = "int main() {\n    int fd = socket(AF_INET, SOCK_STREAM, 0);\n}\n";
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)))
+            .expect("socket match should be present");
+        assert_eq!(
+            socket_match.arg_nodes,
+            vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ]
+        );
     }
 }

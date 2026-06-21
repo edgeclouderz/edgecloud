@@ -6,7 +6,6 @@
 use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::PreprocessorInfo;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 
 /// A single transformation applied to the source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +62,12 @@ pub struct Transformer;
 impl Transformer {
     /// Transform the given C source based on detected pattern matches.
     ///
-    /// Processes matches from highest to lowest byte position, building the
-    /// output by: prepending the WASI header, then for each match appending
-    /// (original content in the gap, WASI replacement). The gap is the content
-    /// BETWEEN the current match's end and the PREVIOUS match's end (in
-    /// original source coordinates). After all matches, append any remaining
-    /// original content from byte 0 to the first match's start.
+    /// Processes matches from lowest to highest byte position (start of
+    /// file forward), building the output by appending for each match
+    /// (original content in the gap, WASI replacement). The gap is the
+    /// content BETWEEN the previous match's end and the current match's
+    /// start in original source coordinates. After all matches, append
+    /// any remaining original content from the last match's end to EOF.
     ///
     /// `preprocessor_info` is attached to the result so callers (the CLI
     /// bin, the control plane) can report "Preprocessor: expanded N macros"
@@ -88,18 +87,24 @@ impl Transformer {
 
         manual_review.extend(not_transformable);
 
-        // Sort by start_byte descending — process from end of file backward
+        // Sort by start_byte ASCENDING — process from start of file forward.
+        // The previous version sorted DESCENDING and APPENDED each
+        // match's gap+replacement to the output, which produced a
+        // REVERSED output (the source's beginning ended up at the end
+        // of the file). The Rust `RustTransformer::transform` already
+        // uses this correct ASCENDING order; the C transformer is
+        // now aligned with it.
         let mut sorted = transformable;
-        sorted.sort_by_key(|m| Reverse(m.start_byte));
+        sorted.sort_by_key(|m| m.start_byte);
 
         let source_bytes = source.as_bytes();
 
         // Build output: WASI header + for each match (gap content + WASI replacement)
         let mut output = WASI_INCLUDES.as_bytes().to_vec();
 
-        // prev_end tracks the END of the previous match in ORIGINAL coordinates.
-        // Start at source.len() (end of file in original).
-        let mut prev_end = source_bytes.len();
+        // prev_end tracks the END of the previous match in ORIGINAL
+        // coordinates. Start at 0 (beginning of file in original).
+        let mut prev_end: usize = 0;
 
         for m in &sorted {
             let wasi_code = Self::generate_wasi_code(m);
@@ -110,17 +115,16 @@ impl Transformer {
             let orig_start = m.start_byte;
             let orig_end = m.end_byte;
 
-            // Copy original content from orig_end to prev_end (the gap between
-            // this match and the previous one in original coordinates).
-            // This is the content that comes AFTER this match in the original
-            // but BEFORE the previous match was processed.
-            output.extend_from_slice(&source_bytes[orig_end..prev_end]);
+            // Copy original content from prev_end to orig_start — the
+            // gap between the previous match's end and this match's
+            // start in original coordinates.
+            output.extend_from_slice(&source_bytes[prev_end..orig_start]);
 
             // Append WASI replacement
             output.extend_from_slice(wasi_code.as_bytes());
 
-            // Update: this match's start becomes the boundary for the next iteration
-            prev_end = orig_start;
+            // Update: this match's end becomes the boundary for the next iteration.
+            prev_end = orig_end;
 
             transformations_applied.push(Transformation {
                 line: m.line,
@@ -133,9 +137,9 @@ impl Transformer {
             });
         }
 
-        // After all matches: append remaining original content from byte 0 to first match start
-        if prev_end > 0 {
-            output.extend_from_slice(&source_bytes[..prev_end]);
+        // After all matches: append remaining original content from prev_end to EOF.
+        if prev_end < source_bytes.len() {
+            output.extend_from_slice(&source_bytes[prev_end..]);
         }
 
         let transformed_source =
@@ -166,12 +170,19 @@ impl Transformer {
                 "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
             }
             PatternKind::Posix(PosixPattern::Bind) => {
-                // Two-phase: start-bind + finish-bind
+                // Two-phase: start-bind + finish-bind.
+                // `wasi_socket_tcp_finish_bind` takes ONLY the socket fd
+                // (no address, no length). The previous version passed
+                // `extract_third_arg(m)` here — which for
+                // `bind(fd, addr, len)` is `len` (e.g. `sizeof(addr)`) —
+                // producing a call like
+                // `wasi_socket_tcp_finish_bind(sizeof(addr))` that the
+                // clang syntax check rejects.
                 format!(
                     "// WASI: two-phase bind\n{{\n  wasi_socket_tcp_start_bind({}, {});\n  wasi_socket_tcp_finish_bind({});\n}}",
                     Self::extract_first_arg(m),
                     Self::extract_second_arg(m),
-                    Self::extract_third_arg(m)
+                    Self::extract_first_arg(m)
                 )
             }
             PatternKind::Posix(PosixPattern::Listen) => {
@@ -185,12 +196,15 @@ impl Transformer {
                 )
             }
             PatternKind::Posix(PosixPattern::Connect) => {
-                // Two-phase: start-connect + finish-connect
+                // Two-phase: start-connect + finish-connect.
+                // `wasi_socket_tcp_finish_connect` takes ONLY the socket
+                // fd, not the address. Same bug as Bind — fix passes
+                // the first arg again instead of the third.
                 format!(
                     "// WASI: two-phase connect\n{{\n  wasi_socket_tcp_start_connect({}, {});\n  wasi_socket_tcp_finish_connect({});\n}}",
                     Self::extract_first_arg(m),
                     Self::extract_second_arg(m),
-                    Self::extract_third_arg(m)
+                    Self::extract_first_arg(m)
                 )
             }
             PatternKind::Posix(PosixPattern::Accept) => {
@@ -607,7 +621,11 @@ int main() {
             .contains("wasi_socket_tcp_start_listen"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
 
-        // Original POSIX calls must NOT be present
+        // Original POSIX calls must NOT be present. The substrings
+        // here include the FULL original arg list so they don't
+        // accidentally match the new WASI emits (which now contain
+        // `wasi_socket_tcp_start_bind(fd, (struct sockaddr*)&addr)` —
+        // a superset of the old `bind(fd, ...)` substring).
         assert!(
             !result.transformed_source.contains("socket(AF_INET"),
             "socket(AF_INET still present"
@@ -615,12 +633,14 @@ int main() {
         assert!(
             !result
                 .transformed_source
-                .contains("bind(fd, (struct sockaddr*)&addr"),
+                .contains("bind(fd, (struct sockaddr*)&addr, sizeof(addr))"),
             "bind original still present"
         );
         assert!(
-            !result.transformed_source.contains("listen(fd, 128)"),
-            "listen original still present"
+            !result.transformed_source.contains("    listen("),
+            "listen original still present (note: 4-space indent \
+             distinguishes the original call from the wasi emit, which \
+             starts with `    // WASI: two-phase listen`)"
         );
         assert!(
             !result.transformed_source.contains("accept(fd, NULL, NULL)"),
