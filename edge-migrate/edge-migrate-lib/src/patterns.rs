@@ -316,7 +316,7 @@ impl PosixPattern {
             PosixPattern::Connect => "start-connect() + finish-connect()",
             PosixPattern::Recv => "input-stream read via wasi:io/streams",
             PosixPattern::Send => "output-stream write via wasi:io/streams",
-            PosixPattern::GetHostByName => "wasi:ip-name-lookup",
+            PosixPattern::GetHostByName => "wasi:ip-name-lookup — not transformable in MVP (G3; edge:cloud/networking shape mismatch)",
             PosixPattern::Close => "drop() on socket resource",
             PosixPattern::Fopen => "wasi:filesystem open",
             PosixPattern::Fread => "wasi:filesystem read",
@@ -344,12 +344,19 @@ impl PosixPattern {
             | PosixPattern::Connect
             | PosixPattern::Recv
             | PosixPattern::Send
-            | PosixPattern::GetHostByName
             | PosixPattern::Close
             | PosixPattern::Fopen
             | PosixPattern::Fread
             | PosixPattern::Fwrite
             | PosixPattern::Fclose => Transformability::AutoTransformable,
+            // G3: gethostbyname / getaddrinfo emit shape
+            // (`wasi:ip-name-lookup.resolve-address`) does not match
+            // the runtime's `edge:cloud/networking.resolve(string) ->
+            // list<string>` shape. Downgrade for MVP — the call
+            // stays verbatim in the source and lands in
+            // manual_review. Tracked as a #118 follow-up once the
+            // runtime lands a wasi:ip-name-lookup host impl.
+            PosixPattern::GetHostByName => Transformability::NotTransformable,
             // Resolves #128: the previous BestEffort emit wrapped
             // accept in a `wasi_poll_pollable_block(pollable)` poll
             // loop, but `pollable` was never declared (the
@@ -624,13 +631,20 @@ mod tests {
         // C path: AutoTransformable for the bulk, NotTransformable
         // for the un-fixables. #128: Accept flipped from BestEffort
         // to NotTransformable (poll-loop wrapper was syntactically
-        // wrong + referenced an undeclared pollable).
+        // wrong + referenced an undeclared pollable). G3:
+        // GetHostByName flipped from AutoTransformable to
+        // NotTransformable (was:ip-name-lookup shape doesn't match
+        // edge:cloud/networking).
         assert_eq!(
             PatternKind::Posix(PosixPattern::Listen).transformability(),
             Transformability::AutoTransformable
         );
         assert_eq!(
             PatternKind::Posix(PosixPattern::Accept).transformability(),
+            Transformability::NotTransformable
+        );
+        assert_eq!(
+            PatternKind::Posix(PosixPattern::GetHostByName).transformability(),
             Transformability::NotTransformable
         );
         assert_eq!(
