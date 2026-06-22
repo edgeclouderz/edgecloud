@@ -1140,7 +1140,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     let token = auth
         .strip_prefix("Bearer ")
         .expect("Authorization must start with 'Bearer '");
-    let claims = edge_worker::auth::verify(TEST_JWT_SECRET, "edgecloud", token)
+    let claims = edge_worker::auth::verify_for_test_only(TEST_JWT_SECRET, "edgecloud", token)
         .expect("verify should succeed");
     assert_eq!(claims.worker_id, "test-worker");
     assert_eq!(claims.tenant_id, "t_test");

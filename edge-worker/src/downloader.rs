@@ -478,8 +478,8 @@ mod tests {
         // Token must parse with the same secret the signer used and carry
         // the worker's identity. This is what the control plane's
         // WorkerAuth middleware does.
-        let claims =
-            crate::auth::verify(b"test-secret", "edgecloud", token).expect("verify should succeed");
+        let claims = crate::auth::verify_for_test_only(b"test-secret", "edgecloud", token)
+            .expect("verify should succeed");
         assert_eq!(claims.worker_id, "w_test");
         assert_eq!(claims.tenant_id, "t_test");
         assert_eq!(claims.region, "test");

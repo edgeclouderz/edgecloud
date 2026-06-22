@@ -153,11 +153,15 @@ impl WorkerJwtSigner {
     }
 }
 
+/// TEST-ONLY: do not call from production code paths; production
+/// workers use `sign()` which always produces valid output.
+///
 /// Parses and validates a worker JWT with the given secret. Used by the
-/// `signed_token_parses_with_correct_claims` and `verify_rejects_wrong_secret`
-/// unit tests AND by `tests/integration_tests.rs::signed_token_round_trips`
-/// to round-trip the signed token back through the same wire format the
-/// control plane expects.
+/// `signed_token_parses_with_correct_claims` and
+/// `verify_rejects_wrong_secret` unit tests AND by
+/// `tests/integration_tests.rs::signed_token_round_trips` to round-trip
+/// the signed token back through the same wire format the control plane
+/// expects.
 ///
 /// `expected_iss` is the issuer this code path is willing to accept; the
 /// `jsonwebtoken` crate's `Validation::set_issuer` pins it. This is
@@ -166,14 +170,21 @@ impl WorkerJwtSigner {
 /// signer drifts away from the canonical issuer, the round-trip test
 /// fails here too, before the request ever hits the wire.
 ///
-/// Production code on the worker doesn't need to verify its own tokens —
-/// `sign()` always produces valid output — but the function is public so
-/// the integration test can import it via `edge_worker::auth::verify`. The
-/// `allow(dead_code)` is needed because the regular (non-test) bin and
-/// lib builds don't link against `tests/integration_tests.rs`, so neither
-/// compilation unit has a non-test call site.
-#[allow(dead_code)]
-pub fn verify(secret: &[u8], expected_iss: &str, token: &str) -> anyhow::Result<WorkerClaims> {
+/// `#[doc(hidden)]` keeps the function compiled into the lib (the
+/// integration test target is a separate `[[test]]` and doesn't enable
+/// the production build's #[cfg(test)] gates) but signals "not for
+/// public use" to anyone reading the generated docs. The `verify`
+/// name is too tempting on a hot path: a future maintainer could
+/// accidentally call it on a hot path and inherit a weaker
+/// validation set than the control plane (no `aud` check, no
+/// `exp_required`). The rename to `verify_for_test_only` makes the
+/// intent unambiguous.
+#[doc(hidden)]
+pub fn verify_for_test_only(
+    secret: &[u8],
+    expected_iss: &str,
+    token: &str,
+) -> anyhow::Result<WorkerClaims> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_aud = false;
     validation.set_issuer(&[expected_iss]);
@@ -236,7 +247,8 @@ mod tests {
     fn signed_token_parses_with_correct_claims() {
         let s = signer();
         let t = s.sign();
-        let claims = verify(b"test-secret", "edgecloud", &t).expect("verify should succeed");
+        let claims = verify_for_test_only(b"test-secret", "edgecloud", &t)
+            .expect("verify should succeed");
         assert_eq!(claims.iss, "edgecloud");
         assert_eq!(claims.worker_id, "w_fra_abc123");
         assert_eq!(claims.tenant_id, "t_tenant1");
@@ -253,18 +265,18 @@ mod tests {
     fn verify_rejects_wrong_secret() {
         let s = signer();
         let t = s.sign();
-        assert!(verify(b"wrong-secret", "edgecloud", &t).is_err());
+        assert!(verify_for_test_only(b"wrong-secret", "edgecloud", &t).is_err());
     }
 
-    /// `verify` pins the issuer via `Validation::set_issuer`. A token
-    /// whose `iss` does not match the expected value must be rejected —
-    /// this is the Rust-side mirror of the control plane's middleware
-    /// check (Commit 1) and catches issuer drift in the signer.
+    /// `verify_for_test_only` pins the issuer via `Validation::set_issuer`.
+    /// A token whose `iss` does not match the expected value must be
+    /// rejected — this is the Rust-side mirror of the control plane's
+    /// middleware check (Commit 1) and catches issuer drift in the signer.
     #[test]
     fn verify_rejects_wrong_issuer() {
         let s = signer(); // mints with iss = "edgecloud"
         let t = s.sign();
-        let err = verify(b"test-secret", "some-other-issuer", &t)
+        let err = verify_for_test_only(b"test-secret", "some-other-issuer", &t)
             .expect_err("verify with wrong expected_iss must fail");
         assert!(
             err.to_string().to_lowercase().contains("issuer")
