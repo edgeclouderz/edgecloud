@@ -355,7 +355,7 @@ impl ApiClient {
     /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
     /// caller can detect that via `body.contains("no previous")`.
     pub fn rollback(&self, app_name: &str) -> Result<RollbackResponse> {
-        let url = format!("{}/api/apps/{}/rollback", self.base_url, app_name);
+        let url = format!("{}/api/v1/apps/{}/rollback", self.base_url, app_name);
         let resp = self
             .http
             .post(&url)

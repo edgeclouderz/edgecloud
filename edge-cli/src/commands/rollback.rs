@@ -79,6 +79,7 @@ mod tests {
             deployment_id: "d_test".to_string(),
             app_name: name.to_string(),
             live_url: "https://example.test".to_string(),
+            regions: vec![],
         }
     }
 
