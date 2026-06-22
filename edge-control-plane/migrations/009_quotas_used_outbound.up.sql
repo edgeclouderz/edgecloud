@@ -1,0 +1,1 @@
+ALTER TABLE quotas ADD COLUMN used_outbound_bytes BIGINT NOT NULL DEFAULT 0;

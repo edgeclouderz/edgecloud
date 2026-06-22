@@ -36,6 +36,7 @@ type workerRepoInterface interface {
 // quotaRepoInterface defines the repository methods used by WorkerService.
 type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+	AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 }
 
 // WorkerService handles worker lifecycle business logic.
@@ -181,8 +182,9 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	s.checkOutboundQuota(ctx, hb.Apps)
 }
 
-// checkOutboundQuota sums outbound_bytes across all apps in a heartbeat and
-// logs a violation when a tenant's total for this interval exceeds their quota.
+// checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
+// tenant's running total in the DB (cross-worker, cross-interval), then logs a
+// violation when the cumulative total exceeds the per-month max_outbound_mb cap.
 // Phase 1: log-only. Phase 2 (tracked in issue #120 follow-up): evict apps.
 func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.RawMessage) {
 	if len(appsRaw) == 0 {
@@ -194,7 +196,9 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 		return
 	}
 
-	// Group outbound bytes by tenant across all apps in this heartbeat.
+	// Sum this heartbeat's delta per tenant. Must aggregate all apps before
+	// checking — an early check on a partial per-tenant total would false-trip
+	// the quota when the tenant's heaviest app appears first in map iteration.
 	byTenant := make(map[string]uint64)
 	for _, app := range apps {
 		if app.TenantID != "" {
@@ -202,24 +206,27 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 		}
 	}
 
-	for tenantID, totalBytes := range byTenant {
-		if totalBytes == 0 {
-			// Old worker or no traffic — skip; don't act on missing data.
+	for tenantID, deltaBytes := range byTenant {
+		if deltaBytes == 0 {
+			// Old worker or genuinely idle — skip; don't write a no-op UPDATE.
 			continue
 		}
-		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		// Persist the delta and get back the updated cumulative total in one
+		// round-trip. This aggregates across all workers and all intervals.
+		quota, err := s.quotaRepo.AddOutboundBytes(ctx, tenantID, deltaBytes)
 		if err != nil || quota == nil {
+			log.Printf("heartbeat: failed to record outbound bytes for tenant %s: %v", tenantID, err)
 			continue
 		}
 		if quota.MaxOutboundMB <= 0 {
 			// Unlimited or unconfigured — nothing to enforce.
 			continue
 		}
-		limitBytes := uint64(quota.MaxOutboundMB) * 1024 * 1024
-		if totalBytes > limitBytes {
+		limitBytes := int64(quota.MaxOutboundMB) * 1024 * 1024
+		if quota.UsedOutboundBytes > limitBytes {
 			log.Printf(
-				"quota: tenant %s outbound bytes %d exceeds interval limit %d (%d MB) — enforcement pending",
-				tenantID, totalBytes, limitBytes, quota.MaxOutboundMB,
+				"quota: tenant %s used %d outbound bytes, exceeds monthly limit %d (%d MB) — enforcement pending",
+				tenantID, quota.UsedOutboundBytes, limitBytes, quota.MaxOutboundMB,
 			)
 		}
 	}
