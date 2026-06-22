@@ -345,8 +345,7 @@ impl Observer {
         // accumulates stack-trace messages). Surfaced via
         // `dropped_record_count()`.
         if record.message.len() > MAX_LOG_MESSAGE_BYTES {
-            let dropped =
-                self.dropped_size_cap_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let dropped = self.dropped_size_cap_count.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 size = record.message.len(),
                 max = MAX_LOG_MESSAGE_BYTES,
@@ -689,11 +688,7 @@ mod tests {
         let huge = "z".repeat(MAX_LOG_MESSAGE_BYTES + 1);
         observer.emit_log("info", &huge, &[]);
 
-        assert_eq!(
-            sink.records().len(),
-            5,
-            "sink should have 5 valid records"
-        );
+        assert_eq!(sink.records().len(), 5, "sink should have 5 valid records");
         assert_eq!(
             observer.dropped_record_count(),
             1,
