@@ -2,6 +2,7 @@
 
 use metrics::NoopRecorder;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Default labels used when none are provided.
@@ -210,6 +211,12 @@ pub struct Observer {
     app_ctx: AppLogContext,
     /// Minimum log level to emit.
     min_log_level: LogLevel,
+    /// Counter for records dropped at the size cap (see
+    /// `MAX_LOG_MESSAGE_BYTES`). Surfaced via `dropped_record_count()`
+    /// so the runtime's metrics interface can expose it without
+    /// changing the wire format. The guest still sees a silent no-op
+    /// on the drop — only operators see the count.
+    dropped_size_cap_count: AtomicU64,
 }
 
 impl Default for Observer {
@@ -243,6 +250,7 @@ impl Observer {
             log_sink: config.log_sink,
             app_ctx: config.app_ctx,
             min_log_level: config.min_log_level,
+            dropped_size_cap_count: AtomicU64::new(0),
         }
     }
 
@@ -331,10 +339,18 @@ impl Observer {
         // it, and the control plane would 400 on the body. We log a
         // warning and return — the guest sees a no-op, not a partial
         // record. The constant is documented at the top of the file.
+        //
+        // We also bump `dropped_size_cap_count` so operators can spot
+        // a guest that is silently losing records (e.g. one that
+        // accumulates stack-trace messages). Surfaced via
+        // `dropped_record_count()`.
         if record.message.len() > MAX_LOG_MESSAGE_BYTES {
+            let dropped =
+                self.dropped_size_cap_count.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 size = record.message.len(),
                 max = MAX_LOG_MESSAGE_BYTES,
+                total_dropped = dropped,
                 "emit_log: dropping oversized message"
             );
             return;
@@ -369,6 +385,19 @@ impl Observer {
             .read()
             .ok()
             .and_then(|c| c.get(name).map(|(v, _)| *v))
+    }
+
+    /// Returns the total number of records dropped at the
+    /// `MAX_LOG_MESSAGE_BYTES` size cap since this `Observer` was
+    /// constructed. Exposed for tests and for the runtime's metrics
+    /// interface; the wire format (`LogRecord`/`LogSink`) is unchanged —
+    /// the guest still sees a silent no-op on the drop.
+    ///
+    /// `Ordering::Relaxed` is sufficient: the counter is purely a
+    /// metric (no happens-before relationship with other state), and
+    /// its only consumer is `metrics::counter!`-style aggregation.
+    pub fn dropped_record_count(&self) -> u64 {
+        self.dropped_size_cap_count.load(Ordering::Relaxed)
     }
 
     /// Returns the current value of a gauge for testing.
@@ -561,7 +590,9 @@ mod tests {
 
     /// Oversized messages are dropped at the chokepoint. The sink must
     /// see zero records and the call must not panic — the guest gets a
-    /// silent no-op, not a partial record.
+    /// silent no-op, not a partial record. The dropped-record counter
+    /// must increment so operators can spot a guest that's silently
+    /// losing records.
     #[test]
     fn test_emit_log_drops_oversized_message() {
         let sink = Arc::new(RecordingLogSink::new());
@@ -577,6 +608,11 @@ mod tests {
         assert!(
             sink.records().is_empty(),
             "oversized message must be dropped before reaching the sink"
+        );
+        assert_eq!(
+            observer.dropped_record_count(),
+            1,
+            "drop counter must increment by 1"
         );
     }
 
@@ -627,6 +663,41 @@ mod tests {
         assert!(
             sink.records().is_empty(),
             "emit_log_record with oversized message must also be dropped"
+        );
+        assert_eq!(
+            observer.dropped_record_count(),
+            1,
+            "drop counter must increment by 1"
+        );
+    }
+
+    /// The drop counter only counts oversized-message drops — successful
+    /// records must not bump it. Mix 5 valid + 1 oversized and assert
+    /// the counter reads 1 (not 6).
+    #[test]
+    fn test_emit_log_drops_count_independent_of_successful_records() {
+        let sink = Arc::new(RecordingLogSink::new());
+        let observer = Observer::from_config(
+            ObserveConfig::new()
+                .with_log_sink(sink.clone())
+                .with_min_log_level(LogLevel::Info),
+        );
+
+        for i in 0..5 {
+            observer.emit_log("info", &format!("valid {i}"), &[]);
+        }
+        let huge = "z".repeat(MAX_LOG_MESSAGE_BYTES + 1);
+        observer.emit_log("info", &huge, &[]);
+
+        assert_eq!(
+            sink.records().len(),
+            5,
+            "sink should have 5 valid records"
+        );
+        assert_eq!(
+            observer.dropped_record_count(),
+            1,
+            "drop counter should reflect only the 1 oversized record"
         );
     }
 }
