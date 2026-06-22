@@ -1010,6 +1010,33 @@ int main() {
             String::from_utf8_lossy(&output.stderr),
             result.transformed_source
         );
+
+        // G3 follow-up: the http_client.c fixture contains a
+        // `gethostbyname(...)` call which is NotTransformable in
+        // MVP. The transformer must leave the original call
+        // verbatim in the source — it must NOT emit the broken
+        // `wasi_ip_name_lookup_resolve(...)` form (G3 reason: the
+        // runtime's `edge:cloud/networking.resolve(string) ->
+        // list<string>` shape doesn't match
+        // `wasi:ip-name-lookup.resolve-address`). The call must
+        // land in `manual_review` so the developer sees it.
+        assert!(
+            result.transformed_source.contains("gethostbyname("),
+            "G3: gethostbyname must be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        assert!(
+            !result.transformed_source.contains("wasi_ip_name_lookup_resolve"),
+            "G3: wasi_ip_name_lookup_resolve emit must NOT appear; got:\n{}",
+            result.transformed_source
+        );
+        assert!(
+            result
+                .manual_review
+                .iter()
+                .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::GetHostByName))),
+            "G3: gethostbyname must be in manual_review"
+        );
     }
 
     /// Returns true iff `EDGE_TEST_CLANG=1` is set in the environment

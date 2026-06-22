@@ -60,6 +60,19 @@ struct sockaddr_in {
 // have passed an int.
 int accept(void *fd, void *addr, int *addrlen);
 
+// POSIX `gethostbyname()` stub. The MVP leaves gethostbyname()
+// verbatim in the source (it's downgraded to NotTransformable
+// per G3 — the runtime's `edge:cloud/networking.resolve(string) ->
+// list<string>` shape doesn't match the
+// `wasi:ip-name-lookup.resolve-address` resource-stream shape).
+// The e2e regression net still needs the symbol declared so the
+// verbatim `gethostbyname("...")` line type-checks. Returns NULL
+// — no real resolution happens; this is a syntax-check-only stub.
+struct hostent {
+  char *h_name;
+};
+struct hostent *gethostbyname(const char *name);
+
 typedef struct wasi_socket_tcp_t wasi_socket_tcp_t;
 typedef struct wasi_socket_udp_t wasi_socket_udp_t;
 
