@@ -365,7 +365,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentID:   deploymentID,
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
-				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
+				Allowlist:      tenant.AllowlistedDestinations,
 				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
@@ -376,7 +376,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	//   - otherwise the control plane's default region (handles
 	//     pre-migration rows AND any caller that wrote the row via a
 	//     path that left Regions nil).
-	regions := domain.StringArrayTo(deployment.Regions)
+	regions := deployment.Regions
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
@@ -461,13 +461,13 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 					DeploymentID:   ad.DeploymentID,
 					DeploymentHash: deployment.Hash,
 					Env:            envMap,
-					Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
+					Allowlist:      tenant.AllowlistedDestinations,
 					MaxMemoryMB:    maxMemoryMB,
 				},
 			},
 		}
 
-		regions := domain.StringArrayTo(deployment.Regions)
+		regions := deployment.Regions
 		if len(regions) == 0 {
 			regions = []string{s.defaultRegion}
 		}
