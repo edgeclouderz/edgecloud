@@ -259,7 +259,18 @@ impl LogForwarder {
                 // control-plane errors. We discard the bytes — we
                 // already have the status code we care about, and any
                 // body is purely diagnostic.
-                let _ = resp.bytes().await;
+                //
+                // A failed drain (e.g. mid-body TCP reset) is logged so
+                // operators can correlate with reqwest pool-exhaustion
+                // metrics. The connection may not return to the pool
+                // cleanly, defeating the original pool-exhaustion fix
+                // (commit d7cf342) under network-partition conditions.
+                if let Err(e) = resp.bytes().await {
+                    tracing::warn!(
+                        err = %e,
+                        "log_forwarder: failed to drain response body; connection may be leaked"
+                    );
+                }
                 if status.is_success() {
                     tracing::debug!(count, status = status.as_u16(), "logs flushed");
                 } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
