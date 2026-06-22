@@ -359,9 +359,23 @@ internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// other /api/internal/* endpoint, this is currently
 	// unauthenticated — see the comment on internalMux above.
 	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
-	internalMux.HandleFunc("GET /api/internal/domains", internalHandler.ListDomains)
-	internalMux.HandleFunc("GET /api/internal/tls-allowed", internalHandler.TlsAllowed)
-	internalMux.HandleFunc("POST /api/internal/domains/{id}/status", internalHandler.UpdateDomainStatus)
+	// Custom-domain routes (issue #83). All three require a valid
+	// worker/ingest JWT; the status endpoint additionally requires
+	// an explicit role gate so a leaked worker JWT cannot
+	// silently flip a row to `active` or `failed`. The two reads
+	// are tenant-agnostic and gated only by JWT — the service-layer
+	// queries return the union across all tenants, and the only
+	// consumer (the ingress poller + occasional admin audit) is
+	// trusted.
+	internalMux.Handle("GET /api/internal/domains", middleware.RequireWorkerRole(
+		middleware.RoleIngest, middleware.RoleWorker,
+	)(http.HandlerFunc(internalHandler.ListDomains)))
+	internalMux.Handle("GET /api/internal/tls-allowed", middleware.RequireWorkerRole(
+		middleware.RoleIngest, middleware.RoleWorker,
+	)(http.HandlerFunc(internalHandler.TlsAllowed)))
+	internalMux.Handle("POST /api/internal/domains/{id}/status", middleware.RequireWorkerRole(
+		middleware.RoleIngest, middleware.RoleWorker,
+	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
@@ -369,19 +383,28 @@ internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
 	// Mint a long-lived service token for the edge-ingress poller
-	// (issue #83). The token is logged so the operator can copy it
-	// into the ingress's INGRESS_SERVICE_TOKEN env var. Region is
-	// sourced from the APP_REGION env var (the config file doesn't
-	// carry it because the control plane is region-agnostic — it's
-	// the ingress and workers that have region identity). If unset,
-	// skip — no ingress is going to talk to this control plane.
+	// (issue #83). The token is written to a 0600 file (NOT logged
+	// in plaintext) so the operator can copy it into the ingress's
+	// INGRESS_SERVICE_TOKEN env var. Region is sourced from the
+	// APP_REGION env var (the config file doesn't carry it because
+	// the control plane is region-agnostic — it's the ingress and
+	// workers that have region identity). If unset, skip — no
+	// ingress is going to talk to this control plane.
+	//
+	// The token file lands in the same dir as the artifact store
+	// (`cfg.Storage.ArtifactPath`) so operators have a single,
+	// predictable place to find all per-region secrets.
 	region := os.Getenv("APP_REGION")
 	if region != "" {
 		tok, err := mintIngressToken(cfg.JWT.Secret, cfg.JWT.Issuer, region)
 		if err != nil {
 			log.Fatalf("failed to mint ingress token: %v", err)
 		}
-		log.Printf("INGRESS_SERVICE_TOKEN (region=%s, expires in 1y): %s", region, tok)
+		path, err := writeIngressTokenFile(cfg.Storage.ArtifactPath, region, tok)
+		if err != nil {
+			log.Fatalf("failed to write ingress token file: %v", err)
+		}
+		log.Printf("INGRESS_SERVICE_TOKEN written to %s (region=%s, expires in 1y, mode 0600)", path, region)
 	} else {
 		log.Printf("APP_REGION not set; skipping ingress service token mint (default-only mode)")
 	}

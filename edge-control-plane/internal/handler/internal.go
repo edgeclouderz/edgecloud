@@ -27,6 +27,13 @@ type InternalDomainServiceInterface interface {
 	UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error
 }
 
+// Compile-time check that the service still satisfies the interface.
+// The error mapping for `service.ErrDomainNotFound → 404` in
+// `UpdateDomainStatus` depends on this contract; if a future refactor
+// changes the signature, the handler will fail to compile and the
+// 404 path will not silently regress to 204.
+var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
+
 // InternalHandler handles internal worker-facing endpoints.
 //
 // `domainSvc` is nil when the binary is built without custom-domain
@@ -283,7 +290,10 @@ func (h *InternalHandler) TlsAllowed(w http.ResponseWriter, r *http.Request) {
 // event hook so the platform learns about renewal failures.
 //
 // JWT-authenticated; the body is `{"status": "active"|"failed",
-// "last_error": "..."}`.
+// "last_error": "..."}`. The 404 path is critical for the v2 webhook:
+// a Caddy event for a deleted/stale domain id must NOT be silently
+// acknowledged, or the operator's "rows in failed state" alerts
+// become wrong.
 func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Request) {
 	if h.domainSvc == nil {
 		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
@@ -307,6 +317,10 @@ func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := h.domainSvc.UpdateStatus(r.Context(), id, body.Status, body.LastError); err != nil {
+		if errors.Is(err, service.ErrDomainNotFound) {
+			http.Error(w, `{"error": "domain not found"}`, http.StatusNotFound)
+			return
+		}
 		log.Printf("UpdateDomainStatus(%s): %v", id, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
