@@ -129,7 +129,11 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, logEntryRepo)
+	// domainSvc is wired by the next rebase commit (14634f9 "wire
+	// DomainService + mint ingress service token"). nil here so
+	// the constructor signature change compiles; the next commit
+	// replaces this with the real DomainService instance.
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, nil, logEntryRepo)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
