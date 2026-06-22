@@ -36,13 +36,20 @@ const (
 //
 // `exp` is required (jwt.WithExpirationRequired) so a token with no
 // expiration cannot be replayed indefinitely after JWT_SECRET rotation.
-// `iss` is enforced inside the parser when cfg.Issuer is set; an empty
-// cfg.Issuer skips iss enforcement (used in tests with various issuers).
+// `iss` is enforced via jwt.WithIssuer(cfg.Issuer); the library skips
+// the iss check when the supplied issuer is empty, so an empty
+// cfg.Issuer effectively disables iss enforcement. Production callers
+// must set cfg.Issuer (the control-plane config defaults it to
+// "edgecloud"); only test setups with no issuer constraint may
+// leave it empty.
 func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, error) {
 	opts := []jwt.ParserOption{jwt.WithExpirationRequired()}
-	if cfg.Issuer != "" {
-		opts = append(opts, jwt.WithIssuer(cfg.Issuer))
-	}
+	// Always call WithIssuer. The library short-circuits the iss check
+	// when the supplied issuer is empty (c.iss == ""), so the behavior
+	// is identical to the previous `if cfg.Issuer != ""` guard. The
+	// explicit call makes the intent visible and removes a layer of
+	// conditional indirection that the library handles internally.
+	opts = append(opts, jwt.WithIssuer(cfg.Issuer))
 	token, err := jwt.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])

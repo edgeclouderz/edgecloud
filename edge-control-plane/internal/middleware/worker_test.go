@@ -148,6 +148,35 @@ func TestVerifyWorkerJWT_WrongIssRejected(t *testing.T) {
 	}
 }
 
+// TestVerifyWorkerJWT_EmptyIssuerSkipsIssCheck pins the documented
+// behavior: jwt.WithIssuer("") makes the library skip the iss check
+// entirely. A token with any iss (or none) is accepted when
+// cfg.Issuer is empty. This is the invariant that makes the
+// "always call WithIssuer" cleanup safe — the library's internal
+// guard handles the empty case. Production callers must NOT rely
+// on this: the control-plane config defaults cfg.Issuer to
+// "edgecloud", so an empty cfg.Issuer is a misconfiguration. The
+// test exists to document the behavior, not to encourage it.
+func TestVerifyWorkerJWT_EmptyIssuerSkipsIssCheck(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: ""}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "other-control-plane",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	// Must NOT error: empty cfg.Issuer means iss is not enforced.
+	if _, err := VerifyWorkerJWT(tokenString, cfg); err != nil {
+		t.Errorf("empty cfg.Issuer should skip iss check; got error: %v", err)
+	}
+}
+
 func TestWorkerAuth_MissingToken(t *testing.T) {
 	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
