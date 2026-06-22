@@ -180,6 +180,7 @@ impl WorkerJwtSigner {
 /// `exp_required`). The rename to `verify_for_test_only` makes the
 /// intent unambiguous.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn verify_for_test_only(
     secret: &[u8],
     expected_iss: &str,
@@ -247,8 +248,8 @@ mod tests {
     fn signed_token_parses_with_correct_claims() {
         let s = signer();
         let t = s.sign();
-        let claims = verify_for_test_only(b"test-secret", "edgecloud", &t)
-            .expect("verify should succeed");
+        let claims =
+            verify_for_test_only(b"test-secret", "edgecloud", &t).expect("verify should succeed");
         assert_eq!(claims.iss, "edgecloud");
         assert_eq!(claims.worker_id, "w_fra_abc123");
         assert_eq!(claims.tenant_id, "t_tenant1");
