@@ -109,10 +109,10 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 
 	// 1. deploymentRepo.GetByID returns a row with 3 regions.
 	regionsCol := `{"us-east","eu-west","ap-south"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false))
 
 	// 2. ActivateDeployment wraps the GetForUpdate + Set in a tx
 	// (so concurrent activate/rollback serialize via FOR UPDATE).
@@ -122,6 +122,11 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
 	// 3. appEnvRepo.List — return no env vars.
@@ -195,15 +200,20 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_legacy"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
@@ -241,15 +251,20 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	svc, mock, cleanup := activateSvcForTest(t, pub, "us-east")
 	defer cleanup()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs("d_x").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -284,15 +299,20 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_partial"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -338,15 +358,20 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 
 	const deploymentID = "d_zero_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
@@ -381,15 +406,20 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 
 	const deploymentID = "d_no_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// ActivateDeployment also calls ClearStableSince inside the tx
+	// (resets the stability clock for the new deployment). Mock the
+	// UPDATE; the new column doesn't change row shape for the mock.
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").

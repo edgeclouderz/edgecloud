@@ -186,7 +186,7 @@ func (s *DeploymentService) SetAppService(appSvc *AppService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
@@ -270,6 +270,11 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		Hash:      hex.EncodeToString(hash[:]),
 		Regions:   domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
+		// Persist the tenant opt-in on the artifact row so audit
+		// endpoints (`edge deployments --app foo`) can show which
+		// deployments opted in. The flag is copied onto the
+		// active_deployments row by ActivateDeployment.
+		AutoRollbackEnabled: autoRollback,
 	}
 
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
@@ -362,12 +367,33 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		if current != nil {
 			lastGood = &current.DeploymentID
 		}
-		return txActive.Set(ctx, &domain.ActiveDeployment{
+		if err := txActive.Set(ctx, &domain.ActiveDeployment{
 			TenantID:             tenantID,
 			AppName:              appName,
 			DeploymentID:         deploymentID,
 			LastGoodDeploymentID: lastGood,
-		})
+			// Copy the opt-in flag from the deployments row onto
+			// the active slot. The worker-driven auto-rollback
+			// path and the heartbeat-driven stability window
+			// both read from the active row.
+			AutoRollbackEnabled: deployment.AutoRollbackEnabled,
+		}); err != nil {
+			return fmt.Errorf("setting active deployment: %w", err)
+		}
+		// Reset the stability clock on every activate. The new
+		// deployment has not been observed running yet, so
+		// stable_since must be NULL — otherwise the stability
+		// window could fire immediately on the next heartbeat
+		// and promote the just-activated id into last_good
+		// before any worker has even loaded the artifact. We
+		// explicitly ClearStableSince inside the tx (rather than
+		// relying on Set to write it) because Set deliberately
+		// omits stable_since from its UPDATE clause — see the
+		// doc comment on ActiveDeploymentRepository.Set.
+		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("clearing stability clock: %w", err)
+		}
+		return nil
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
 	}
@@ -492,14 +518,26 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
 		// that requires an N-step history table, out of scope for the
-		// minimum viable UX).
+		// minimum viable UX). Also reset the stability clock so the
+		// freshly-active deployment has to be observed running again
+		// before it becomes eligible to be promoted into last_good
+		// (otherwise the next heartbeat could see a stale stable_since
+		// from before the rollback and immediately promote the
+		// now-active deployment).
 		if err := txActive.Set(ctx, &domain.ActiveDeployment{
 			TenantID:             tenantID,
 			AppName:              appName,
 			DeploymentID:         rolledBackID,
 			LastGoodDeploymentID: nil,
+			// Preserve the auto-rollback flag across the rollback —
+			// it's a tenant preference, not a property of any single
+			// deployment, so it should survive a swap.
+			AutoRollbackEnabled: current.AutoRollbackEnabled,
 		}); err != nil {
 			return fmt.Errorf("swapping active deployment: %w", err)
+		}
+		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("clearing stability clock: %w", err)
 		}
 
 		// Snapshot the publish inputs inside the tx so the message

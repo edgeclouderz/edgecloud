@@ -58,6 +58,21 @@ enum Command {
         /// the deployment row at upload time).
         #[arg(long, value_name = "REGIONS", value_delimiter = ',')]
         regions: Vec<String>,
+
+        /// Opt in to auto-rollback (issue #74). When set, the server
+        /// records `auto_rollback_enabled = true` on this deployment
+        /// (and on the active slot at activate time). With this flag:
+        ///   - If the worker hits `restart_count >= 5` and the app is
+        ///     marked `crashed`, the worker POSTs to the control plane
+        ///     and the last-known-good deployment is restored.
+        ///   - If the currently-active deployment has been observed
+        ///     `running` for ≥ `STABLE_WINDOW_SECONDS` (default 30s),
+        ///     it is promoted to `last_good_deployment_id` so future
+        ///     crashes roll back to it instead of an older build.
+        /// Ignored when --id is set (auto-rollback is a deployment-time
+        /// property, not a session toggle).
+        #[arg(long)]
+        auto_rollback: bool,
     },
 
     /// Get deployment status.
@@ -128,8 +143,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
         Command::Build => commands::build::run(&cli.path),
-        Command::Deploy { app, id, regions } => {
-            commands::deploy::run(&cli.path, &app, id.as_deref(), &regions)
+        Command::Deploy { app, id, regions, auto_rollback } => {
+            commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback)
         }
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),

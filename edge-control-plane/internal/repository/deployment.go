@@ -37,14 +37,14 @@ func (r *DeploymentRepository) Create(ctx context.Context, d *domain.Deployment)
 	if regions == nil {
 		regions = pq.StringArray{}
 	}
-	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt)
+	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt, d.AutoRollbackEnabled)
 	return err
 }
 
 func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
 	var d domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id = $1`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE id = $1`
 	err := r.db.GetContext(ctx, &d, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -54,14 +54,14 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.
 
 func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName)
 	return deployments, err
 }
 
 func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
 	return deployments, err
 }
