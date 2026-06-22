@@ -62,8 +62,17 @@ type IngestLogsRequest struct {
 // IngestLogs handles POST /api/internal/logs — tenant log ingest from workers.
 //
 // Auth: WorkerAuth middleware (HMAC-SHA256 JWT). The handler:
+//   - rejects empty JWT identity claims (tenant_id/worker_id/region) up
+//     front so a buggy admin tool or test fixture that mints a token with
+//     a blank claim cannot insert orphan rows the query endpoint cannot
+//     filter on. Returns 400 (not 401) because auth already passed; the
+//     failure is in claim shape, not token validity.
 //   - caps request body at MaxLogBatchSize
 //   - caps the number of entries per batch at MaxEntries
+//   - validates each entry's level against the canonical set (debug/info/
+//     warn/error/trace) so a non-canonical value doesn't land an orphan
+//     row. Runs BEFORE the JWT overwrite loop so a rejected batch cannot
+//     attribute a (still-stamped) row to a real tenant.
 //   - overwrites each entry's TenantID, WorkerID, and Region with the JWT's
 //     claims (the worker can lie in the body, but the JWT is the truth —
 //     this is the security boundary that prevents a compromised worker
@@ -71,12 +80,23 @@ type IngestLogsRequest struct {
 //   - trusts DeploymentID, AppName, Level, Message, Labels from the body
 //
 // Response: 204 No Content on success. 400 on malformed body, oversize
-// batch, or too many entries. 401 is handled by WorkerAuth before the
-// handler runs. 500 on DB failure.
+// batch, too many entries, empty JWT identity, or non-canonical level.
+// 401 is handled by WorkerAuth before the handler runs. 500 on DB failure.
 func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	workerID := middleware.GetWorkerID(r.Context())
 	region := middleware.GetWorkerRegion(r.Context())
+
+	// Reject empty JWT identity up front. A token that passes
+	// WorkerAuth (HMAC + exp + iss) but carries a blank tenant_id,
+	// worker_id, or region claim would land orphan rows that
+	// aggregation / billing queries can't distinguish from auth bugs.
+	// 400 (not 401): auth passed; the failure is in claim shape.
+	if tenantID == "" || workerID == "" || region == "" {
+		log.Printf("ingest logs: missing identity (tenant=%q worker=%q region=%q)", tenantID, workerID, region)
+		http.Error(w, `{"error": "invalid worker identity"}`, http.StatusBadRequest)
+		return
+	}
 
 	// Cap request body before decoding. MaxBytesReader returns a
 	// *http.MaxBytesError when the (N+1)-th read past the cap is attempted.

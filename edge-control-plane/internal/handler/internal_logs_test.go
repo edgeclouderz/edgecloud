@@ -459,3 +459,93 @@ func validTokenWithSecret(t *testing.T, tenantID, workerID, secret string) strin
 	}
 	return signed
 }
+
+// validTokenWithClaims mints a token with arbitrary claim fields. The
+// empty-identity tests use this to forge a token whose tenant_id,
+// worker_id, or region is blank — simulating a buggy admin tool or
+// test fixture.
+func validTokenWithClaims(t *testing.T, tenantID, workerID, region string) string {
+	t.Helper()
+	claims := &middleware.WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    testJWTIssuer,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: workerID,
+		TenantID: tenantID,
+		Region:   region,
+		Apps:     []string{},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("failed to sign token: %v", err)
+	}
+	return signed
+}
+
+// TestIngestLogs_RejectsEmptyTenantID pins the empty-tenant_id guard.
+// A token with an empty tenant_id claim would otherwise land orphan
+// rows that the query endpoint cannot attribute to a real tenant.
+// The handler must reject the request with 400 before any row is
+// written.
+func TestIngestLogs_RejectsEmptyTenantID(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validTokenWithClaims(t, "", "w_fra_real", "fra")
+
+	entries := []domain.LogEntry{{AppName: "x", Level: "info", Message: "m"}}
+	rec := postLogs(t, server, token, entries, "", "", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid worker identity") {
+		t.Errorf("expected error to mention 'invalid worker identity', got: %s", rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo must not be called when tenant_id is empty, got %d calls", repo.calls)
+	}
+}
+
+// TestIngestLogs_RejectsEmptyWorkerID is the worker_id counterpart of
+// TestIngestLogs_RejectsEmptyTenantID.
+func TestIngestLogs_RejectsEmptyWorkerID(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validTokenWithClaims(t, "t_real", "", "fra")
+
+	entries := []domain.LogEntry{{AppName: "x", Level: "info", Message: "m"}}
+	rec := postLogs(t, server, token, entries, "", "", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid worker identity") {
+		t.Errorf("expected error to mention 'invalid worker identity', got: %s", rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo must not be called when worker_id is empty, got %d calls", repo.calls)
+	}
+}
+
+// TestIngestLogs_RejectsEmptyRegion is the region counterpart of
+// TestIngestLogs_RejectsEmptyTenantID.
+func TestIngestLogs_RejectsEmptyRegion(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validTokenWithClaims(t, "t_real", "w_fra_real", "")
+
+	entries := []domain.LogEntry{{AppName: "x", Level: "info", Message: "m"}}
+	rec := postLogs(t, server, token, entries, "", "", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid worker identity") {
+		t.Errorf("expected error to mention 'invalid worker identity', got: %s", rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo must not be called when region is empty, got %d calls", repo.calls)
+	}
+}
