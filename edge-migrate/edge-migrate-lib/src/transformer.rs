@@ -803,6 +803,50 @@ int main() {
         ));
     }
 
+    /// `socket(...)` as the argument of an outer function call
+    /// (e.g. `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`)
+    /// cannot be safely rewritten — the bare-expression emit form
+    /// leaves the surrounding `int fd = ...` with a stale `int`
+    /// type. Routes to `manual_review` with the original source
+    /// preserved verbatim. This is the follow-up to #129's fd-binding
+    /// fix: same class of bug (stale int type), different syntactic
+    /// shape.
+    #[test]
+    fn test_transform_socket_inside_outer_call_preserved_verbatim() {
+        let source = "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches, None);
+
+        // No WASI emit — the classifier detected the parent `arguments`
+        // node and flipped the match to NotTransformable.
+        assert!(
+            !result.transformed_source.contains("wasi_socket_tcp_create"),
+            "outer-call socket should not emit a wasi_socket_tcp_create call; got:\n{}",
+            result.transformed_source
+        );
+        // The original POSIX call is preserved verbatim inside its
+        // enclosing call.
+        assert!(
+            result
+                .transformed_source
+                .contains("wrap(socket(AF_INET, SOCK_STREAM, 0))"),
+            "original outer-call socket should be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        // And it shows up in manual_review so the developer knows.
+        assert_eq!(
+            result.manual_review.len(),
+            1,
+            "expected 1 manual_review entry, got {}",
+            result.manual_review.len()
+        );
+        assert!(matches!(
+            result.manual_review[0].pattern,
+            PatternKind::Posix(PosixPattern::SocketTcp)
+        ));
+    }
+
     /// Integration test: verify that a full socket sequence transforms to valid C
     /// (at minimum — parses as correct syntax). Runs clang -fsyntax-only if available.
     #[test]
