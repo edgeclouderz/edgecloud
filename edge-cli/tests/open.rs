@@ -62,7 +62,7 @@ async fn open_crashed_deployment_warns_and_exits_non_zero() {
     // we'd see a connection refused, not a 200, so the absence of
     // any other mock is fine.
     Mock::given(method("GET"))
-        .and(path("/api/status/d_crashed"))
+        .and(path("/api/v1/status/d_crashed"))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "d_crashed",
@@ -112,7 +112,7 @@ async fn open_force_skips_crash_preflight() {
 
     // Mount status with expect(0) — if the CLI calls it, the test fails.
     Mock::given(method("GET"))
-        .and(path("/api/status/d_crashed"))
+        .and(path("/api/v1/status/d_crashed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "d_crashed",
             "status": "crashed",
@@ -160,7 +160,7 @@ async fn open_ready_deployment_does_not_warn() {
     seed_project_with_state(&project, "myapp", "d_ok", "https://ok.example.test");
 
     Mock::given(method("GET"))
-        .and(path("/api/status/d_ok"))
+        .and(path("/api/v1/status/d_ok"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "d_ok",
             "status": "ready",

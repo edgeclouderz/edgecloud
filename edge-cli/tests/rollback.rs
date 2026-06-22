@@ -64,7 +64,7 @@ async fn rollback_flips_state_to_returned_deployment_id() {
     seed_project(&project, "myapp", "d_broken");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/myapp/rollback"))
+        .and(path("/api/v1/apps/myapp/rollback"))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "deployment_id": "d_prev",
@@ -107,7 +107,7 @@ async fn rollback_no_last_good_exits_non_zero() {
     seed_project(&project, "myapp", "d_only");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/myapp/rollback"))
+        .and(path("/api/v1/apps/myapp/rollback"))
         .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
             "error": "no previous deployment to roll back to",
         })))
@@ -149,7 +149,7 @@ async fn rollback_resolves_app_from_positional_when_state_differs() {
     seed_project(&project, "oldapp", "d_broken");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/newapp/rollback"))
+        .and(path("/api/v1/apps/newapp/rollback"))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "deployment_id": "d_prev",
@@ -182,7 +182,7 @@ async fn rollback_resolves_app_from_state_when_arg_empty() {
     seed_project(&project, "fromstate", "d_broken");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/fromstate/rollback"))
+        .and(path("/api/v1/apps/fromstate/rollback"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "deployment_id": "d_prev",
         })))
@@ -215,7 +215,7 @@ async fn rollback_does_not_overwrite_state_for_different_app() {
     seed_project(&project, "oldapp", "d_oldapp_state");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/newapp/rollback"))
+        .and(path("/api/v1/apps/newapp/rollback"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "deployment_id": "d_newapp_prev",
         })))

@@ -78,7 +78,7 @@ async fn activate_persists_returned_deployment_id_to_state_json() {
     seed_project(&project, "myapp", "d_old");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/myapp/activate/d_new"))
+        .and(path("/api/v1/apps/myapp/activate/d_new"))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "activated",
@@ -120,7 +120,7 @@ async fn activate_server_error_does_not_overwrite_state() {
     seed_project(&project, "myapp", "d_old");
 
     Mock::given(method("POST"))
-        .and(path("/api/apps/myapp/activate/d_new"))
+        .and(path("/api/v1/apps/myapp/activate/d_new"))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
         .expect(1)
         .mount(&server)

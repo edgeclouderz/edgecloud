@@ -233,6 +233,7 @@ mod tests {
             deployment_id: "d_test".to_string(),
             app_name: "myapp".to_string(),
             live_url: String::new(),
+            regions: vec![],
         };
         let got = url_to_print(Some(&s), "myapp");
         assert_eq!(got, None);
