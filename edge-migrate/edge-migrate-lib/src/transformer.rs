@@ -854,6 +854,7 @@ int main() {
         let source = r#"
 #include <stdio.h>
 int main() {
+    struct sockaddr_in addr;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     bind(fd, (struct sockaddr*)&addr, sizeof(addr));
     listen(fd, 128);
@@ -918,23 +919,38 @@ int main() {
         );
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
-        // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
-        // since WASI SDK is only available in the server-side build environment (Phase 6).
-        if std::env::var("EDGE_TEST_CLANG").is_ok()
-            && std::process::Command::new("clang")
-                .arg("--version")
-                .output()
-                .is_ok()
-        {
-            let pid = std::process::id();
-            let tmp_path = std::env::temp_dir().join(format!("edge_migrate_test_{}.c", pid));
-            std::fs::write(&tmp_path, &result.transformed_source)
+        // Gated the same way as the dedicated e2e regression net test
+        // (`test_transform_e2e_wasi_stubs_compile` below). Uses
+        // `tempfile::NamedTempFile` so the file is auto-cleaned on
+        // drop (and on panic in the assert), and `-I` + `-include` so
+        // the transformer's emitted `#include <wasi/*.h>` directives
+        // and the `wasi_stubs.h` POSIX stubs resolve.
+        if clang_available() {
+            let mut tmp = tempfile::Builder::new()
+                .suffix(".c")
+                .tempfile()
+                .expect("create temp file");
+            std::io::Write::write_all(&mut tmp, result.transformed_source.as_bytes())
                 .expect("write transformed source");
+            let testdata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("testdata");
+            let include_flag = format!("-I{}", testdata_dir.display());
+            let force_include_flag =
+                format!("-include{}", testdata_dir.join("wasi_stubs.h").display());
             let output = std::process::Command::new("clang")
-                .args(["-fsyntax-only", "-Werror", tmp_path.to_str().unwrap()])
+                .args([
+                    "-fsyntax-only",
+                    "-Werror",
+                    "-Wno-unused-variable",
+                    "-Wno-unused-but-set-variable",
+                    &include_flag,
+                    &force_include_flag,
+                    tmp.path().to_str().unwrap(),
+                ])
                 .output()
                 .expect("clang runs");
-            let _ = std::fs::remove_file(&tmp_path);
             assert!(
                 output.status.success(),
                 "clang syntax check failed: {}",
@@ -982,9 +998,16 @@ int main() {
         let matches = analyzer.analyze(&source);
         let result = Transformer::transform(&source, matches, None);
 
-        let pid = std::process::id();
-        let tmp_path = std::env::temp_dir().join(format!("edge_migrate_e2e_{}.c", pid));
-        std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
+        // Use `tempfile::NamedTempFile` so the file auto-cleans on
+        // drop (and on assert panic). The pre-existing pid-based
+        // naming leaked files if `clang` segfaulted mid-invocation
+        // and left a stale `.c` in the OS temp dir.
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".c")
+            .tempfile()
+            .expect("create temp file");
+        std::io::Write::write_all(&mut tmp, result.transformed_source.as_bytes())
+            .expect("write transformed source");
 
         let include_flag = format!("-I{}", testdata_dir.display());
         let force_include_flag = format!("-include{}", testdata_dir.join("wasi_stubs.h").display());
@@ -996,11 +1019,10 @@ int main() {
                 "-Wno-unused-but-set-variable",
                 &include_flag,
                 &force_include_flag,
-                tmp_path.to_str().unwrap(),
+                tmp.path().to_str().unwrap(),
             ])
             .output()
             .expect("clang runs");
-        let _ = std::fs::remove_file(&tmp_path);
 
         assert!(
             output.status.success(),
