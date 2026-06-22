@@ -16,11 +16,24 @@ pub enum TaskMessage {
     },
 }
 
+/// DeploymentRoute: a single destination in a weighted traffic split.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeploymentRoute {
+    pub deployment_id: String,
+    pub weight: u8,
+}
+
 /// AppSpec: specification for a single deployed app.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppSpec {
     pub deployment_id: String,
     pub deployment_hash: String,
+    /// Optional traffic split. When present, the worker runs ALL deployments
+    /// listed (not just the primary one) concurrently. None = legacy mode
+    /// (single deployment_id only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub routes: Option<Vec<DeploymentRoute>>,
     pub env: HashMap<String, String>,
     #[allow(dead_code)]
     pub allowlist: Vec<String>,

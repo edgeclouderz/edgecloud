@@ -31,7 +31,8 @@ impl Supervisor {
     /// Handle an incoming TaskMessage from NATS.
     ///
     /// Diffs the desired app set against currently running apps and
-    /// starts/stops apps accordingly.
+    /// starts/stops apps accordingly. Supports canary/blue-green: when
+    /// `spec.routes` is Some, all listed deployments run concurrently.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
         let TaskMessage::TaskUpdate {
             tenant_id,
@@ -39,39 +40,69 @@ impl Supervisor {
             ..
         } = msg;
 
-        let current_apps: HashMap<String, (String, AppInstanceStatus)> = {
+        // Compute the set of (app_name, deployment_id) keys currently running,
+        // and look up the deployment_id for each key so we can detect changes.
+        let (current_keys, current_deployment_ids): (
+            HashMap<(String, String), AppInstanceStatus>,
+            HashMap<(String, String), String>,
+        ) = {
             let state = self.state.read().await;
-            let mut map = HashMap::new();
-            for (name, inst) in state.apps.iter() {
-                let inst = inst.lock().await;
-                map.insert(
-                    name.clone(),
-                    (inst.deployment_id.clone(), inst.status.clone()),
-                );
+            let mut keys = HashMap::new();
+            let mut dep_ids = HashMap::new();
+            for (key, inst) in state.apps.iter() {
+                let inst = inst.lock().unwrap();
+                keys.insert(key.clone(), inst.status.clone());
+                dep_ids.insert(key.clone(), inst.deployment_id.clone());
             }
-            map
+            (keys, dep_ids)
         };
 
-        // Stop apps no longer in the desired set
-        for app_name in current_apps.keys() {
-            if !desired_apps.contains_key(app_name) {
-                if let Err(e) = self.stop_app(app_name).await {
-                    tracing::error!(app_name, err = %e, "failed to stop app");
+        // Build the desired set from the task message.
+        // When spec.routes is Some, run all listed deployments concurrently.
+        // When None, run the primary deployment_id (legacy behaviour).
+        let mut desired_keys: HashMap<(String, String), (&str, &AppSpec)> =
+            HashMap::new();
+        for (app_name, spec) in &desired_apps {
+            if let Some(ref routes) = spec.routes {
+                for route in routes {
+                    desired_keys.insert(
+                        (app_name.clone(), route.deployment_id.clone()),
+                        (app_name.as_str(), spec),
+                    );
+                }
+            } else {
+                desired_keys.insert(
+                    (app_name.clone(), spec.deployment_id.clone()),
+                    (app_name.as_str(), spec),
+                );
+            }
+        }
+
+        // Stop instances whose key is no longer desired.
+        for key in current_keys.keys() {
+            if !desired_keys.contains_key(key) {
+                if let Err(e) = self.stop_app(key).await {
+                    tracing::error!(app_name = %key.0, deployment_id = %key.1, err = %e, "failed to stop app");
                 }
             }
         }
 
-        // Start or update apps in the desired set
-        for (app_name, spec) in &desired_apps {
-            let is_new = !current_apps.contains_key(app_name);
-            let is_changed = current_apps
-                .get(app_name)
-                .map(|(dep_id, _)| dep_id != &spec.deployment_id)
-                .unwrap_or(false);
+        // Start or restart instances that are missing or changed.
+        for (key, (app_name, spec)) in &desired_keys {
+            let is_new = !current_keys.contains_key(key);
+            // Restart if: no entry (new), bad status (crashed/hung), OR the
+            // deployment_id at this key differs from what we want.
+            let current_dep_id = current_deployment_ids.get(key);
+            let needs_restart = is_new
+                || current_dep_id.map(|id| id != &spec.deployment_id).unwrap_or(false)
+                || current_keys
+                    .get(key)
+                    .map(|s| !matches!(s, AppInstanceStatus::Running | AppInstanceStatus::Starting))
+                    .unwrap_or(false);
 
-            if is_new || is_changed {
-                if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
-                    tracing::error!(app_name, err = %e, "failed to start app");
+            if needs_restart {
+                if let Err(e) = self.start_app(key, spec, &tenant_id).await {
+                    tracing::error!(app_name, deployment_id = %key.1, err = %e, "failed to start app");
                 }
             }
         }
@@ -82,21 +113,26 @@ impl Supervisor {
     /// Start a new app or restart a changed one.
     async fn start_app(
         &self,
-        app_name: &str,
+        key: &(String, String),
         spec: &AppSpec,
         tenant_id: &str,
     ) -> anyhow::Result<()> {
+        let app_name = &key.0;
+        let deployment_id = &key.1;
+
         // Validate tenant_id before any filesystem or store operations.
         // Reject path-traversal characters that could escape the base persistence directory.
         if !edge_runtime::is_safe_tenant_id(tenant_id) {
             anyhow::bail!("refusing to start app: unsafe tenant_id {:?}", tenant_id);
         }
 
-        tracing::info!(app_name, deployment_id = spec.deployment_id, "starting app");
+        tracing::info!(app_name, deployment_id, "starting app");
 
-        // Stop existing instance if present
-        if self.state.read().await.apps.contains_key(app_name) {
-            self.stop_app(app_name).await?;
+        // Stop existing instance at this specific (app_name, deployment_id) key.
+        // We do NOT stop other deployment_ids for the same app_name — that
+        // allows canary (v1 + v2) to run concurrently.
+        if self.state.read().await.apps.contains_key(key) {
+            self.stop_app(key).await?;
         }
 
         // Acquire a port.
@@ -189,6 +225,7 @@ impl Supervisor {
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
+        let dep_id_for_loop = deployment_id.clone();
         let handle = tokio::spawn(async move {
             Self::run_app_loop(
                 instance_pre_clone,
@@ -196,6 +233,7 @@ impl Supervisor {
                 env,
                 state_clone,
                 app_name_str.clone(),
+                dep_id_for_loop,
                 shutdown_rx,
                 max_memory_mb,
                 epoch_deadline_ticks,
@@ -208,7 +246,7 @@ impl Supervisor {
         });
 
         // Register the app instance (Arc<Mutex<>> for interior mutability).
-        let instance = Arc::new(Mutex::new(AppInstance {
+        let instance = Arc::new(std::sync::Mutex::new(AppInstance {
             deployment_id: spec.deployment_id.clone(),
             app_name: app_name.to_string(),
             tenant_id: tenant_id.to_string(),
@@ -225,23 +263,23 @@ impl Supervisor {
             .write()
             .await
             .apps
-            .insert(app_name.to_string(), instance);
+            .insert(key.clone(), instance);
 
-        tracing::info!(app_name, port = raw_port, "app started");
+        tracing::info!(app_name, deployment_id, port = raw_port, "app started");
         Ok(())
     }
 
-    /// Stop an app gracefully.
-    pub async fn stop_app(&self, app_name: &str) -> anyhow::Result<()> {
+    /// Stop an app gracefully by its (app_name, deployment_id) key.
+    pub async fn stop_app(&self, key: &(String, String)) -> anyhow::Result<()> {
         // Clone the Arc so we can lock it while the instance is still in the map.
         let instance = {
             let state = self.state.read().await;
-            state.apps.get(app_name).cloned()
+            state.apps.get(key).cloned()
         };
 
         let (port, handle, ticker) = if let Some(inst) = instance {
             // Extract port, handle, ticker, and sender while locked.
-            let mut inst = inst.lock().await;
+            let mut inst = inst.lock().unwrap();
             inst.status = AppInstanceStatus::Stopping;
             let port = inst.port;
             let handle = inst.handle.clone();
@@ -257,7 +295,7 @@ impl Supervisor {
         };
 
         // Remove from the map.
-        self.state.write().await.apps.remove(app_name);
+        self.state.write().await.apps.remove(key);
 
         // Free the port.
         {
@@ -291,7 +329,7 @@ impl Supervisor {
             }
         }
 
-        tracing::info!(app_name, "app stopped");
+        tracing::info!(app_name = %key.0, deployment_id = %key.1, "app stopped");
         Ok(())
     }
 
@@ -318,6 +356,7 @@ impl Supervisor {
         env: HashMap<String, String>,
         state: Arc<RwLock<WorkerState>>,
         app_name: String,
+        deployment_id: String,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
@@ -381,8 +420,8 @@ impl Supervisor {
                                 // Mark the app as crashed so the heartbeat reflects the failure.
                                 {
                                     let mut s = state.write().await;
-                                    if let Some(inst) = s.apps.get_mut(&app_name) {
-                                        let mut inst = inst.lock().await;
+                                    if let Some(inst) = s.apps.get_mut(&(app_name.clone(), deployment_id.clone())) {
+                                        let mut inst = inst.lock().unwrap();
                                         inst.status = AppInstanceStatus::Crashed { restart_count };
                                     }
                                 }
@@ -416,8 +455,8 @@ impl Supervisor {
                             );
                             if restart_count >= max_restarts {
                                 let mut s = state.write().await;
-                                if let Some(inst) = s.apps.get_mut(&app_name) {
-                                    let mut inst = inst.lock().await;
+                                if let Some(inst) = s.apps.get_mut(&(app_name.clone(), deployment_id.clone())) {
+                                    let mut inst = inst.lock().unwrap();
                                     inst.status = AppInstanceStatus::Hung;
                                 }
                                 break;
@@ -508,8 +547,8 @@ impl Supervisor {
         );
 
         let state = self.state.read().await;
-        for (app_name, inst) in &state.apps {
-            let inst = inst.lock().await;
+        for (key, inst) in &state.apps {
+            let inst = inst.lock().unwrap();
             let status = match &inst.status {
                 AppInstanceStatus::Running => "running",
                 AppInstanceStatus::Starting => "starting",
@@ -523,8 +562,11 @@ impl Supervisor {
                 | AppInstanceStatus::Stopping => None,
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
+            // Key by app_name:deployment_id so the ingress can distinguish
+            // multiple concurrent instances of the same app.
+            let hb_key = format!("{}:{}", key.0, key.1);
             msg.apps.insert(
-                app_name.clone(),
+                hb_key,
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
@@ -541,10 +583,10 @@ impl Supervisor {
 
     /// Stop all running apps (used during graceful shutdown).
     pub async fn stop_all_apps(&self) {
-        let app_names: Vec<String> = self.state.read().await.apps.keys().cloned().collect();
-        for app_name in &app_names {
-            if let Err(e) = self.stop_app(app_name).await {
-                tracing::error!(app_name, err = %e, "failed to stop app during shutdown");
+        let keys: Vec<(String, String)> = self.state.read().await.apps.keys().cloned().collect();
+        for key in &keys {
+            if let Err(e) = self.stop_app(key).await {
+                tracing::error!(app_name = %key.0, deployment_id = %key.1, err = %e, "failed to stop app during shutdown");
             }
         }
     }
