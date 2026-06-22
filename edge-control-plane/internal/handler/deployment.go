@@ -21,7 +21,7 @@ import (
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
-	trafficSvc   *service.TrafficService
+	trafficSvc    *service.TrafficService
 }
 
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {

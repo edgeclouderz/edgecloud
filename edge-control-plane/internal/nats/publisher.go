@@ -33,7 +33,7 @@ type TaskMessage struct {
 type AppConfig struct {
 	DeploymentID   string            `json:"deployment_id"`
 	DeploymentHash string            `json:"deployment_hash"`
-	Routes        []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
+	Routes         []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
 	Env            map[string]string `json:"env"`
 	Allowlist      []string          `json:"allowlist"`
 	MaxMemoryMB    int               `json:"max_memory_mb"`
