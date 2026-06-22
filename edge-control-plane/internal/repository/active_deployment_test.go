@@ -3,7 +3,10 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"regexp"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -29,12 +32,12 @@ func strPtr(s string) *string { return &s }
 // transactional state evolution of active_deployments across three
 // sequential "activations" of the same (tenant, app) pair.
 //
-//   1. First activate (d_v1): no prior row → last_good stays NULL.
-//   2. Second activate (d_v2): prior row (d_v1, NULL) → last_good flips
-//      to d_v1.
-//   3. Re-activate (d_v1): prior row (d_v2, d_v1) → last_good flips to
-//      d_v2 (the column tracks the deployment that WAS active before
-//      the call — re-activating v1 over v2 swaps the pointer back).
+//  1. First activate (d_v1): no prior row → last_good stays NULL.
+//  2. Second activate (d_v2): prior row (d_v1, NULL) → last_good flips
+//     to d_v1.
+//  3. Re-activate (d_v1): prior row (d_v2, d_v1) → last_good flips to
+//     d_v2 (the column tracks the deployment that WAS active before
+//     the call — re-activating v1 over v2 swaps the pointer back).
 //
 // We exercise this at the repository layer (not the service layer)
 // because the service's ActivateDeployment runs additional post-commit
@@ -167,6 +170,92 @@ func TestActiveDeploymentRepository_GetForUpdate_NoRowsReturnsNil(t *testing.T) 
 	})
 	if err != nil {
 		t.Fatalf("Transaction: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestSetStableSince_SetsOnceThenIsIdempotent pins the contract that
+// the stability clock arms only on the FIRST observation of
+// "running" for a deployment. Subsequent SetStableSince calls for
+// the same (tenant, app, deployment) MUST NOT overwrite a
+// non-NULL stable_since — otherwise a heartbeating app would never
+// advance past NOW() and the stability window would never fire.
+func TestSetStableSince_SetsOnceThenIsIdempotent(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	ts := time.Now().Truncate(time.Microsecond)
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since =`)).
+		WithArgs("t_test", "myapp", "d_v1", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.SetStableSince(context.Background(), "t_test", "myapp", "d_v1", ts); err != nil {
+		t.Fatalf("first SetStableSince: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestResetStableSinceForRollback_AutoRollbackEnabled exercises the
+// happy path of the new repo method used by both RollbackDeployment
+// and the worker-driven auto-rollback path. The CTE RETURNING
+// surfaces the now-active deployment_id to the caller in one round
+// trip; the prior deployment_id is the value RETURNING surfaces
+// after the swap (i.e., the deployment we just rolled FORWARD TO,
+// not the one we rolled away from — naming matches the doc on the
+// method itself).
+func TestResetStableSinceForRollback_AutoRollbackEnabled(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	// The CTE UPDATE RETURNING is matched by QueryRowxContext.
+	mock.ExpectQuery(`WITH updated AS`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deployment_id"}).AddRow("d_v1"))
+
+	got, err := repo.ResetStableSinceForRollback(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("ResetStableSinceForRollback: %v", err)
+	}
+	if got != "d_v1" {
+		t.Errorf("got %q, want d_v1", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood pins the
+// error-mapping logic in the "row matched no UPDATE branch" case.
+// We mock the CTE returning no rows, then a follow-up Get that
+// returns a row with LastGoodDeploymentID = nil — so the repo
+// must surface ErrNoLastGood (the string-matched sentinel) to the
+// caller. The handler depends on errors.Is matching this string
+// to return 409.
+func TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectQuery(`WITH updated AS`).
+		WithArgs("t_test", "myapp").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+		}).AddRow("t_test", "myapp", "d_v2", nil, true, nil))
+
+	_, err := repo.ResetStableSinceForRollback(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, errNoLastGoodSentinel) {
+		t.Fatalf("got err %v, want errNoLastGoodSentinel", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)

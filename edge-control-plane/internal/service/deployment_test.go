@@ -71,7 +71,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -114,7 +114,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -165,6 +165,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "US-EAST"}, // second is invalid
+		false,
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid region, got nil")
@@ -194,6 +195,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "BAD-1", "BAD-2", "eu-west"},
+		false,
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -230,6 +232,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		regions,
+		false,
 	)
 	if err == nil {
 		t.Fatal("expected error for over-cap regions, got nil")
@@ -278,6 +281,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 	dep, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		regions,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("Deploy at cap: %v", err)

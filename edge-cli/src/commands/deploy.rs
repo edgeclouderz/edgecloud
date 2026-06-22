@@ -16,12 +16,18 @@ use crate::state::State;
 /// path (with `--id`) ignores `regions` because regions are baked
 /// into the deployment row at upload time; activation reads them from
 /// the row, not from the CLI flag.
+///
+/// `auto_rollback` is the tenant opt-in for the worker-driven auto-
+/// rollback + heartbeat-driven stability-window promotion (issue
+/// #74). It is forwarded to the upload path; the activate path
+/// ignores it because the flag was already set at upload time and
+/// is read from the deployment row by ActivateDeployment.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String]) -> Result<()> {
+pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String], auto_rollback: bool) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions)
+    run_upload(path, app, regions, auto_rollback)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -29,8 +35,13 @@ pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String]) -> Resu
 /// `app`: positional app-name override. When empty, read from `edge.toml`.
 /// `regions`: list of regions to replicate to. Empty slice = server's
 /// default region.
+/// `auto_rollback`: tenant opt-in for issue #74 — when true, the
+/// deployment row and (at activate time) the active_deployments row
+/// get `auto_rollback_enabled = true`, which gates the
+/// worker-driven auto-rollback trigger and the heartbeat-driven
+/// stability-window promotion.
 #[cfg(feature = "network")]
-fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
+fn run_upload(path: &Path, app: &str, regions: &[String], auto_rollback: bool) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
         app.to_string()
@@ -49,7 +60,7 @@ fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes, regions)?;
+    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback)?;
 
     let live_url = resp.url.clone();
     // Persist the regions the server actually accepted (it may
@@ -145,7 +156,7 @@ fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _app: &str, _id: Option<&str>, _regions: &[String]) -> Result<()> {
+pub fn run(_path: &Path, _app: &str, _id: Option<&str>, _regions: &[String], _auto_rollback: bool) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
 

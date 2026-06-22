@@ -15,6 +15,12 @@ type DBTX interface {
 	GetContext(ctx context.Context, dest any, query string, args ...any) error
 	SelectContext(ctx context.Context, dest any, query string, args ...any) error
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	// QueryRowxContext returns a single row from a query that may
+	// return zero rows (caller checks sql.ErrNoRows). Both *sqlx.DB
+	// and *sqlx.Tx expose this method; we add it here so repositories
+	// can do single-row reads from inside a CTE / RETURNING without
+	// having to switch to *sqlx.DB at the call site.
+	QueryRowxContext(ctx context.Context, query string, args ...any) *sqlx.Row
 }
 
 // NewDB creates a new database connection.

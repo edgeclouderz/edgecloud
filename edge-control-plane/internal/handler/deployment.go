@@ -63,10 +63,11 @@ func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc se
 // Typed (vs the prior anonymous `map[string]interface{}`) so the contract
 // is explicit and the test asserts against a struct, not a string match.
 type deployResponse struct {
-	ID      string   `json:"id"`
-	Hash    string   `json:"hash"`
-	URL     string   `json:"url"`
-	Regions []string `json:"regions"`
+	ID                  string   `json:"id"`
+	Hash                string   `json:"hash"`
+	URL                 string   `json:"url"`
+	Regions             []string `json:"regions"`
+	AutoRollbackEnabled bool     `json:"auto_rollback_enabled"`
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +91,18 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse `?auto-rollback=true|false`. Defaults to false. Uses
+	// `strconv.ParseBool` so the user can pass any of the canonical
+	// truthy strings ("1", "t", "true", "TRUE", …); a non-boolean
+	// value returns 400 rather than being silently coerced to false
+	// (silent coercion would let a typo like `?auto-rollback=ture`
+	// disable a feature the tenant thought they had enabled).
+	autoRollback, aperr := parseBoolQuery(r.URL.Query().Get("auto-rollback"), false)
+	if aperr != nil {
+		http.Error(w, `{"error": "`+aperr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -97,7 +110,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions, autoRollback)
 	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
@@ -123,10 +136,11 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(deployResponse{
-		ID:      deployment.ID,
-		Hash:    deployment.Hash,
-		URL:     "https://" + domain.IngressHost(tenantID, appName),
-		Regions: domain.StringArrayTo(deployment.Regions),
+		ID:                  deployment.ID,
+		Hash:                deployment.Hash,
+		URL:                 "https://" + domain.IngressHost(tenantID, appName),
+		Regions:             domain.StringArrayTo(deployment.Regions),
+		AutoRollbackEnabled: deployment.AutoRollbackEnabled,
 	})
 }
 
@@ -172,6 +186,18 @@ func parseRegions(raw string) ([]string, error) {
 		return nil, fmt.Errorf("too many regions: %d (max %d)", len(out), service.MaxRegionsPerDeployment)
 	}
 	return out, nil
+}
+
+// parseBoolQuery parses a query-string boolean with a default when the
+// parameter is absent. Returns an error for unparseable values so the
+// caller can return 400 — silently coercing to the default would let
+// a typo disable a feature the tenant thought they had enabled
+// (e.g. `?auto-rollback=ture` ≠ `?auto-rollback=true`).
+func parseBoolQuery(raw string, defaultVal bool) (bool, error) {
+	if raw == "" {
+		return defaultVal, nil
+	}
+	return strconv.ParseBool(raw)
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
