@@ -92,6 +92,10 @@ impl Config {
     /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
     /// - `WORKER_JWT_ISSUER` (default: `edgecloud`)
     /// - `WORKER_JWT_SECRET` (default: empty — see warning in main.rs)
+    /// - `EDGE_WORKER_LOG_LEVEL` (default: `info`) — minimum level the
+    ///   worker log layer ships to the control plane via `LogForwarder`.
+    ///   Independent of `RUST_LOG`, which still controls local stdout
+    ///   verbosity via `EnvFilter`. See `forwarder_log_level`.
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -144,6 +148,31 @@ impl Config {
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
         })
+    }
+
+    /// Returns the minimum level the worker log layer ships to the
+    /// control plane. Default: `info`. Override via `EDGE_WORKER_LOG_LEVEL`
+    /// (one of `trace`, `debug`, `info`, `warn`, `error`; unknown values
+    /// fall back to `info`). Independent of `RUST_LOG`, which still
+    /// controls local stdout verbosity via the `EnvFilter`.
+    ///
+    /// The two knobs deliberately diverge: `RUST_LOG=info,edge_worker=debug`
+    /// sets *stdout* to debug for the worker crate, while
+    /// `EDGE_WORKER_LOG_LEVEL=debug` sets the *forwarder* threshold to
+    /// debug. Most operators will leave both at `info`.
+    pub fn forwarder_log_level(&self) -> tracing::Level {
+        match std::env::var("EDGE_WORKER_LOG_LEVEL")
+            .unwrap_or_else(|_| "info".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "info" => tracing::Level::INFO,
+            "warn" => tracing::Level::WARN,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
+        }
     }
 }
 

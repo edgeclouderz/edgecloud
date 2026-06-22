@@ -11,3 +11,4 @@ pub mod nats;
 pub mod port_pool;
 pub mod state;
 pub mod supervisor;
+pub mod tracing_layer;

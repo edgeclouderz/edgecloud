@@ -16,7 +16,11 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+
+use edge_worker::tracing_layer::WorkerLogLayer;
 
 use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
@@ -29,17 +33,67 @@ use crate::supervisor::Supervisor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Load configuration FIRST so we can construct the JWT signer and
+    // LogForwarder before tracing init. This hoisting lets the new
+    // WorkerLogLayer (wired in below) capture the JWT-secret warning
+    // and every tracing call that follows.
+    let config = Config::from_env()?;
+
+    // Initialize JWT signer — signs outbound calls to the control plane's
+    // /api/internal/* endpoints. Worker is per-tenant in this design; the
+    // JWT carries the worker's tenant_id claim.
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
+
+    // Initialize LogForwarder — receives tenant `emit_log` records from the
+    // runtime AND worker-side `tracing` events via WorkerLogLayer. One per
+    // worker; per-app AppLogContext travels with each guest record.
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer.clone(),
+    );
+
+    // Without a JWT secret the worker can still run — NATS heartbeats and
+    // the deployment supervisor don't need it — but every outbound call
+    // to /api/internal/* will 401 until the secret is provisioned. Warn
+    // loudly so an operator notices instead of discovering it from a
+    // silent drop in log forwarding. A real fix needs a JWT bootstrap
+    // handshake (see follow-up issue D).
+    if config.worker_jwt_secret.is_empty() {
+        tracing::warn!(
+            "WORKER_JWT_SECRET is not set; /api/internal/* calls will return 401 \
+             until the secret is provisioned. NATS heartbeats and the deployment \
+             supervisor keep running — only the log forwarder and downloader are \
+             affected. See follow-up issue D for the bootstrap handshake."
+        );
+    }
+
+    // Initialize tracing. The Registry stack is:
+    //   - EnvFilter (RUST_LOG-controlled; default info)
+    //   - fmt::Layer (local stdout — preserves existing behavior)
+    //   - WorkerLogLayer (ships worker-side events to the control plane
+    //     via log_forwarder, with EDGE_WORKER_LOG_LEVEL controlling the
+    //     threshold; default info)
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_layer = WorkerLogLayer::new(
+        log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
+        config.forwarder_log_level(),
+    );
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_layer)
         .init();
 
     tracing::info!("edge-worker starting");
 
-    // Load configuration from environment
-    let config = Config::from_env()?;
     tracing::info!(
         worker_id = %config.worker_id,
         region = %config.region,
@@ -59,32 +113,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize shared state
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-
-    // Initialize JWT signer — signs outbound calls to the control plane's
-    // /api/internal/* endpoints. Worker is per-tenant in this design; the
-    // JWT carries the worker's tenant_id claim.
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-
-    // Without a JWT secret the worker can still run — NATS heartbeats and
-    // the deployment supervisor don't need it — but every outbound call
-    // to /api/internal/* will 401 until the secret is provisioned. Warn
-    // loudly so an operator notices instead of discovering it from a
-    // silent drop in log forwarding. A real fix needs a JWT bootstrap
-    // handshake (see follow-up issue D).
-    if config.worker_jwt_secret.is_empty() {
-        tracing::warn!(
-            "WORKER_JWT_SECRET is not set; /api/internal/* calls will return 401 \
-             until the secret is provisioned. NATS heartbeats and the deployment \
-             supervisor keep running — only the log forwarder and downloader are \
-             affected. See follow-up issue D for the bootstrap handshake."
-        );
-    }
 
     // Initialize downloader
     let downloader = Arc::new(Downloader::new(
@@ -107,16 +135,6 @@ async fn main() -> anyhow::Result<()> {
     // Create the shutdown broadcast channel for the heartbeat task.
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-    // Initialize LogForwarder — receives tenant `emit_log` records from the
-    // runtime and ships them to the control plane's POST /api/internal/logs.
-    // One per worker; per-app AppLogContext travels with each record.
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer,
-    );
 
     // Create the supervisor
     let supervisor = Arc::new(Supervisor {
