@@ -114,8 +114,20 @@ func (r *DomainRepository) AtomicDelete(ctx context.Context, tenantID, appName, 
 // Called by the v2 Caddy webhook via `POST /api/internal/domains/{id}/status`.
 // v1 never calls this from anywhere; it's exposed for completeness so the
 // service doesn't need to be updated when the webhook lands.
-func (r *DomainRepository) UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error {
+//
+// Returns `false` (with no error) when no row matches the id, so the
+// handler can render a 404 instead of a misleading 204. Without this
+// distinction a stale id would silently look like success — see the
+// review on PR #133.
+func (r *DomainRepository) UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error) {
 	query := `UPDATE domains SET status = $2, last_error = $3 WHERE id = $1`
-	_, err := r.db.ExecContext(ctx, query, id, status, lastError)
-	return err
+	res, err := r.db.ExecContext(ctx, query, id, status, lastError)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

@@ -93,7 +93,7 @@ type DomainRepositoryInterface interface {
 	CountByApp(ctx context.Context, tenantID, appName string) (int, error)
 	ListAll(ctx context.Context) ([]domain.Domain, error)
 	AtomicDelete(ctx context.Context, tenantID, appName, fqdn string) (bool, error)
-	UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error
+	UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error)
 }
 
 // DomainService handles custom-domain business logic.
@@ -119,6 +119,15 @@ func NewDomainService(domainRepo *repository.DomainRepository, appSvc appLookupF
 //
 // Returns ErrInvalidFQDN, ErrDomainQuotaExceeded, or an unwrapped DB
 // error. Callers (handlers, tests) match via errors.Is.
+//
+// The per-app quota (`MaxDomainsPerApp = 50`) is BEST-EFFORT — the
+// count and insert are not wrapped in a transaction, so two concurrent
+// calls can both observe `count == 49` and both insert, briefly
+// exceeding the cap. The 50-domain ceiling and low request rate make
+// the race window small; the v2 follow-up closes it with a
+// `SELECT … FOR UPDATE` on the parent `apps` row, mirroring
+// `service/deployment.go`. The follow-up must also add a sqlmock-based
+// integration test that pins the no-overshoot invariant.
 func (s *DomainService) AddDomain(ctx context.Context, tenantID, appName, fqdn string) (*domain.Domain, error) {
 	if !IsValidFQDN(fqdn) {
 		return nil, fmt.Errorf("%w %q: must be RFC-1035 shape, lowercase, ≤253 chars, no wildcard, no .edgecloud.dev suffix", ErrInvalidFQDN, fqdn)
@@ -132,6 +141,17 @@ func (s *DomainService) AddDomain(ctx context.Context, tenantID, appName, fqdn s
 		return nil, fmt.Errorf("%w: %s", ErrAppNotFound, appName)
 	}
 
+	// BEST-EFFORT quota check (see AddDomain's doc comment). The
+	// count + insert here are not wrapped in a transaction, so two
+	// concurrent `AddDomain` calls can both observe `count == cap-1`
+	// and both insert. The 50-domain cap is high enough and the
+	// request rate low enough that the race window is small, but
+	// this MUST be closed in v2 — the planned fix is a tx-wrapped
+	// `SELECT … FROM apps WHERE id = $1 FOR UPDATE` followed by
+	// `CountByApp` and `Create` on the same `*sqlx.Tx`, mirroring
+	// the pattern in `service/deployment.go`. The follow-up will
+	// also add an integration test that pins the no-overshoot
+	// invariant under concurrent inserts.
 	count, err := s.domainRepo.CountByApp(ctx, tenantID, appName)
 	if err != nil {
 		return nil, fmt.Errorf("counting domains: %w", err)
@@ -198,13 +218,16 @@ func (s *DomainService) RemoveDomain(ctx context.Context, tenantID, appName, fqd
 // would just fail again — the operator needs to fix the upstream
 // issue first).
 //
-// Known gap: this does NOT check that the underlying (tenant, app)
+// KNOWN GAP: this does NOT check that the underlying (tenant, app)
 // still exists. If the tenant is deleted, the FK cascade removes the
 // domain row and we correctly return false. But if the *app* is
 // deleted (no FK cascade), the domain row survives and we incorrectly
-// return true. This is pinned by a handler test; the fix requires a
-// composite FK on (tenant_id, app_name) → apps(tenant_id, name),
-// deferred to a follow-up that also adds the missing unique index.
+// return true. Pinned by
+// `handler.TestInternal_TlsAllowed_OrphanedDomain_KnownGap`. The
+// fix requires a composite FK on (tenant_id, app_name) → apps, which
+// in turn requires a new `apps(tenant_id, name)` unique index —
+// deferred to a follow-up that bundles the index migration, the FK
+// addition, and a v2 test that flips the assertion to `404`.
 func (s *DomainService) IsTlsAllowed(ctx context.Context, fqdn string) (bool, error) {
 	d, err := s.domainRepo.GetByFQDN(ctx, fqdn)
 	if err != nil {
@@ -233,9 +256,17 @@ func (s *DomainService) GetDomainByID(ctx context.Context, id string) (*domain.D
 // UpdateStatus updates the status (and optionally last_error) of a
 // domain row. Used by the v2 Caddy event hook via
 // `POST /api/internal/domains/{id}/status`. v1 has no callers.
+//
+// Returns ErrDomainNotFound when no row matched the id — the handler
+// maps that to 404. A future caller that wants to silently no-op
+// instead of surfacing a 404 must opt in explicitly.
 func (s *DomainService) UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error {
-	if err := s.domainRepo.UpdateStatus(ctx, id, status, lastError); err != nil {
+	ok, err := s.domainRepo.UpdateStatus(ctx, id, status, lastError)
+	if err != nil {
 		return fmt.Errorf("updating domain status: %w", err)
+	}
+	if !ok {
+		return ErrDomainNotFound
 	}
 	return nil
 }
