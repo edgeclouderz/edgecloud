@@ -24,13 +24,14 @@ type Tenant struct {
 
 // Quota defines resource limits for a tenant.
 type Quota struct {
-	TenantID          string `db:"tenant_id"`
-	MaxDeployments    int    `db:"max_deployments"`
-	MaxApps           int    `db:"max_apps"`
-	MaxWorkers        int    `db:"max_workers"`
-	MaxMemoryMB       int    `db:"max_memory_mb"`
-	MaxOutboundMB     int    `db:"max_outbound_mb"`
-	UsedOutboundBytes int64  `db:"used_outbound_bytes"`
+	TenantID          string    `db:"tenant_id"`
+	MaxDeployments    int       `db:"max_deployments"`
+	MaxApps           int       `db:"max_apps"`
+	MaxWorkers        int       `db:"max_workers"`
+	MaxMemoryMB       int       `db:"max_memory_mb"`
+	MaxOutboundMB     int       `db:"max_outbound_mb"`
+	UsedOutboundBytes int64     `db:"used_outbound_bytes"`
+	QuotaPeriodStart  time.Time `db:"quota_period_start"`
 }
 
 // DefaultQuota returns free-tier defaults.

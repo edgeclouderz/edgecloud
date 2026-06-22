@@ -546,12 +546,18 @@ impl Supervisor {
         msg
     }
 
-    /// Reset all app meters after a successful heartbeat publish so the next
-    /// interval carries a delta rather than a cumulative lifetime total.
-    pub async fn reset_meters(&self) {
+    /// Subtract the published heartbeat's per-app counts from each meter after
+    /// a successful publish. Using subtract_delta rather than zeroing the counter
+    /// preserves any bytes recorded between the snapshot and this call — those
+    /// will appear in the next heartbeat interval rather than being silently lost.
+    pub async fn reset_meters_after(&self, heartbeat: &HeartbeatMessage) {
         let state = self.state.read().await;
-        for inst in state.apps.values() {
-            inst.lock().await.meter.reset();
+        for (app_name, status) in &heartbeat.apps {
+            if let Some(inst) = state.apps.get(app_name) {
+                let inst = inst.lock().await;
+                inst.meter
+                    .subtract_delta(status.request_count, status.outbound_bytes);
+            }
         }
     }
 

@@ -53,11 +53,13 @@ impl RequestMeter {
         self.outbound_bytes.load(Ordering::Relaxed)
     }
 
-    /// Reset both counters. Called after reporting to the control plane so
-    /// each heartbeat interval carries a delta rather than a cumulative total.
-    pub fn reset(&self) {
-        self.count.store(0, Ordering::Relaxed);
-        self.outbound_bytes.store(0, Ordering::Relaxed);
+    /// Subtract previously-snapshotted values from the counters. Called after a
+    /// successful heartbeat publish so only the delta not yet reported remains.
+    /// Using fetch_sub rather than store(0) preserves any bytes recorded after
+    /// the snapshot was taken — those will appear in the next heartbeat interval.
+    pub fn subtract_delta(&self, count_delta: u64, bytes_delta: u64) {
+        self.count.fetch_sub(count_delta, Ordering::Relaxed);
+        self.outbound_bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
     }
 
     /// Get a snapshot of the meter state for reporting.
@@ -102,14 +104,20 @@ mod tests {
     }
 
     #[test]
-    fn reset_zeroes_both_counters() {
+    fn subtract_delta_removes_only_snapshotted_values() {
         let m = RequestMeter::new("t_test".into(), "d_test".into());
         m.record_request();
+        m.record_request();
         m.record_outbound_bytes(4096);
-        m.reset();
         let snap = m.snapshot();
-        assert_eq!(snap.request_count, 0);
-        assert_eq!(snap.outbound_bytes, 0);
+        // Simulate a new request arriving after the snapshot but before reset.
+        m.record_request();
+        m.record_outbound_bytes(100);
+        m.subtract_delta(snap.request_count, snap.outbound_bytes);
+        // Only the post-snapshot delta should remain.
+        let after = m.snapshot();
+        assert_eq!(after.request_count, 1);
+        assert_eq!(after.outbound_bytes, 100);
     }
 
     #[test]
