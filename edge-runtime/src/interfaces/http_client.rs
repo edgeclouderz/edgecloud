@@ -186,6 +186,7 @@ impl HttpClient {
                             headers: HashMap::new(),
                             body: ResponseBody::None,
                             error: Some(message),
+                            body_bytes: 0,
                         };
                     }
                     attempt += 1;
@@ -263,6 +264,7 @@ impl HttpClient {
                 Ok(HttpResponse {
                     status,
                     headers: response_headers,
+                    body_bytes: body.len() as u64,
                     body: ResponseBody::Buffered(body.to_vec()),
                     error: None,
                 })
@@ -297,6 +299,7 @@ impl HttpClient {
                     headers: HashMap::new(),
                     body: ResponseBody::None,
                     error: Some(format!("invalid method: {}", e)),
+                    body_bytes: 0,
                 };
             }
         };
@@ -328,6 +331,7 @@ impl HttpClient {
                     headers: HashMap::new(),
                     body: ResponseBody::None,
                     error: Some(e.to_string()),
+                    body_bytes: 0,
                 };
             }
         };
@@ -360,11 +364,15 @@ impl HttpClient {
             // Drop producer → consumer's next read_chunk observes Closed.
         });
 
+        // body_bytes is 0 for streaming responses: bytes are counted per-chunk
+        // in the WIT read_chunk binding (runtime.rs streams_impl) as the guest
+        // consumes the stream, via IncomingEntry::count_as_outbound.
         HttpResponse {
             status,
             headers: response_headers,
             body: ResponseBody::Streamed(stream),
             error: None,
+            body_bytes: 0,
         }
     }
 }
@@ -445,6 +453,12 @@ pub struct HttpResponse {
     pub body: ResponseBody,
     /// Human-readable error message. Empty on success.
     pub error: Option<String>,
+    /// Byte count of the response body, for billing.
+    /// Set to the actual body size on buffered responses.
+    /// Zero on streaming responses — bytes are counted per-chunk in the
+    /// WIT `read_chunk` binding as the guest consumes the stream.
+    /// Zero on error paths.
+    pub body_bytes: u64,
 }
 
 #[cfg(test)]
