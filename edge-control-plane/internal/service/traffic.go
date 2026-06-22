@@ -13,7 +13,7 @@ import (
 // TrafficService handles traffic split business logic.
 type TrafficService struct {
 	splitRepo      *repository.TrafficSplitRepository
-	deploymentRepo  *repository.DeploymentRepository
+	deploymentRepo *repository.DeploymentRepository
 	activeRepo     *repository.ActiveDeploymentRepository
 	appEnvRepo     *repository.AppEnvRepository
 	tenantRepo     *repository.TenantRepository
@@ -163,10 +163,10 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 			appName: {
 				DeploymentID:   splits[0].DeploymentID, // primary; Routes drives worker behavior
 				DeploymentHash: primaryHash,
-				Routes:        routes,
-				Env:           envMap,
-				Allowlist:     domain.StringArrayTo(tenant.AllowlistedDestinations),
-				MaxMemoryMB:   maxMemoryMB,
+				Routes:         routes,
+				Env:            envMap,
+				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
+				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
 	}
