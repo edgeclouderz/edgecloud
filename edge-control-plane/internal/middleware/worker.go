@@ -18,7 +18,24 @@ type WorkerClaims struct {
 	TenantID string   `json:"tenant_id"`
 	Region   string   `json:"region"`
 	Apps     []string `json:"apps"`
+	// Role distinguishes the bearer: per-worker tokens carry
+	// RoleWorker (or empty, for backward compatibility with tokens
+	// minted before this field existed); the long-lived ingress
+	// service token carries RoleIngest so the control plane can
+	// gate cross-tenant reads (ListDomains, TlsAllowed,
+	// UpdateDomainStatus) to the poller only — a per-worker JWT
+	// would otherwise see every tenant's domain mapping.
+	Role string `json:"role,omitempty"`
 }
+
+// Role constants for the Role claim.
+const (
+	// RoleWorker is the default for any worker-issued JWT.
+	RoleWorker = "worker"
+	// RoleIngest is for the long-lived ingress service token
+	// (cmd/api/mint.go).
+	RoleIngest = "ingest"
+)
 
 // WorkerJWTConfig holds the HMAC secret and expected issuer.
 type WorkerJWTConfig struct {
@@ -31,6 +48,7 @@ const (
 	WorkerTenantIDKey contextKey = "worker_tenant_id"
 	WorkerRegionKey   contextKey = "worker_region"
 	WorkerAppsKey     contextKey = "worker_apps"
+	WorkerRoleKey     contextKey = "worker_role"
 )
 
 // VerifyWorkerJWT parses and validates a HMAC-SHA256 JWT.
@@ -91,6 +109,7 @@ func WorkerAuth(cfg WorkerJWTConfig) func(http.Handler) http.Handler {
 			ctx = context.WithValue(ctx, WorkerTenantIDKey, claims.TenantID)
 			ctx = context.WithValue(ctx, WorkerRegionKey, claims.Region)
 			ctx = context.WithValue(ctx, WorkerAppsKey, claims.Apps)
+			ctx = context.WithValue(ctx, WorkerRoleKey, claims.Role)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -118,4 +137,35 @@ func GetWorkerRegion(ctx context.Context) string {
 		return r
 	}
 	return ""
+}
+
+// GetWorkerRole extracts the role claim from context.
+func GetWorkerRole(ctx context.Context) string {
+	if r, ok := ctx.Value(WorkerRoleKey).(string); ok {
+		return r
+	}
+	return ""
+}
+
+// HasRole reports whether the request's JWT carries the named role.
+func HasRole(ctx context.Context, role string) bool {
+	got := GetWorkerRole(ctx)
+	if got == "" {
+		got = RoleWorker
+	}
+	return got == role
+}
+
+// RequireWorkerRole returns a middleware that 403s any request whose
+// JWT does not carry the named role.
+func RequireWorkerRole(role string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !HasRole(r.Context(), role) {
+				httperror.ForbiddenCtx(w, r, "insufficient role")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
