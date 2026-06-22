@@ -1067,7 +1067,8 @@ impl HttpServer {
             res = timeout_at(deadline, ch_rx) => {
                 match res {
                     Ok(Ok(HttpResponse { status, headers, body })) => {
-                        if let Err(e) = Self::write_response(
+                        let body_len = body.len() as u64;
+                        match Self::write_response(
                             &mut write_half,
                             status,
                             &headers,
@@ -1077,7 +1078,14 @@ impl HttpServer {
                         )
                         .await
                         {
-                            tracing::warn!(req_id = %id, err = %e, "response write error");
+                            Ok(()) => {
+                                if let Some(ref m) = meter {
+                                    m.record_outbound_bytes(body_len);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(req_id = %id, err = %e, "response write error");
+                            }
                         }
                     }
                     Ok(Err(_)) => {
@@ -1091,11 +1099,17 @@ impl HttpServer {
             res = timeout_at(deadline, stream_ch_rx) => {
                 match res {
                     Ok(Ok(StreamingResponseParts { head, mut adapter })) => {
-                        if let Err(e) =
-                            Self::write_streaming_response(&mut write_half, &head, &mut adapter, deadline)
-                                .await
+                        match Self::write_streaming_response(&mut write_half, &head, &mut adapter, deadline)
+                            .await
                         {
-                            tracing::warn!(req_id = %id, err = %e, "streaming response write error");
+                            Ok(body_bytes) => {
+                                if let Some(ref m) = meter {
+                                    m.record_outbound_bytes(body_bytes);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(req_id = %id, err = %e, "streaming response write error");
+                            }
                         }
                     }
                     Ok(Err(_)) => {
@@ -1124,12 +1138,13 @@ impl HttpServer {
     /// - Hop-by-hop / host-reserved headers (RFC 7230 §6.1) are stripped
     ///   from the guest's set before writing, to avoid response splitting
     ///   and spoofing.
+    /// Returns the number of body bytes written on success.
     async fn write_streaming_response(
         stream: &mut SharedWriteHalf,
         head: &StreamingResponseHead,
         adapter: &mut OutgoingStreamAdapter,
         deadline: Instant,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<u64, std::io::Error> {
         use futures::StreamExt;
 
         // F3 — require Content-Length; reject Content-Encoding; strip hop-by-hop.
@@ -1188,6 +1203,7 @@ impl HttpServer {
         // instead of pinning a connection task indefinitely. The
         // `biased;` modifier matches the rest of this file and prefers
         // making progress on chunks before checking the timer.
+        let mut body_bytes: u64 = 0;
         loop {
             let chunk_fut = adapter.next();
             tokio::select! {
@@ -1195,6 +1211,7 @@ impl HttpServer {
                 item = chunk_fut => {
                     let Some(item) = item else { break; };
                     let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
+                    body_bytes += chunk.len() as u64;
                     timeout_at(deadline, stream.write_all(&chunk)).await??;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
@@ -1206,7 +1223,7 @@ impl HttpServer {
             }
         }
         timeout_at(deadline, stream.flush()).await??;
-        Ok(())
+        Ok(body_bytes)
     }
 
     /// Read and parse the HTTP headers only — the body is consumed by

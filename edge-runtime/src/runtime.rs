@@ -369,6 +369,14 @@ impl HttpClientHost for RuntimeState {
             tracestate,
         ));
 
+        // Count buffered response bytes immediately. Streaming response bytes
+        // (body_bytes == 0) are counted per-chunk in streams_impl::read_chunk.
+        if resp.body_bytes > 0 {
+            if let Some(ref meter) = self.http_server.meter {
+                meter.record_outbound_bytes(resp.body_bytes);
+            }
+        }
+
         let body = match resp.body {
             http_client::ResponseBody::None => ResponseBodySource::None,
             http_client::ResponseBody::Buffered(bytes) => ResponseBodySource::Buffered(bytes),
@@ -381,7 +389,7 @@ impl HttpClientHost for RuntimeState {
                     self.incoming_streams
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(rep, IncomingEntry { stream });
+                        .insert(rep, IncomingEntry { stream, count_as_outbound: true });
                     let handle = wasmtime::component::Resource::<
                         crate::edge::cloud::streams::Incoming,
                     >::new_own(rep);
@@ -593,7 +601,7 @@ impl HttpServerHost for RuntimeState {
                         self.incoming_streams
                             .lock()
                             .unwrap()
-                            .insert(rep, IncomingEntry { stream });
+                            .insert(rep, IncomingEntry { stream, count_as_outbound: false });
                         let handle = wasmtime::component::Resource::<
                             crate::edge::cloud::streams::Incoming,
                         >::new_own(rep);
@@ -709,15 +717,21 @@ mod streams_impl {
             self_: Resource<Incoming>,
             _max_bytes: u32,
         ) -> Result<Vec<u8>, WitStreamError> {
-            let mut cloned = {
+            let (mut cloned, count_as_outbound) = {
                 let incoming = self
                     .incoming_streams
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let entry = incoming.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
-                entry.stream.clone()
+                (entry.stream.clone(), entry.count_as_outbound)
             };
-            block_on_timeout(cloned.read_chunk()).map_err(streams::to_wit)
+            let chunk = block_on_timeout(cloned.read_chunk()).map_err(streams::to_wit)?;
+            if count_as_outbound {
+                if let Some(ref meter) = self.http_server.meter {
+                    meter.record_outbound_bytes(chunk.len() as u64);
+                }
+            }
+            Ok(chunk)
         }
 
         fn cancel(&mut self, self_: Resource<Incoming>) {
