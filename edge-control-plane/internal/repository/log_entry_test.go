@@ -151,8 +151,9 @@ func TestLogEntryRepository_DeleteOlderThanBatches_UsesServerNOW(t *testing.T) {
 	defer cleanup()
 
 	// The arg is retention.Seconds() (a float64), not a time.Time.
+	// batchSize is bound as int64 (matching LIMIT's bigint type).
 	mock.ExpectExec(`DELETE FROM logs WHERE id IN \(SELECT id FROM logs WHERE ts < NOW\(\) - make_interval\(secs => \$1\) LIMIT \$2\)`).
-		WithArgs(7*24*60*60.0, 10_000).
+		WithArgs(7*24*60*60.0, int64(10_000)).
 		WillReturnResult(sqlmock.NewResult(0, 100))
 
 	_, err := repo.DeleteOlderThanBatched(
@@ -162,5 +163,38 @@ func TestLogEntryRepository_DeleteOlderThanBatches_UsesServerNOW(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations (SQL shape or args wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_DeleteOlderThanBatches_BoundInt64 pins the
+// type of the LIMIT $2 binding. The Go-side parameter is int
+// (declared in the function signature), but Postgres LIMIT expects
+// bigint. Without the explicit int64(batchSize) cast, the driver
+// binds an int4 and strict-type Postgres configurations fail at
+// execution time. sqlmock's WithArgs does not enforce server-side
+// type strictness on its own, so this test pins the explicit
+// int64 value to catch any future regression that drops the cast.
+//
+// Other tests in this file use bare integer literals (e.g. 10_000)
+// in WithArgs and pass because sqlmock's value matcher coerces
+// int → int64 for the comparison. That coercion masks a real
+// regression on the wire; this test uses an explicit int64 to make
+// the binding type part of the contract.
+func TestLogEntryRepository_DeleteOlderThanBatches_BoundInt64(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	const wantBatchSize = int64(10_000)
+	mock.ExpectExec(`DELETE FROM logs WHERE id IN \(SELECT id FROM logs WHERE ts < NOW\(\) - make_interval\(secs => \$1\) LIMIT \$2\)`).
+		WithArgs(7*24*60*60.0, wantBatchSize).
+		WillReturnResult(sqlmock.NewResult(0, 100))
+
+	_, err := repo.DeleteOlderThanBatched(
+		context.Background(), 7*24*time.Hour, int(wantBatchSize), 100)
+	if err != nil {
+		t.Fatalf("DeleteOlderThanBatched: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (LIMIT $2 was not bound as int64): %v", err)
 	}
 }
