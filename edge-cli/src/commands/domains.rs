@@ -19,7 +19,6 @@ use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
-use crate::state::State;
 
 /// The four subcommands. Mirrors the route table in
 /// `edge-control-plane/internal/handler/domain.go`.
@@ -33,23 +32,16 @@ pub enum DomainsAction {
 
 impl DomainsAction {
     /// Run the action. `path` is the project root, used to load
-    /// `.edge/state.json` (for the app name) and `edge.toml` (for the
-    /// control plane URL). The `app` arg in each variant overrides
-    /// the on-disk state — `edge domains add myotherapp foo.com` is
-    /// intentional, not a bug.
+    /// `edge.toml` (for the control plane URL).
+    ///
+    /// We intentionally do NOT require `.edge/state.json` here. Every
+    /// subcommand takes an explicit `app` arg, so the state file's
+    /// `app_name` is redundant. Forcing its presence would mean
+    /// `edge domains add myotherapp foo.com` fails when `myotherapp`
+    /// has never been deployed — a 404 from the control plane is
+    /// the right "no such app" signal.
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
-        // We require state.json to exist — the CLI's "what app am I
-        // managing" answer comes from there. Subcommands that take an
-        // explicit `app` arg can still target a different app, but
-        // they need to know the project is set up first.
-        let state = State::load(path)
-            .with_context(|| "no deployment found — run `edge deploy` first")?;
-        // Touch state to silence the unused warning when the caller
-        // passes an explicit `app` (we don't fall back to it, but we
-        // do verify the project has been initialized).
-        let _ = state.app_name;
-
         let edge_toml = EdgeToml::from_path(path)?;
         let client = ApiClient::new(edge_toml.deployment.api.clone())?;
         let domains = client.domains();
