@@ -803,6 +803,50 @@ int main() {
         ));
     }
 
+    /// `socket(...)` as the argument of an outer function call
+    /// (e.g. `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`)
+    /// cannot be safely rewritten — the bare-expression emit form
+    /// leaves the surrounding `int fd = ...` with a stale `int`
+    /// type. Routes to `manual_review` with the original source
+    /// preserved verbatim. This is the follow-up to #129's fd-binding
+    /// fix: same class of bug (stale int type), different syntactic
+    /// shape.
+    #[test]
+    fn test_transform_socket_inside_outer_call_preserved_verbatim() {
+        let source = "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches, None);
+
+        // No WASI emit — the classifier detected the parent `arguments`
+        // node and flipped the match to NotTransformable.
+        assert!(
+            !result.transformed_source.contains("wasi_socket_tcp_create"),
+            "outer-call socket should not emit a wasi_socket_tcp_create call; got:\n{}",
+            result.transformed_source
+        );
+        // The original POSIX call is preserved verbatim inside its
+        // enclosing call.
+        assert!(
+            result
+                .transformed_source
+                .contains("wrap(socket(AF_INET, SOCK_STREAM, 0))"),
+            "original outer-call socket should be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        // And it shows up in manual_review so the developer knows.
+        assert_eq!(
+            result.manual_review.len(),
+            1,
+            "expected 1 manual_review entry, got {}",
+            result.manual_review.len()
+        );
+        assert!(matches!(
+            result.manual_review[0].pattern,
+            PatternKind::Posix(PosixPattern::SocketTcp)
+        ));
+    }
+
     /// Integration test: verify that a full socket sequence transforms to valid C
     /// (at minimum — parses as correct syntax). Runs clang -fsyntax-only if available.
     #[test]
@@ -810,6 +854,7 @@ int main() {
         let source = r#"
 #include <stdio.h>
 int main() {
+    struct sockaddr_in addr;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     bind(fd, (struct sockaddr*)&addr, sizeof(addr));
     listen(fd, 128);
@@ -874,23 +919,38 @@ int main() {
         );
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
-        // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
-        // since WASI SDK is only available in the server-side build environment (Phase 6).
-        if std::env::var("EDGE_TEST_CLANG").is_ok()
-            && std::process::Command::new("clang")
-                .arg("--version")
-                .output()
-                .is_ok()
-        {
-            let pid = std::process::id();
-            let tmp_path = std::env::temp_dir().join(format!("edge_migrate_test_{}.c", pid));
-            std::fs::write(&tmp_path, &result.transformed_source)
+        // Gated the same way as the dedicated e2e regression net test
+        // (`test_transform_e2e_wasi_stubs_compile` below). Uses
+        // `tempfile::NamedTempFile` so the file is auto-cleaned on
+        // drop (and on panic in the assert), and `-I` + `-include` so
+        // the transformer's emitted `#include <wasi/*.h>` directives
+        // and the `wasi_stubs.h` POSIX stubs resolve.
+        if clang_available() {
+            let mut tmp = tempfile::Builder::new()
+                .suffix(".c")
+                .tempfile()
+                .expect("create temp file");
+            std::io::Write::write_all(&mut tmp, result.transformed_source.as_bytes())
                 .expect("write transformed source");
+            let testdata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("testdata");
+            let include_flag = format!("-I{}", testdata_dir.display());
+            let force_include_flag =
+                format!("-include{}", testdata_dir.join("wasi_stubs.h").display());
             let output = std::process::Command::new("clang")
-                .args(["-fsyntax-only", "-Werror", tmp_path.to_str().unwrap()])
+                .args([
+                    "-fsyntax-only",
+                    "-Werror",
+                    "-Wno-unused-variable",
+                    "-Wno-unused-but-set-variable",
+                    &include_flag,
+                    &force_include_flag,
+                    tmp.path().to_str().unwrap(),
+                ])
                 .output()
                 .expect("clang runs");
-            let _ = std::fs::remove_file(&tmp_path);
             assert!(
                 output.status.success(),
                 "clang syntax check failed: {}",
@@ -938,9 +998,16 @@ int main() {
         let matches = analyzer.analyze(&source);
         let result = Transformer::transform(&source, matches, None);
 
-        let pid = std::process::id();
-        let tmp_path = std::env::temp_dir().join(format!("edge_migrate_e2e_{}.c", pid));
-        std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
+        // Use `tempfile::NamedTempFile` so the file auto-cleans on
+        // drop (and on assert panic). The pre-existing pid-based
+        // naming leaked files if `clang` segfaulted mid-invocation
+        // and left a stale `.c` in the OS temp dir.
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".c")
+            .tempfile()
+            .expect("create temp file");
+        std::io::Write::write_all(&mut tmp, result.transformed_source.as_bytes())
+            .expect("write transformed source");
 
         let include_flag = format!("-I{}", testdata_dir.display());
         let force_include_flag = format!("-include{}", testdata_dir.join("wasi_stubs.h").display());
@@ -952,11 +1019,10 @@ int main() {
                 "-Wno-unused-but-set-variable",
                 &include_flag,
                 &force_include_flag,
-                tmp_path.to_str().unwrap(),
+                tmp.path().to_str().unwrap(),
             ])
             .output()
             .expect("clang runs");
-        let _ = std::fs::remove_file(&tmp_path);
 
         assert!(
             output.status.success(),
@@ -965,6 +1031,33 @@ int main() {
              --- transformed source ---\n{}",
             String::from_utf8_lossy(&output.stderr),
             result.transformed_source
+        );
+
+        // G3 follow-up: the http_client.c fixture contains a
+        // `gethostbyname(...)` call which is NotTransformable in
+        // MVP. The transformer must leave the original call
+        // verbatim in the source — it must NOT emit the broken
+        // `wasi_ip_name_lookup_resolve(...)` form (G3 reason: the
+        // runtime's `edge:cloud/networking.resolve(string) ->
+        // list<string>` shape doesn't match
+        // `wasi:ip-name-lookup.resolve-address`). The call must
+        // land in `manual_review` so the developer sees it.
+        assert!(
+            result.transformed_source.contains("gethostbyname("),
+            "G3: gethostbyname must be preserved verbatim; got:\n{}",
+            result.transformed_source
+        );
+        assert!(
+            !result.transformed_source.contains("wasi_ip_name_lookup_resolve"),
+            "G3: wasi_ip_name_lookup_resolve emit must NOT appear; got:\n{}",
+            result.transformed_source
+        );
+        assert!(
+            result
+                .manual_review
+                .iter()
+                .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::GetHostByName))),
+            "G3: gethostbyname must be in manual_review"
         );
     }
 

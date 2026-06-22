@@ -249,6 +249,7 @@ impl CAnalyzer {
             match classify_socket_declaration_context(source, node) {
                 SocketDeclContext::Simple(bv) => (Some(bv), pattern.transformability()),
                 SocketDeclContext::Unsupported => (None, Transformability::NotTransformable),
+                SocketDeclContext::InsideOtherCall => (None, Transformability::NotTransformable),
                 SocketDeclContext::Bare => (None, pattern.transformability()),
             }
         } else {
@@ -348,6 +349,13 @@ enum SocketDeclContext {
     /// flips `transformability` to `NotTransformable` so the call
     /// lands in `manual_review` with the original source preserved.
     Unsupported,
+    /// `socket(...)` as the argument of an outer function call
+    /// (e.g. `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`).
+    /// The bare-expression emit form would leave the surrounding
+    /// `int fd = ...` with a stale `int` type — same class of bug
+    /// as #129, different syntactic shape. Caller flips
+    /// `transformability` to `NotTransformable`.
+    InsideOtherCall,
 }
 
 /// Classifies the parent context of a `socket(...)` call so the
@@ -362,12 +370,25 @@ fn classify_socket_declaration_context(
     source: &str,
     call_node: tree_sitter::Node,
 ) -> SocketDeclContext {
-    let Some(init) = call_node.parent() else {
+    let Some(parent) = call_node.parent() else {
         return SocketDeclContext::Bare;
     };
-    if init.kind() != "init_declarator" {
+    // `socket(...)` as the argument of an outer function call (e.g.
+    // `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`) — the
+    // surrounding `int fd = ...` would end up with a stale `int` type
+    // if we emitted the bare `wasi_socket_tcp_create(...)` form.
+    // Same class of bug as #129, different syntactic shape. In
+    // tree-sitter's C grammar, the parent of an arg-position
+    // `call_expression` is an `argument_list` node (the whole
+    // parenthesized list); the `arguments` node is for definitions
+    // like `int f(int x)`.
+    if parent.kind() == "argument_list" {
+        return SocketDeclContext::InsideOtherCall;
+    }
+    if parent.kind() != "init_declarator" {
         return SocketDeclContext::Bare;
     }
+    let init = parent;
     let Some(decl) = init.parent() else {
         return SocketDeclContext::Bare;
     };
@@ -723,6 +744,33 @@ int main(void) {
                 "SOCK_STREAM".to_string(),
                 "0".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_analyzer_socket_inside_outer_call_is_not_transformable() {
+        // Follow-up to #129: when `socket(...)` is the argument of
+        // an outer function call, the surrounding `int fd = ...`
+        // would end up with a stale `int` type if we emitted the
+        // bare `wasi_socket_tcp_create(...)` form. The classifier
+        // must detect this and flip the match to NotTransformable
+        // so it lands in manual_review.
+        let mut analyzer = CAnalyzer::new();
+        let source =
+            "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)))
+            .expect("socket match should be present");
+        assert_eq!(
+            socket_match.transformability,
+            Transformability::NotTransformable,
+            "socket inside outer call must be NotTransformable"
+        );
+        assert!(
+            socket_match.bound_var.is_none(),
+            "socket inside outer call must NOT have a bound_var (no declaration to bind to)"
         );
     }
 }
