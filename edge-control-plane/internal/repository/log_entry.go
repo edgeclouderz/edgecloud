@@ -138,7 +138,7 @@ func (r *LogEntryRepository) DeleteOlderThanBatched(
 		}
 		res, err := r.db.ExecContext(ctx,
 			`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE ts < NOW() - make_interval(secs => $1) LIMIT $2)`,
-			retention.Seconds(), batchSize)
+			retention.Seconds(), int64(batchSize))
 		if err != nil {
 			return total, fmt.Errorf("deleting old logs (batch %d): %w", i, err)
 		}
