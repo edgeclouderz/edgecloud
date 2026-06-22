@@ -87,7 +87,7 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    client.activate(&app_name, deployment_id)?;
+    client.activate(&app_name, deployment_id, None)?;
 
     output::success("Activated successfully");
     println!("  ID: {deployment_id}");

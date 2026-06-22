@@ -11,3 +11,4 @@ pub mod init;
 pub mod migrate;
 pub mod open;
 pub mod status;
+pub mod traffic;
