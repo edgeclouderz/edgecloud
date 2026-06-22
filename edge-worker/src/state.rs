@@ -1,10 +1,9 @@
 //! App state tracking for running instances.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use edge_runtime::RequestMeter;
-use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
 
@@ -51,9 +50,11 @@ pub struct AppInstance {
 /// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
 /// (e.g., status update to Crashed) without replacing the Arc entry.
 pub struct WorkerState {
-    /// Currently running app instances: app_name -> AppInstance (Arc-wrapped for
+    /// Currently running app instances: (app_name, deployment_id) -> AppInstance (Arc-wrapped for
     /// cheap clone, with Mutex for interior mutability of status/fields).
-    pub apps: HashMap<String, Arc<Mutex<AppInstance>>>,
+    /// The composite key allows multiple deployment IDs for the same app_name
+    /// to run concurrently (canary/blue-green).
+    pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
 }
