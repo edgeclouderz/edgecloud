@@ -528,13 +528,15 @@ impl Supervisor {
                 | AppInstanceStatus::Stopping => None,
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
+            let snap = inst.meter.snapshot();
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
                     exit_code,
-                    request_count: inst.meter.snapshot().request_count,
+                    request_count: snap.request_count,
+                    outbound_bytes: snap.outbound_bytes,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                 },

@@ -71,6 +71,13 @@ pub struct AppStatus {
     pub exit_code: Option<i32>,
     /// Number of HTTP requests handled since last heartbeat.
     pub request_count: u64,
+    /// Total outbound bytes since the last heartbeat interval.
+    /// Covers http-client response bodies received by the guest and
+    /// http-server response bodies written back to callers.
+    /// Defaults to 0 when absent (old workers) — control plane must
+    /// treat a missing field as "no data", not as "zero usage".
+    #[serde(default)]
+    pub outbound_bytes: u64,
     /// Tenant the app belongs to. Used by the public ingress to render the
     /// host (`<tenant_id>-<app_name>.edgecloud.dev` — see
     /// `edge-ingress::config::ingress_host` and
@@ -172,6 +179,51 @@ mod tests {
         assert_eq!(parsed.worker_addr.as_deref(), Some("203.0.113.10"));
         assert_eq!(parsed.worker_id, "w_fra_abc");
         assert_eq!(parsed.region, "fra");
+    }
+
+    // ── outbound_bytes rolling-upgrade contract ───────────────────────────
+
+    fn app_status_from_json(json: &str) -> AppStatus {
+        serde_json::from_str(json).expect("deserialize AppStatus")
+    }
+
+    /// Old workers that don't send `outbound_bytes` must deserialize to 0,
+    /// not fail. The control plane treats 0 as "no data for this interval".
+    #[test]
+    fn outbound_bytes_absent_deserializes_to_zero() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.outbound_bytes, 0);
+    }
+
+    /// Explicit value round-trips correctly.
+    #[test]
+    fn outbound_bytes_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":1048576,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.outbound_bytes, 1_048_576);
+    }
+
+    /// Serialization always includes the field (no skip_serializing_if), so
+    /// new workers talking to new control planes always send the byte count.
+    #[test]
+    fn outbound_bytes_always_serialized() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 2,
+            outbound_bytes: 512,
+            tenant_id: "t_1".into(),
+            port: 8080,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""outbound_bytes":512"#),
+            "outbound_bytes must always appear in serialized AppStatus; got: {json}"
+        );
     }
 
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────
