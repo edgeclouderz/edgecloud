@@ -259,7 +259,7 @@ impl ApiClient {
         })
     }
 
-    fn auth_header(&self) -> String {
+    pub(crate) fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key.0)
     }
 
@@ -350,6 +350,10 @@ impl ApiClient {
     /// proceeding, because logs are the user's actual goal.
     pub fn get_app_status(&self, app_name: &str) -> Result<AppWorkerStatus, ApiError> {
         self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
+    }
+
+    pub(crate) fn http(&self) -> &Client {
+        &self.http
     }
 
     /// Upload a deployment artifact.
@@ -586,6 +590,16 @@ impl ApiClient {
         self.get_json_anyhow("list deployments", |base| {
             format!("{base}/api/v1/list/{app_name}")
         })
+    }
+
+    // ---- Custom-domain (issue #83) ----
+
+    /// Accessor for the `domains` namespace. The returned `DomainClient`
+    /// borrows this `ApiClient` so the API-key + base_url are shared
+    /// across all subcommands without cloning the underlying HTTP
+    /// client (which is already internally `Arc`-shared by reqwest).
+    pub fn domains(&self) -> crate::api::domains::DomainClient<'_> {
+        crate::api::domains::DomainClient { client: self }
     }
 }
 
