@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ type mockDomainRepo struct {
 	countByAppFn   func(ctx context.Context, tenantID, appName string) (int, error)
 	listAllFn      func(ctx context.Context) ([]domain.Domain, error)
 	atomicDeleteFn func(ctx context.Context, tenantID, appName, fqdn string) (bool, error)
-	updateStatusFn func(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error
+	updateStatusFn func(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error)
 }
 
 func (m *mockDomainRepo) Create(ctx context.Context, d *domain.Domain) error {
@@ -65,9 +66,9 @@ func (m *mockDomainRepo) AtomicDelete(ctx context.Context, tenantID, appName, fq
 	}
 	return m.atomicDeleteFn(ctx, tenantID, appName, fqdn)
 }
-func (m *mockDomainRepo) UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error {
+func (m *mockDomainRepo) UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error) {
 	if m.updateStatusFn == nil {
-		return nil
+		return true, nil
 	}
 	return m.updateStatusFn(ctx, id, status, lastError)
 }
@@ -110,7 +111,11 @@ func TestIsValidFQDN(t *testing.T) {
 		{"foo..bar.com", false, "empty label rejected"},
 		{".foo.com", false, "leading dot rejected"},
 		{"foo.com.", false, "trailing dot rejected (would need explicit allow)"},
-		{"api.example.com " + string(make([]byte, 200)), false, "over 253 chars rejected"},
+		{"api.example.com " + string(make([]byte, 200)), false, "whitespace rejected"},
+		{"api." + strings.Repeat("a", 250) + ".com", false, "over 253 chars rejected"},
+		// Distribute across labels to stay under the 63-char per-label limit
+		// (single-label caps are covered above).
+		{strings.Repeat("a", 60) + "." + strings.Repeat("a", 60) + "." + strings.Repeat("a", 60) + "." + strings.Repeat("a", 60) + ".com", true, "just under 253 chars accepted"},
 		{"api.edgecloud.dev", false, "platform suffix rejected"},
 		{"myapp.svc.edgecloud.dev", false, "any .edgecloud.dev suffix rejected"},
 		{"*.example.com", false, "wildcard rejected (DNS-01 out of scope)"},
