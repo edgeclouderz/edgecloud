@@ -214,8 +214,12 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 		// Persist the delta and get back the updated cumulative total in one
 		// round-trip. This aggregates across all workers and all intervals.
 		quota, err := s.quotaRepo.AddOutboundBytes(ctx, tenantID, deltaBytes)
-		if err != nil || quota == nil {
+		if err != nil {
 			log.Printf("heartbeat: failed to record outbound bytes for tenant %s: %v", tenantID, err)
+			continue
+		}
+		if quota == nil {
+			// No quota row — tenant is unlimited; nothing to enforce.
 			continue
 		}
 		if quota.MaxOutboundMB <= 0 {

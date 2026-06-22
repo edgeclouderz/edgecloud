@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
                         .await
                     {
                         Ok(()) => {
-                            heartbeat_supervisor.reset_meters().await;
+                            heartbeat_supervisor.reset_meters_after(&heartbeat).await;
                         }
                         Err(e) => {
                             tracing::error!(err = %e, "failed to publish heartbeat");

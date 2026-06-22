@@ -1399,7 +1399,7 @@ impl HttpServer {
     }
 
     /// Write an HTTP/1.1 response back to the socket, with optional gzip compression.
-    /// Returns the number of body bytes actually written on the wire (post-compression).
+    /// Returns the total bytes written on the wire (status line + headers + body).
     async fn write_response(
         stream: &mut SharedWriteHalf,
         status: u16,
@@ -1413,7 +1413,6 @@ impl HttpServer {
             .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Encoding") && v.contains("gzip"));
 
         let (body_to_send, is_compressed) = try_compress(body, accept_gzip);
-        let wire_bytes = body_to_send.len() as u64;
 
         let status_line = format!("HTTP/1.1 {} {}\r\n", status, Self::status_text(status));
         let mut response = status_line.into_bytes();
@@ -1427,6 +1426,7 @@ impl HttpServer {
         response.extend(format!("Content-Length: {}\r\n\r\n", body_to_send.len()).bytes());
         response.extend(&body_to_send);
 
+        let wire_bytes = response.len() as u64;
         timeout_at(deadline, stream.write_all(&response)).await??;
         timeout_at(deadline, stream.flush()).await??;
         Ok(wire_bytes)

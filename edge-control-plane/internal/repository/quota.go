@@ -30,7 +30,7 @@ func (r *QuotaRepository) Create(ctx context.Context, q *domain.Quota) error {
 
 func (r *QuotaRepository) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	var q domain.Quota
-	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes FROM quotas WHERE tenant_id = $1`
+	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id = $1`
 	err := r.db.GetContext(ctx, &q, query, tenantID)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -38,16 +38,28 @@ func (r *QuotaRepository) GetByTenantID(ctx context.Context, tenantID string) (*
 	return &q, err
 }
 
-// AddOutboundBytes atomically adds delta to used_outbound_bytes and returns
-// the updated quota row. One round-trip via RETURNING avoids a race between
-// the UPDATE and a subsequent SELECT.
+// AddOutboundBytes atomically accumulates delta into used_outbound_bytes and
+// returns the updated quota row. When the stored quota_period_start is in a
+// past calendar month (UTC), the counter and period are reset first so the
+// monthly cap applies to the current month only — no separate cron required.
 func (r *QuotaRepository) AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	var q domain.Quota
 	query := `
-		UPDATE quotas
-		SET used_outbound_bytes = used_outbound_bytes + $2
+		UPDATE quotas SET
+			used_outbound_bytes = CASE
+				WHEN date_trunc('month', quota_period_start AT TIME ZONE 'UTC')
+				     < date_trunc('month', now() AT TIME ZONE 'UTC')
+				THEN $2
+				ELSE used_outbound_bytes + $2
+			END,
+			quota_period_start = CASE
+				WHEN date_trunc('month', quota_period_start AT TIME ZONE 'UTC')
+				     < date_trunc('month', now() AT TIME ZONE 'UTC')
+				THEN date_trunc('month', now() AT TIME ZONE 'UTC')
+				ELSE quota_period_start
+			END
 		WHERE tenant_id = $1
-		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes`
+		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start`
 	err := r.db.GetContext(ctx, &q, query, tenantID, int64(delta))
 	if err == sql.ErrNoRows {
 		return nil, nil
