@@ -182,7 +182,12 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	// Dispatched in a separate goroutine so DB round-trips in quota enforcement
 	// do not block the NATS heartbeat drain goroutine (which has a fixed 100-msg
 	// buffer and will drop overflow messages if the drain stalls).
-	go s.checkOutboundQuota(ctx, hb.Apps)
+	//
+	// context.WithoutCancel strips the subscriber's cancellation signal so that
+	// a graceful shutdown (which cancels ctx) does not abort in-flight quota
+	// writes — byte deltas must reach the DB even when the subscriber is
+	// shutting down. Context values (trace IDs, etc.) are preserved.
+	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
 }
 
 // checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
