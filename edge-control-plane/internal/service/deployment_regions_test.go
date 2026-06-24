@@ -131,10 +131,10 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	// 5. quotaRepo.GetByTenantID — ActivateDeployment reads the quota
 	// to populate MaxMemoryMB on the AppConfig (per main's quota
 	// wiring). Return a row so the field flows.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
-			AddRow(tenantID, 100, 50, 10, 512, 1024))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow(tenantID, 100, 50, 10, 512, 1024, 0, time.Now()))
 
 	if err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -199,10 +199,10 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -238,9 +238,9 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", "d_x"); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -276,9 +276,9 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
 
 	err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID)
 	if err == nil {
@@ -329,10 +329,10 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
 	// Quota row with MaxMemoryMB=0 — should be treated as "unset" and
 	// fall through to the 256 default.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
-			AddRow("t_test", 100, 50, 10, 0, 1024))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 0, 1024, 0, time.Now()))
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -366,9 +366,9 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
 	// Empty row set (no quota row) — GetByTenantID returns (nil, nil).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}))
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)

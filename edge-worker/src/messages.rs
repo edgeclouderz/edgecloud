@@ -1,7 +1,23 @@
 //! NATS message types for worker ↔ control plane communication.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// Deserializes `allowlist` so that absent, `[]`, and `["*"]` all map to
+/// `None` (allow-all). Only a non-empty array without a bare `"*"` sentinel
+/// becomes `Some(list)`.
+///
+/// The `["*"]` case handles legacy DB rows written before this PR where
+/// `allowlisted_destinations = '{*}'` was the conventional "no restriction"
+/// value. `EgressPolicy::new(["*"])` strips the sentinel and produces deny-all,
+/// which is the wrong semantic; mapping it to `None` → `allow_all()` is correct.
+fn deserialize_allowlist<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Option<Vec<String>> = Option::deserialize(de)?;
+    Ok(v.filter(|list| !list.is_empty() && !list.iter().all(|e| e == "*")))
+}
 
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
 #[derive(Debug, Clone, Deserialize)]
@@ -35,8 +51,11 @@ pub struct AppSpec {
     #[allow(dead_code)]
     pub routes: Option<Vec<DeploymentRoute>>,
     pub env: HashMap<String, String>,
-    #[allow(dead_code)]
-    pub allowlist: Vec<String>,
+    /// Per-deployment egress allowlist. `None` means allow-all outbound (field
+    /// absent or `[]` on the wire — both safe defaults for pre-enforcement
+    /// control planes). `Some(list)` means only the listed hosts are permitted.
+    #[serde(default, deserialize_with = "deserialize_allowlist")]
+    pub allowlist: Option<Vec<String>>,
     pub max_memory_mb: u64,
 }
 
@@ -65,6 +84,13 @@ pub struct AppStatus {
     pub exit_code: Option<i32>,
     /// Number of HTTP requests handled since last heartbeat.
     pub request_count: u64,
+    /// Total outbound bytes since the last heartbeat interval.
+    /// Covers http-client response bodies received by the guest and
+    /// http-server response bodies written back to callers.
+    /// Defaults to 0 when absent (old workers) — control plane must
+    /// treat a missing field as "no data", not as "zero usage".
+    #[serde(default)]
+    pub outbound_bytes: u64,
     /// Tenant the app belongs to. Used by the public ingress to render the
     /// host (`<tenant_id>-<app_name>.edgecloud.dev` — see
     /// `edge-ingress::config::ingress_host` and
@@ -166,5 +192,112 @@ mod tests {
         assert_eq!(parsed.worker_addr.as_deref(), Some("203.0.113.10"));
         assert_eq!(parsed.worker_id, "w_fra_abc");
         assert_eq!(parsed.region, "fra");
+    }
+
+    // ── outbound_bytes rolling-upgrade contract ───────────────────────────
+
+    fn app_status_from_json(json: &str) -> AppStatus {
+        serde_json::from_str(json).expect("deserialize AppStatus")
+    }
+
+    /// Old workers that don't send `outbound_bytes` must deserialize to 0,
+    /// not fail. The control plane treats 0 as "no data for this interval".
+    #[test]
+    fn outbound_bytes_absent_deserializes_to_zero() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.outbound_bytes, 0);
+    }
+
+    /// Explicit value round-trips correctly.
+    #[test]
+    fn outbound_bytes_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":1048576,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.outbound_bytes, 1_048_576);
+    }
+
+    /// Serialization always includes the field (no skip_serializing_if), so
+    /// new workers talking to new control planes always send the byte count.
+    #[test]
+    fn outbound_bytes_always_serialized() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 2,
+            outbound_bytes: 512,
+            tenant_id: "t_1".into(),
+            port: 8080,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""outbound_bytes":512"#),
+            "outbound_bytes must always appear in serialized AppStatus; got: {json}"
+        );
+    }
+
+    // ── deserialize_allowlist rolling-upgrade contract ────────────────────
+
+    fn app_spec_from_json(json: &str) -> AppSpec {
+        serde_json::from_str(json).expect("deserialize AppSpec")
+    }
+
+    /// Absent `allowlist` field → `None` (allow-all). Old control planes that
+    /// don't send the field must not trigger deny-all on every app.
+    #[test]
+    fn allowlist_absent_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256}"#,
+        );
+        assert!(
+            spec.allowlist.is_none(),
+            "absent allowlist must deserialize to None (allow-all)"
+        );
+    }
+
+    /// Explicit `[]` → `None` (allow-all). Old control planes that send an
+    /// empty array as a Go zero-value must not trigger deny-all either.
+    #[test]
+    fn allowlist_empty_array_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"allowlist":[]}"#,
+        );
+        assert!(
+            spec.allowlist.is_none(),
+            "empty-array allowlist must deserialize to None (allow-all)"
+        );
+    }
+
+    /// Legacy `["*"]` sentinel → `None` (allow-all). Pre-enforcement DB rows that
+    /// stored `allowlisted_destinations = '{*}'` must not trigger deny-all after
+    /// deployment; `EgressPolicy::new(["*"])` strips the sentinel and produces
+    /// deny-all, so we intercept here and map to None → allow_all() instead.
+    #[test]
+    fn allowlist_star_sentinel_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"allowlist":["*"]}"#,
+        );
+        assert!(
+            spec.allowlist.is_none(),
+            "legacy [\"*\"] sentinel must deserialize to None (allow-all), not Some([\"*\"]) which becomes deny-all"
+        );
+    }
+
+    /// Non-empty array → `Some(list)`. The worker must enforce this list.
+    #[test]
+    fn allowlist_non_empty_deserializes_to_some() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"allowlist":["api.stripe.com","*.sendgrid.net"]}"#,
+        );
+        assert_eq!(
+            spec.allowlist,
+            Some(vec![
+                "api.stripe.com".to_string(),
+                "*.sendgrid.net".to_string()
+            ])
+        );
     }
 }
