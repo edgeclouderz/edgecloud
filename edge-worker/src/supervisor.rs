@@ -594,13 +594,15 @@ impl Supervisor {
                 | AppInstanceStatus::Stopping => None,
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
+            let snap = inst.meter.snapshot();
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
                     exit_code,
-                    request_count: inst.meter.snapshot().request_count,
+                    request_count: snap.request_count,
+                    outbound_bytes: snap.outbound_bytes,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                 },
@@ -608,6 +610,28 @@ impl Supervisor {
         }
 
         msg
+    }
+
+    /// Subtract the published heartbeat's per-app counts from each meter after
+    /// a successful publish. Using subtract_delta rather than zeroing the counter
+    /// preserves any bytes recorded between the snapshot and this call — those
+    /// will appear in the next heartbeat interval rather than being silently lost.
+    pub async fn reset_meters_after(&self, heartbeat: &HeartbeatMessage) {
+        let state = self.state.read().await;
+        for (app_name, status) in &heartbeat.apps {
+            if let Some(inst) = state.apps.get(app_name) {
+                let inst = inst.lock().await;
+                // Guard on deployment_id: if the app was stopped and a new
+                // deployment with the same name started between build_heartbeat
+                // and here, the new instance's meter must not be subtracted for
+                // the old deployment's counts — fetch_sub would wrap to u64::MAX.
+                if inst.deployment_id != status.deployment_id {
+                    continue;
+                }
+                inst.meter
+                    .subtract_delta(status.request_count, status.outbound_bytes);
+            }
+        }
     }
 
     /// Stop all running apps (used during graceful shutdown).

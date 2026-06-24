@@ -238,6 +238,11 @@ impl OutgoingEntry {
 /// the host's body-pipeline task) pushes chunks via the `IncomingProducer`.
 pub struct IncomingEntry {
     pub stream: IncomingStream,
+    /// When `true`, bytes returned from `read_chunk` should be counted toward
+    /// the tenant's outbound byte total (i.e. this is an http-client response
+    /// body). When `false`, this is an http-server inbound request body and
+    /// should not be counted as outbound.
+    pub count_as_outbound: bool,
 }
 
 /// Adapter that exposes an outgoing stream's chunks as a `futures::Stream`.
