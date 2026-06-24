@@ -949,6 +949,15 @@ components:
               code: INTERNAL_ERROR
               message: internal error
 
+  parameters:
+    appName:
+      name: appName
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique name of the app within the tenant.
+
 paths:
   # -------------------------------------------------------------------------
   # Public
