@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -58,17 +59,17 @@ func (h *DomainHandler) Add(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	if appName == "" {
-		http.Error(w, `{"error": "app name required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	var req addDomainRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.FQDN == "" {
-		http.Error(w, `{"error": "fqdn required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "fqdn required")
 		return
 	}
 
@@ -76,14 +77,14 @@ func (h *DomainHandler) Add(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrInvalidFQDN):
-			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+			httperror.BadRequestCtx(w, r, err.Error())
 		case errors.Is(err, service.ErrDomainQuotaExceeded):
-			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusTooManyRequests)
+			httperror.QuotaExceededCtx(w, r, err.Error())
 		case errors.Is(err, service.ErrAppNotFound):
-			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusNotFound)
+			httperror.NotFoundCtx(w, r, err.Error())
 		default:
 			log.Printf("internal error: %v", err)
-			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			httperror.InternalErrorCtx(w, r)
 		}
 		return
 	}
@@ -100,14 +101,14 @@ func (h *DomainHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	if appName == "" {
-		http.Error(w, `{"error": "app name required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	domains, err := h.domainSvc.ListDomains(r.Context(), tenantID, appName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if domains == nil {
@@ -131,18 +132,18 @@ func (h *DomainHandler) Get(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 	fqdn := r.PathValue("fqdn")
 	if appName == "" || fqdn == "" {
-		http.Error(w, `{"error": "app name and fqdn required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name and fqdn required")
 		return
 	}
 
 	d, err := h.domainSvc.GetDomain(r.Context(), tenantID, appName, fqdn)
 	if err != nil {
 		if errors.Is(err, service.ErrDomainNotFound) {
-			http.Error(w, `{"error": "domain not found"}`, http.StatusNotFound)
+			httperror.NotFoundCtx(w, r, "domain not found")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -157,18 +158,18 @@ func (h *DomainHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 	fqdn := r.PathValue("fqdn")
 	if appName == "" || fqdn == "" {
-		http.Error(w, `{"error": "app name and fqdn required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name and fqdn required")
 		return
 	}
 
 	err := h.domainSvc.RemoveDomain(r.Context(), tenantID, appName, fqdn)
 	if err != nil {
 		if errors.Is(err, service.ErrDomainNotFound) {
-			http.Error(w, `{"error": "domain not found"}`, http.StatusNotFound)
+			httperror.NotFoundCtx(w, r, "domain not found")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

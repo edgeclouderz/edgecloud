@@ -128,10 +128,16 @@ func main() {
 	// `apps`-FK-or-not is deferred; the service is built with the
 	// existing repos and the quota check (MaxDomainsPerApp=50) is
 	// enforced in the service layer. DomainService needs an
-	// appLookupForDomain (for the (tenant, app) existence check in
-	// AddDomain); appSvc already satisfies that interface via its
-	// Get method, so we pass it directly.
-	domainSvc := service.NewDomainService(domainRepo, appSvc)
+	// appLookupForDomain (for the (tenant, app) existence check +
+	// row lock in AddDomain) AND a *sqlx.DB so it can wrap
+	// count+insert in a transaction that holds a SELECT … FOR
+	// UPDATE on the parent `apps` row. We pass the *AppRepository
+	// (not the *AppService wrapper) so WithTx binds the lock
+	// acquisition to the same tx that runs the count and the
+	// insert. Without the tx wrap, two concurrent AddDomain calls
+	// can both observe count==49 and both insert — closing that race
+	// is the fix from the second-pass PR #133 review.
+	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
 
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
@@ -364,22 +370,26 @@ internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// other /api/internal/* endpoint, this is currently
 	// unauthenticated — see the comment on internalMux above.
 	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
-	// Custom-domain routes (issue #83). All three require a valid
-	// worker/ingest JWT; the status endpoint additionally requires
-	// an explicit role gate so a leaked worker JWT cannot
-	// silently flip a row to `active` or `failed`. The two reads
-	// are tenant-agnostic and gated only by JWT — the service-layer
-	// queries return the union across all tenants, and the only
-	// consumer (the ingress poller + occasional admin audit) is
-	// trusted.
+	// Custom-domain routes (issue #83). All three are gated to
+	// RoleIngest ONLY — the cross-tenant reads (ListDomains,
+	// TlsAllowed) return data for every tenant and would leak the
+	// entire tenant→FQDN→app mapping to any worker JWT in the
+	// platform (every v1 worker JWT defaults to RoleWorker, so
+	// RoleIngest+RoleWorker allowed = effectively no gate). The
+	// 30s ingress poller mints a long-lived ingest token at
+	// startup (cmd/api/mint.go), so no legitimate worker caller
+	// needs RoleWorker access here. UpdateDomainStatus is also
+	// Ingest-only because it mutates a row in any tenant's domain
+	// (intended receiver: the v2 Caddy event hook, which runs on
+	// the same ingress process as the poller).
 	internalMux.Handle("GET /api/internal/domains", middleware.RequireWorkerRole(
-		middleware.RoleIngest, middleware.RoleWorker,
+		middleware.RoleIngest,
 	)(http.HandlerFunc(internalHandler.ListDomains)))
 	internalMux.Handle("GET /api/internal/tls-allowed", middleware.RequireWorkerRole(
-		middleware.RoleIngest, middleware.RoleWorker,
+		middleware.RoleIngest,
 	)(http.HandlerFunc(internalHandler.TlsAllowed)))
 	internalMux.Handle("POST /api/internal/domains/{id}/status", middleware.RequireWorkerRole(
-		middleware.RoleIngest, middleware.RoleWorker,
+		middleware.RoleIngest,
 	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
