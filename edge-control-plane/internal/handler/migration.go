@@ -79,7 +79,23 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseMultipartForm(50 << 20); err != nil {
+	// Cap the request body up front so a malicious caller can't pin
+	// a multi-GiB upload mid-stream. The MigrateTree handler applies
+	// the same guard with the same 50 MiB limit (see below); the
+	// single-file Migrate path previously only relied on
+	// ParseMultipartForm's "max memory" hint, which doesn't cap the
+	// underlying body read.
+	r.Body = http.MaxBytesReader(w, r.Body, maxTreeBodyBytes)
+
+	if err := r.ParseMultipartForm(maxTreeBodyBytes); err != nil {
+		// MaxBytesReader returns *http.MaxBytesError once the cap is
+		// hit. Detect via errors.As so we don't string-match the
+		// error message.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		httperror.BadRequestCtx(w, r, "failed to parse multipart form")
 		return
 	}

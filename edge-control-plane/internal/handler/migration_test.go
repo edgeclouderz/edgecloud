@@ -834,3 +834,41 @@ func TestMigrateTree_ZipSlip(t *testing.T) {
 		t.Errorf("expected 'unsafe zip entry' in body, got: %s", rr.Body.String())
 	}
 }
+
+// TestMigrate_RejectsOversizedBody verifies that the single-file
+// Migrate handler caps the request body at maxTreeBodyBytes (50 MiB)
+// via http.MaxBytesReader. A multipart body that exceeds the cap
+// returns 413, before the migration service is ever called.
+//
+// Pre-fix this parsed the multipart form with a 50 MiB "max memory"
+// hint that didn't actually cap the underlying body read; the
+// service-layer cap was too late. Now the handler wraps the body
+// with MaxBytesReader up front.
+func TestMigrate_RejectsOversizedBody(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+	// Build a valid multipart body that's over the cap. We use a
+	// single large file part padded past maxTreeBodyBytes.
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("filename", "hello.c")
+	_ = w.WriteField("language", "c")
+	fw, _ := w.CreateFormFile("file", "hello.c")
+	padding := make([]byte, maxTreeBodyBytes+1024)
+	for i := range padding {
+		padding[i] = 'a'
+	}
+	fw.Write(padding)
+	w.Close()
+	req := httptest.NewRequest("POST", "/api/migrate", body)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "request body too large") {
+		t.Errorf("expected 'request body too large' in body, got: %s", rr.Body.String())
+	}
+}

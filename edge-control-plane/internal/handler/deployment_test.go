@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // mockAppTargetLookup is the minimum service.AppTargetLookup implementation
@@ -367,4 +369,45 @@ func TestDeploy_TooManyRegions_Returns400(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "too many regions") {
 		t.Errorf("body = %q, want it to mention 'too many regions'", rr.Body.String())
 	}
+}
+
+// TestDeploy_OversizedBody_Returns413 verifies that the handler
+// caps the request body at service.MaxArtifactSize via
+// http.MaxBytesReader. A body that exceeds the cap returns 413
+// (Request Entity Too Large) with a JSON error body, before the
+// deployment service is ever called.
+//
+// Pre-fix this returned 500 (or hung the handler on a multi-GiB
+// allocation) because io.ReadAll on an unbounded r.Body consumed
+// the full payload before the service layer's io.LimitReader ran.
+func TestDeploy_OversizedBody_Returns413(t *testing.T) {
+	mux := newDeployMux()
+	// Allocate MaxArtifactSize+1 bytes — one byte over the cap.
+	// We don't actually allocate MaxArtifactSize+1 in memory; we
+	// use a Reader that emits bytes on demand to keep the test
+	// cheap.
+	oversized := io.NopCloser(io.LimitReader(zeroReader{}, service.MaxArtifactSize+1))
+	req := httptest.NewRequest("POST", "/api/deploy/myapp", oversized)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "artifact exceeds maximum size") {
+		t.Errorf("body = %q, want it to mention 'artifact exceeds maximum size'",
+			rr.Body.String())
+	}
+}
+
+// zeroReader emits a stream of zero bytes — used to construct
+// an arbitrarily large body without actually allocating it.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }

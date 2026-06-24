@@ -105,9 +105,24 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the body at MaxArtifactSize (the service layer's own
+	// io.LimitReader runs *after* the handler has already allocated
+	// the full body via io.ReadAll — too late to defend against a
+	// multi-GiB payload). http.MaxBytesReader returns a typed
+	// *http.MaxBytesError when the cap is exceeded, which we map to
+	// 413 below. The service-layer LimitReader stays as
+	// defense-in-depth for any non-HTTP caller (tests, future
+	// internal CLIs).
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
+
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		httperror.BadRequestCtx(w, r, "failed to read body")
 		return
 	}
