@@ -10,7 +10,7 @@
 //! base_url are shared across all subcommands without cloning the
 //! underlying HTTP client (which is already internally `Arc`-shared
 //! by reqwest). The methods are the only path that hits
-//! `/api/apps/{app}/domains*`; tests stub the wiremock at those
+//! `/api/v1/apps/{app}/domains*`; tests stub the wiremock at those
 //! paths.
 
 use anyhow::{Context, Result};
@@ -49,7 +49,7 @@ pub struct DomainClient<'a> {
 impl<'a> DomainClient<'a> {
     /// Bind a custom FQDN to an existing app. Returns the new row.
     pub fn add(&self, app: &str, fqdn: &str) -> Result<Domain> {
-        let url = format!("{}/api/apps/{}/domains", self.client.base_url(), app);
+        let url = format!("{}/api/v1/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
             .http()
@@ -57,7 +57,7 @@ impl<'a> DomainClient<'a> {
             .header("Authorization", self.client.auth_header())
             .json(&json!({ "fqdn": fqdn }))
             .send()
-            .context("POST /api/apps/{app}/domains")?;
+            .context("POST /api/v1/apps/{app}/domains")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -71,14 +71,14 @@ impl<'a> DomainClient<'a> {
 
     /// List all custom FQDNs bound to the app.
     pub fn list(&self, app: &str) -> Result<Vec<Domain>> {
-        let url = format!("{}/api/apps/{}/domains", self.client.base_url(), app);
+        let url = format!("{}/api/v1/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
             .http()
             .get(&url)
             .header("Authorization", self.client.auth_header())
             .send()
-            .context("GET /api/apps/{app}/domains")?;
+            .context("GET /api/v1/apps/{app}/domains")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -93,7 +93,7 @@ impl<'a> DomainClient<'a> {
     /// Fetch a single row by (app, fqdn).
     pub fn get(&self, app: &str, fqdn: &str) -> Result<Domain> {
         let url = format!(
-            "{}/api/apps/{}/domains/{}",
+            "{}/api/v1/apps/{}/domains/{}",
             self.client.base_url(),
             app,
             fqdn
@@ -104,7 +104,7 @@ impl<'a> DomainClient<'a> {
             .get(&url)
             .header("Authorization", self.client.auth_header())
             .send()
-            .context("GET /api/apps/{app}/domains/{fqdn}")?;
+            .context("GET /api/v1/apps/{app}/domains/{fqdn}")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -119,7 +119,7 @@ impl<'a> DomainClient<'a> {
     /// Unbind a custom FQDN from an app.
     pub fn remove(&self, app: &str, fqdn: &str) -> Result<()> {
         let url = format!(
-            "{}/api/apps/{}/domains/{}",
+            "{}/api/v1/apps/{}/domains/{}",
             self.client.base_url(),
             app,
             fqdn
@@ -130,7 +130,7 @@ impl<'a> DomainClient<'a> {
             .delete(&url)
             .header("Authorization", self.client.auth_header())
             .send()
-            .context("DELETE /api/apps/{app}/domains/{fqdn}")?;
+            .context("DELETE /api/v1/apps/{app}/domains/{fqdn}")?;
 
         if !resp.status().is_success() {
             let status = resp.status();

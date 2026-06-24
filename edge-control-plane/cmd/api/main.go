@@ -239,6 +239,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", redirectTo("/api/v1/apps/"+"{appName}/activate/"+"{deploymentID}"))
 	mux.HandleFunc("GET /api/apps/{appName}/logs", redirectTo("/api/v1/apps/"+"{appName}/logs"))
 	mux.HandleFunc("GET /api/apps/{appName}/status", redirectTo("/api/v1/apps/"+"{appName}/status"))
+	// Custom domains (issue #83)
+	mux.HandleFunc("POST /api/apps/{appName}/domains", redirectTo("/api/v1/apps/"+"{appName}/domains"))
+	mux.HandleFunc("GET /api/apps/{appName}/domains", redirectTo("/api/v1/apps/"+"{appName}/domains"))
+	mux.HandleFunc("GET /api/apps/{appName}/domains/{fqdn}", redirectTo("/api/v1/apps/"+"{appName}/domains/"+"{fqdn}"))
+	mux.HandleFunc("DELETE /api/apps/{appName}/domains/{fqdn}", redirectTo("/api/v1/apps/"+"{appName}/domains/"+"{fqdn}"))
 	// Deploy & status
 	mux.HandleFunc("POST /api/deploy/{appName}", redirectTo("/api/v1/deploy/"+"{appName}"))
 	mux.HandleFunc("GET /api/status/{deploymentID}", redirectTo("/api/v1/status/"+"{deploymentID}"))
@@ -295,11 +300,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// Custom-domain routes (issue #83). Tenant-authenticated; the
 	// handler validates the FQDN shape and enforces the per-app
 	// quota. Routed through the same auth middleware as the rest of
-	// `/api/`.
-	api.HandleFunc("POST /api/apps/{appName}/domains", domainHandler.Add)
-	api.HandleFunc("GET /api/apps/{appName}/domains", domainHandler.List)
-	api.HandleFunc("GET /api/apps/{appName}/domains/{fqdn}", domainHandler.Get)
-	api.HandleFunc("DELETE /api/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
+	// `/api/v1/`.
+	api.HandleFunc("POST /api/v1/apps/{appName}/domains", domainHandler.Add)
+	api.HandleFunc("GET /api/v1/apps/{appName}/domains", domainHandler.List)
+	api.HandleFunc("GET /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Get)
+	api.HandleFunc("DELETE /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()

@@ -43,13 +43,13 @@ func NewDomainHandlerFromMock(svc DomainServiceInterface) *DomainHandler {
 	return &DomainHandler{domainSvc: svc}
 }
 
-// addDomainRequest is the POST body for `POST /api/apps/{app}/domains`.
+// addDomainRequest is the POST body for `POST /api/v1/apps/{app}/domains`.
 // Only `fqdn` is required; everything else is server-derived.
 type addDomainRequest struct {
 	FQDN string `json:"fqdn"`
 }
 
-// Add handles POST /api/apps/{appName}/domains — bind a custom FQDN to an app.
+// Add handles POST /api/v1/apps/{appName}/domains — bind a custom FQDN to an app.
 //
 // Returns 201 + the created row on success. 400 if the FQDN is malformed
 // or the FQDN ends in `.edgecloud.dev`. 404 if the app does not exist.
@@ -93,7 +93,7 @@ func (h *DomainHandler) Add(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(d)
 }
 
-// List handles GET /api/apps/{appName}/domains — list all custom domains
+// List handles GET /api/v1/apps/{appName}/domains — list all custom domains
 // for an app. Returns an empty array (not 404) when the app has no
 // domains; matches `DeploymentRepository.ListByApp`.
 func (h *DomainHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ func (h *DomainHandler) List(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"domains": domains})
 }
 
-// Get handles GET /api/apps/{appName}/domains/{fqdn} — fetch one domain.
+// Get handles GET /api/v1/apps/{appName}/domains/{fqdn} — fetch one domain.
 //
 // The FQDN may contain dots; `r.PathValue("fqdn")` returns the decoded
 // segment as Go's `net/http` URL-decodes path values automatically. This
@@ -149,7 +149,7 @@ func (h *DomainHandler) Get(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(d)
 }
 
-// Remove handles DELETE /api/apps/{appName}/domains/{fqdn} — drop a
+// Remove handles DELETE /api/v1/apps/{appName}/domains/{fqdn} — drop a
 // custom domain. The 30s ingress poller will pick up the deletion on
 // its next tick.
 func (h *DomainHandler) Remove(w http.ResponseWriter, r *http.Request) {
