@@ -313,9 +313,16 @@ fn build_byte_map(
     }
 
     // Walk expanded text line by line, tracking running byte offset.
+    // We use `split('\n').take(line_map.len())` to align the iteration
+    // count with `line_map` (which is built with `text.lines()`, which
+    // strips a single trailing `\n`). `split('\n')` would otherwise
+    // yield one extra empty entry for a file ending in `\n`, making
+    // `result.len() > line_map.len()` and causing
+    // `byte_map[expanded_row]` lookups for the last user line to read
+    // a phantom (byte=0, orig=0) entry.
     let mut result = Vec::with_capacity(line_map.len());
     let mut expanded_byte: u32 = 0;
-    for (i, line) in expanded_text.split('\n').enumerate() {
+    for (i, line) in expanded_text.split('\n').take(line_map.len()).enumerate() {
         let line_len = (line.len() + 1) as u32; // include the trailing `\n`
         let user_line = line_map.get(i).copied().unwrap_or(0);
         let original_byte = if user_line == 0 {
