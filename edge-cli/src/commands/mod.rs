@@ -10,5 +10,7 @@ pub mod env;
 pub mod init;
 pub mod migrate;
 pub mod open;
+pub mod rollback;
+pub(crate) mod state_io;
 pub mod status;
 pub mod traffic;

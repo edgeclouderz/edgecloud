@@ -18,6 +18,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -91,14 +92,44 @@ const MaxRegionsPerDeployment = 16
 //
 // The handler matches ErrInvalidRegion and ErrTooManyRegions via
 // errors.Is and maps them to 400. Quota errors stay 429.
+// ErrNoLastGood is returned by RollbackDeployment when the active row
+// exists but last_good_deployment_id is NULL — the tenant has no
+// previous deployment to roll back to. Handler maps to HTTP 409.
 var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
+	// ErrNoActiveDeployment is returned by RollbackDeployment when there
+	// is no active-deployment row for this app (user never activated any
+	// deployment). Distinct from ErrAppNotFound (which is for the app
+	// row in the apps table) so handlers can map to HTTP 404 without
+	// false matches. Handler maps to HTTP 404.
+	ErrNoActiveDeployment = fmt.Errorf("no active deployment")
+	// ErrPublishFailed is returned by ActivateDeployment /
+	// RollbackDeployment when the post-commit NATS publish of the
+	// TaskMessage failed. The DB transaction may have already
+	// committed, so workers may still be serving the prior
+	// deployment; the client should treat this as a transient
+	// infrastructure failure. Handler maps to HTTP 502. The wrapped
+	// cause (using Go 1.20+ multi-%w) is preserved for logs.
+	ErrPublishFailed = fmt.Errorf("publishing task update failed")
+	// ErrAutoRollbackDisabled is returned by RollbackDeployment (via
+	// the repo's ResetStableSinceForRollback SQL guard) when the
+	// active_deployments row has auto_rollback_enabled=false. The
+	// string MUST stay in sync with `errAutoRollbackDisabledSentinel`
+	// in `internal/repository/active_deployment.go`; the handler
+	// matches it via errors.Is. Returned only by the worker-driven
+	// auto-rollback path (POST /api/internal/apps/{appName}/auto-rollback);
+	// the manual `edge rollback` path bypasses this guard because a
+	// tenant should always be able to manually reverse their own
+	// activation, even if they opted out of auto-rollback.
+	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
 
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
+	db             *sqlx.DB
 	deploymentRepo *repository.DeploymentRepository
 	activeRepo     *repository.ActiveDeploymentRepository
 	appEnvRepo     *repository.AppEnvRepository
@@ -118,6 +149,7 @@ type DeploymentService struct {
 }
 
 func NewDeploymentService(
+	db *sqlx.DB,
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
@@ -137,6 +169,7 @@ func NewDeploymentService(
 		defaultRegion = "global"
 	}
 	return &DeploymentService{
+		db:             db,
 		deploymentRepo: deploymentRepo,
 		activeRepo:     activeRepo,
 		appEnvRepo:     appEnvRepo,
@@ -164,7 +197,7 @@ func (s *DeploymentService) SetAppService(appSvc *AppService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
@@ -248,6 +281,11 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		Hash:      hex.EncodeToString(hash[:]),
 		Regions:   domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
+		// Persist the tenant opt-in on the artifact row so audit
+		// endpoints (`edge deployments --app foo`) can show which
+		// deployments opted in. The flag is copied onto the
+		// active_deployments row by ActivateDeployment.
+		AutoRollbackEnabled: autoRollback,
 	}
 
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
@@ -321,10 +359,52 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("deployment not found")
 	}
 
-	if err := s.activeRepo.Set(ctx, &domain.ActiveDeployment{
-		TenantID:     tenantID,
-		AppName:      appName,
-		DeploymentID: deploymentID,
+	// Atomically move the current active id into last_good_deployment_id
+	// and write the new id. Two readers can race on a non-tx read+write;
+	// use a tx with FOR UPDATE so concurrent activate/rollback serialize.
+	//
+	// Edge cases handled:
+	//   - First-ever activate: current is nil → last_good stays NULL.
+	//   - Re-activate the same id: current.deployment_id == newID →
+	//     last_good becomes equal to deployment_id (visually a no-op,
+	//     but the row stays consistent).
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txActive := s.activeRepo.WithTx(tx)
+		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("reading current active deployment: %w", err)
+		}
+		var lastGood *string
+		if current != nil {
+			lastGood = &current.DeploymentID
+		}
+		if err := txActive.Set(ctx, &domain.ActiveDeployment{
+			TenantID:             tenantID,
+			AppName:              appName,
+			DeploymentID:         deploymentID,
+			LastGoodDeploymentID: lastGood,
+			// Copy the opt-in flag from the deployments row onto
+			// the active slot. The worker-driven auto-rollback
+			// path and the heartbeat-driven stability window
+			// both read from the active row.
+			AutoRollbackEnabled: deployment.AutoRollbackEnabled,
+		}); err != nil {
+			return fmt.Errorf("setting active deployment: %w", err)
+		}
+		// Reset the stability clock on every activate. The new
+		// deployment has not been observed running yet, so
+		// stable_since must be NULL — otherwise the stability
+		// window could fire immediately on the next heartbeat
+		// and promote the just-activated id into last_good
+		// before any worker has even loaded the artifact. We
+		// explicitly ClearStableSince inside the tx (rather than
+		// relying on Set to write it) because Set deliberately
+		// omits stable_since from its UPDATE clause — see the
+		// doc comment on ActiveDeploymentRepository.Set.
+		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("clearing stability clock: %w", err)
+		}
+		return nil
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
 	}
@@ -371,25 +451,38 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		},
 	}
 
-	// Resolve the effective regions list to publish to:
-	//   - deployment.Regions if non-empty (post-migration-008 row),
-	//   - otherwise the control plane's default region (handles
-	//     pre-migration rows AND any caller that wrote the row via a
-	//     path that left Regions nil).
-	regions := deployment.Regions
+	// Resolve the effective regions list to publish to via the
+	// shared helper. publishSwap is also used by RollbackDeployment,
+	// which previously published to "global" only — a silent
+	// multi-region regression. Keeping both paths through one helper
+	// guarantees they fan out identically.
+	//
+	// deployment.Regions is pq.StringArray on this branch; convert to
+	// []string so publishSwap can iterate it directly.
+	regions := domain.StringArrayTo(deployment.Regions)
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
+	return s.publishSwap(ctx, msg, regions, deploymentID)
+}
 
-	// Fan out: publish one TaskMessage per region. Failures are
-	// logged but do NOT abort the loop — if a tenant activated to
-	// three regions and one publish fails (e.g. NATS blip), the
-	// other two should still get the message. The error returned
-	// here is a summary so the HTTP layer can surface a 5xx and
-	// the tenant can retry the failed regions. (A future
-	// improvement could track per-region publish state in the
-	// `active_deployments` row and only retry the failed ones;
-	// out of scope for the v1.)
+// publishSwap fans a TaskMessage out to every region in `regions`.
+// Used by ActivateDeployment and RollbackDeployment so they cannot
+// drift in their region-fanout behavior (the prior Rollback path
+// published to "global" only, leaving multi-region deployments
+// stuck on the broken version until the next heartbeat).
+//
+// Failures in a single region are logged and accumulated into the
+// returned error — we keep publishing to the remaining regions
+// rather than aborting on the first failure, so a transient NATS
+// blip in one region doesn't starve the others. If at least one
+// region fails the error is wrapped with ErrPublishFailed (matched
+// by the HTTP layer for 502); the per-region list is preserved
+// through Go's multi-%w error wrapping so logs can show the full
+// picture. The DB row has already committed by the time we get
+// here, so workers may still be serving the prior deployment; the
+// caller surfaces this as a transient failure to the client.
+func (s *DeploymentService) publishSwap(ctx context.Context, msg *nats.TaskMessage, regions []string, deploymentID string) error {
 	var failedRegions []string
 	for _, region := range regions {
 		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
@@ -398,10 +491,143 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		}
 	}
 	if len(failedRegions) > 0 {
-		return fmt.Errorf("publishing task update failed for %d region(s): %s", len(failedRegions), strings.Join(failedRegions, ","))
+		return fmt.Errorf("%w: %d region(s) failed: %s", ErrPublishFailed, len(failedRegions), strings.Join(failedRegions, ","))
+	}
+	return nil
+}
+
+// RollbackDeployment atomically swaps the active deployment back to the
+// stored last_good_deployment_id and republishes a TaskMessage so workers
+// reconcile. Returns ErrNoLastGood if the row has no last-good pointer
+// (tenant has only ever activated one deployment).
+//
+// On success, returns the deployment_id that is now active (i.e., the
+// prior last_good value). The prior current deployment_id is overwritten
+// — there is no multi-step history in this minimum viable version.
+func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error) {
+	var rolledBackID string
+	var deploymentHash string
+	var regions []string
+	var tenant *domain.Tenant
+	var envs []domain.AppEnv
+	var maxMemoryMB int
+
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txActive := s.activeRepo.WithTx(tx)
+		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("reading current active deployment: %w", err)
+		}
+		if current == nil {
+			return ErrNoActiveDeployment
+		}
+		if current.LastGoodDeploymentID == nil {
+			return ErrNoLastGood
+		}
+
+		rolledBackID = *current.LastGoodDeploymentID
+
+		// Confirm the target still exists. Defends against the (unlikely)
+		// case where the last_good row was deleted out from under us.
+		dep, err := s.deploymentRepo.WithTx(tx).GetByID(ctx, rolledBackID)
+		if err != nil || dep == nil {
+			return fmt.Errorf("previous deployment %s not found", rolledBackID)
+		}
+		if dep.TenantID != tenantID || dep.AppName != appName {
+			return fmt.Errorf("previous deployment %s not found", rolledBackID)
+		}
+		deploymentHash = dep.Hash
+		// Use the rolled-BACK-TO deployment's regions so we publish
+		// to exactly the regions where this artifact was originally
+		// destined. Previously this published to "global" only, which
+		// silently left multi-region tenants running the broken
+		// version on their non-default regions (workers there had no
+		// signal to swap).
+		regions = domain.StringArrayTo(dep.Regions)
+		if len(regions) == 0 {
+			regions = []string{s.defaultRegion}
+		}
+
+		// Clear last_good so a second rollback is a no-op (returns 409
+		// rather than rolling back to whatever was active two steps ago —
+		// that requires an N-step history table, out of scope for the
+		// minimum viable UX). Also reset the stability clock so the
+		// freshly-active deployment has to be observed running again
+		// before it becomes eligible to be promoted into last_good
+		// (otherwise the next heartbeat could see a stale stable_since
+		// from before the rollback and immediately promote the
+		// now-active deployment).
+		if err := txActive.Set(ctx, &domain.ActiveDeployment{
+			TenantID:             tenantID,
+			AppName:              appName,
+			DeploymentID:         rolledBackID,
+			LastGoodDeploymentID: nil,
+			// Preserve the auto-rollback flag across the rollback —
+			// it's a tenant preference, not a property of any single
+			// deployment, so it should survive a swap.
+			AutoRollbackEnabled: current.AutoRollbackEnabled,
+		}); err != nil {
+			return fmt.Errorf("swapping active deployment: %w", err)
+		}
+		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("clearing stability clock: %w", err)
+		}
+
+		// Snapshot the publish inputs inside the tx so the message
+		// reflects post-rollback state even if another activate lands
+		// between commit and publish (which would itself race with this
+		// publish; see plan §"Risk register"). All four reads below use
+		// WithTx(tx) so they participate in the same atomic transaction
+		// as the active_deployments Set above — without the wrapper the
+		// reads would happen on the main connection pool and could
+		// observe a different snapshot than the one we're about to
+		// commit.
+		envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing env vars: %w", err)
+		}
+		envs = envsList
+		tenant, err = s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
+		if err != nil || tenant == nil {
+			return fmt.Errorf("getting tenant: %w", err)
+		}
+		quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		maxMemoryMB = 256
+		if quota != nil && quota.MaxMemoryMB > 0 {
+			maxMemoryMB = quota.MaxMemoryMB
+		}
+		return nil
+	}); err != nil {
+		return "", err
 	}
 
-	return nil
+	envMap := make(map[string]string)
+	for _, e := range envs {
+		envMap[e.EnvKey] = e.EnvValue
+	}
+
+	msg := &nats.TaskMessage{
+		Type:      "task_update",
+		Timestamp: time.Now(),
+		TenantID:  tenantID,
+		Apps: map[string]nats.AppConfig{
+			appName: {
+				DeploymentID:   rolledBackID,
+				DeploymentHash: deploymentHash,
+				Env:            envMap,
+				Allowlist:      tenant.AllowlistedDestinations,
+				MaxMemoryMB:    maxMemoryMB,
+			},
+		},
+	}
+	if err := s.publishSwap(ctx, msg, regions, rolledBackID); err != nil {
+		return "", err
+	}
+
+	return rolledBackID, nil
 }
 
 // RepublishActiveDeployments re-sends a TaskMessage for every currently-active

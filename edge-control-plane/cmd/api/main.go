@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +30,31 @@ import (
 // exists solely for //go:embed (which resolves paths relative to this file).
 // Run `go generate` after updating the spec to keep them in sync.
 var openAPISpec embed.FS
+
+// stableWindowFromEnv reads STABLE_WINDOW_SECONDS from the
+// environment, returning 0 (= "use service default") when unset or
+// unparseable. Defaults live in service.NewWorkerService; this
+// helper is purely an env → Duration bridge so cmd/api/main.go
+// doesn't have to repeat the strconv + log-on-error dance inline.
+//
+// The env var is the operator-facing knob for the auto-rollback
+// stability window. Lowering it (e.g. to 5s) makes freshly-activated
+// deployments eligible to be promoted to last_good faster, at the
+// cost of being more sensitive to transient blips. The default
+// (30s) matches the worker's heartbeat_interval_secs default so
+// promotion can fire on the second heartbeat after activation.
+func stableWindowFromEnv() time.Duration {
+	raw := os.Getenv("STABLE_WINDOW_SECONDS")
+	if raw == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs < 0 {
+		log.Printf("STABLE_WINDOW_SECONDS=%q invalid; using service default", raw)
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
 
 func main() {
 	// Load configuration
@@ -86,11 +112,11 @@ func main() {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo)
 	deploymentSvc := service.NewDeploymentService(
-		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
+		db, deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
-	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
+	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	trafficSvc := service.NewTrafficService(trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher)
@@ -223,6 +249,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/status/{deploymentID}", deploymentHandler.GetStatus)
 	api.HandleFunc("GET /api/v1/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
+	api.HandleFunc("POST /api/v1/apps/{appName}/rollback", deploymentHandler.Rollback)
 	api.HandleFunc("GET /api/v1/apps/{appName}/active", deploymentHandler.GetActive)
 	api.HandleFunc("GET /api/v1/auth/whoami", authHandler.Whoami)
 	api.HandleFunc("POST /api/v1/apps/{appName}/env", envHandler.Set)
@@ -232,6 +259,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
+	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
 	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
@@ -266,6 +294,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
 	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
+	// Worker-driven auto-rollback: an edge-worker POSTs here when its
+	// supervisor exhausts the restart cap on a tenant app. The
+	// handler swaps the active deployment back to last_good and
+	// publishes a TaskMessage so all regions reconcile. Like every
+	// other /api/internal/* endpoint, this is currently
+	// unauthenticated — see the comment on internalMux above.
+	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,

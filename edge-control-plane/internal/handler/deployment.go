@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,20 +23,53 @@ type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
 	trafficSvc    *service.TrafficService
+	// rollbackSvc is a narrow contract for the rollback handler so the
+	// test can stub it without standing up the full *service.DeploymentService
+	// (DB + NATS + publisher + artifact store). The concrete
+	// *service.DeploymentService satisfies it.
+	rollbackSvc deploymentRollbacker
+	// activateSvc mirrors rollbackSvc for the Activate handler — narrow
+	// contract lets tests stub the activate path without the full service
+	// surface. Concrete *service.DeploymentService satisfies it.
+	activateSvc deploymentActivator
+}
+
+// deploymentRollbacker is the narrow contract the Rollback handler needs.
+// Kept package-local so handler tests can implement it inline without
+// having to mock the full DeploymentService surface.
+type deploymentRollbacker interface {
+	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+}
+
+// deploymentActivator is the narrow contract the Activate handler needs.
+// Mirrors deploymentRollbacker for the activate path.
+type deploymentActivator interface {
+	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
-	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc, trafficSvc: trafficSvc}
+	return &DeploymentHandler{
+		deploymentSvc: deploymentSvc,
+		workerSvc:     workerSvc,
+		trafficSvc:    trafficSvc,
+		// Concrete *service.DeploymentService satisfies the narrow interfaces.
+		// nil is also fine for tests that only exercise the workerSvc path
+		// (e.g. AppIngress) — those methods never touch rollbackSvc /
+		// activateSvc.
+		rollbackSvc: deploymentSvc,
+		activateSvc: deploymentSvc,
+	}
 }
 
 // deployResponse is the JSON shape returned by `POST /api/deploy/{appName}`.
 // Typed (vs the prior anonymous `map[string]interface{}`) so the contract
 // is explicit and the test asserts against a struct, not a string match.
 type deployResponse struct {
-	ID      string   `json:"id"`
-	Hash    string   `json:"hash"`
-	URL     string   `json:"url"`
-	Regions []string `json:"regions"`
+	ID                  string   `json:"id"`
+	Hash                string   `json:"hash"`
+	URL                 string   `json:"url"`
+	Regions             []string `json:"regions"`
+	AutoRollbackEnabled bool     `json:"auto_rollback_enabled"`
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -43,8 +77,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	// Validate app name
-	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequestCtx(w, r, "invalid app name")
+	if !validateAppName(w, appName) {
 		return
 	}
 
@@ -60,6 +93,18 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse `?auto-rollback=true|false`. Defaults to false. Uses
+	// `strconv.ParseBool` so the user can pass any of the canonical
+	// truthy strings ("1", "t", "true", "TRUE", …); a non-boolean
+	// value returns 400 rather than being silently coerced to false
+	// (silent coercion would let a typo like `?auto-rollback=ture`
+	// disable a feature the tenant thought they had enabled).
+	autoRollback, aperr := parseBoolQuery(r.URL.Query().Get("auto-rollback"), false)
+	if aperr != nil {
+		http.Error(w, `{"error": "`+aperr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -67,7 +112,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions, autoRollback)
 	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
@@ -93,10 +138,11 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(deployResponse{
-		ID:      deployment.ID,
-		Hash:    deployment.Hash,
-		URL:     "https://" + domain.IngressHost(tenantID, appName),
-		Regions: domain.StringArrayTo(deployment.Regions),
+		ID:                  deployment.ID,
+		Hash:                deployment.Hash,
+		URL:                 "https://" + domain.IngressHost(tenantID, appName),
+		Regions:             domain.StringArrayTo(deployment.Regions),
+		AutoRollbackEnabled: deployment.AutoRollbackEnabled,
 	})
 }
 
@@ -142,6 +188,18 @@ func parseRegions(raw string) ([]string, error) {
 		return nil, fmt.Errorf("too many regions: %d (max %d)", len(out), service.MaxRegionsPerDeployment)
 	}
 	return out, nil
+}
+
+// parseBoolQuery parses a query-string boolean with a default when the
+// parameter is absent. Returns an error for unparseable values so the
+// caller can return 400 — silently coercing to the default would let
+// a typo disable a feature the tenant thought they had enabled
+// (e.g. `?auto-rollback=ture` ≠ `?auto-rollback=true`).
+func parseBoolQuery(raw string, defaultVal bool) (bool, error) {
+	if raw == "" {
+		return defaultVal, nil
+	}
+	return strconv.ParseBool(raw)
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
@@ -196,15 +254,43 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
+//
+// Status codes:
+//   - 200: activated; body is {"status": "activated"}
+//   - 502: activation committed but the post-commit NATS publish of
+//     the TaskMessage failed — workers may still be serving the prior
+//     deployment. Client should re-activate the desired deployment
+//     (a plain retry will 409 because the row is already in the
+//     desired state, or 404 if the deploy was deleted).
+//   - 500: anything else (DB error, etc.).
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	deploymentID := r.PathValue("deploymentID")
 
+	// Validate both path parameters. The deployment id flows into the
+	// /registry/{tenant}/{app}/{deployment}.wasm path on the worker
+	// (see Download handler) — a ".." or "/" in the id lets a caller
+	// reference arbitrary files on the worker's filesystem. Reject
+	// 400 here rather than 500 from the storage layer.
+	if !validateAppName(w, appName) {
+		return
+	}
+	if !validateDeploymentID(w, deploymentID) {
+		return
+	}
+
 	weightStr := r.URL.Query().Get("weight")
 	if weightStr == "" {
 		// Default weight=100: atomic activation (existing behavior).
-		if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+			if errors.Is(err, service.ErrPublishFailed) {
+				http.Error(w,
+					`{"error": "activation committed but worker notification failed; please retry"}`,
+					http.StatusBadGateway)
+				return
+			}
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)
 			return
@@ -248,6 +334,52 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"})
 }
 
+// Rollback handles POST /api/apps/{appName}/rollback. Swaps the active
+// deployment back to the stored last_good_deployment_id and republishes a
+// TaskMessage so workers reconcile.
+//
+// Status codes:
+//   - 200: rolled back; body is {"deployment_id": "<new active id>"}
+//   - 404: no active deployment for this app (user never activated)
+//   - 409: app is active but has no last-good pointer (only ever activated
+//     one deployment, so there is nothing to roll back to)
+//   - 502: rollback committed but the post-commit NATS publish failed —
+//     workers may still be serving the prior deployment. Client should
+//     re-activate the desired deployment; a plain retry will 409
+//     because last_good was cleared on this attempt.
+//   - 500: anything else (DB error, etc.).
+func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
+
+	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName)
+	if err != nil {
+		if errors.Is(err, service.ErrNoLastGood) {
+			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
+			return
+		}
+		if errors.Is(err, service.ErrNoActiveDeployment) {
+			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, service.ErrPublishFailed) {
+			http.Error(w,
+				`{"error": "rollback committed but worker notification failed; please retry"}`,
+				http.StatusBadGateway)
+			return
+		}
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "rollback failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
+}
+
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -260,6 +392,32 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(deployment)
+}
+
+// validateAppName writes a 400 with {"error": "invalid app name"} and
+// returns false if appName is empty or contains path-traversal
+// characters. Callers should `return` immediately when this is false.
+func validateAppName(w http.ResponseWriter, appName string) bool {
+	if appName == "" || containsPathTraversal(appName) {
+		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+// validateDeploymentID writes a 400 with {"error": "invalid deployment
+// id"} and returns false if deploymentID is empty or contains
+// path-traversal characters. Callers should `return` when this is false.
+// The deployment id flows into the /registry/{tenant}/{app}/{deployment}
+// .wasm path on the worker (see Download handler) — a ".." or "/" in the
+// id lets a caller reference arbitrary files on the worker's filesystem.
+// Reject 400 here rather than 500 from the storage layer.
+func validateDeploymentID(w http.ResponseWriter, deploymentID string) bool {
+	if deploymentID == "" || containsPathTraversal(deploymentID) {
+		http.Error(w, `{"error": "invalid deployment id"}`, http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 // containsPathTraversal blocks the *decoded* traversal shapes ("/", "\\",
@@ -285,8 +443,7 @@ func containsPathTraversal(s string) bool {
 func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
-	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequestCtx(w, r, "invalid app name")
+	if !validateAppName(w, appName) {
 		return
 	}
 
