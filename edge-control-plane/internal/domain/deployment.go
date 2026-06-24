@@ -31,6 +31,16 @@ type Deployment struct {
 	// convention of not using `omitempty` on domain structs.
 	Regions   pq.StringArray `db:"regions" json:"regions"`
 	CreatedAt time.Time      `db:"created_at"`
+	// AutoRollbackEnabled is the tenant opt-in set by
+	// `edge deploy --auto-rollback`. At activate time this flag is
+	// copied onto the active_deployments row; it controls whether
+	// the worker-driven auto-rollback (handler.AutoRollback) and the
+	// heartbeat-driven stability window (service.worker.evaluateStability)
+	// are allowed to mutate last_good_deployment_id for this app.
+	// Defaults to false on the wire (legacy deployments pre-migration-009
+	// are not affected). Stored on the deployments row too so operators
+	// can audit "which deployments opted in" via the list endpoint.
+	AutoRollbackEnabled bool `db:"auto_rollback_enabled" json:"auto_rollback_enabled"`
 }
 
 // Deployment status constants.
@@ -42,10 +52,32 @@ const (
 )
 
 // ActiveDeployment maps an app name to its active deployment for a tenant.
+//
+// LastGoodDeploymentID is the prior deployment that was active before the
+// most recent Activate. Used by RollbackDeployment to swap back to it
+// without requiring the tenant to remember the id. Nullable: pre-existing
+// rows (no history) read back as nil; rollback on such a row returns 409.
 type ActiveDeployment struct {
-	TenantID     string `db:"tenant_id"`
-	AppName      string `db:"app_name"`
-	DeploymentID string `db:"deployment_id"`
+	TenantID             string  `db:"tenant_id"`
+	AppName              string  `db:"app_name"`
+	DeploymentID         string  `db:"deployment_id"`
+	LastGoodDeploymentID *string `db:"last_good_deployment_id"`
+	// AutoRollbackEnabled mirrors the flag from the deployments
+	// row, copied at activate time. Read by the worker-driven
+	// auto-rollback endpoint and by the heartbeat-driven stability
+	// window. Defaults to false on disk (migration 009).
+	AutoRollbackEnabled bool `db:"auto_rollback_enabled"`
+	// StableSince is the first-heartbeat timestamp for the
+	// currently-active deployment. NULL means "not yet observed
+	// running" or "rolled back; clock reset". The heartbeat
+	// handler sets this to NOW() the first time it sees
+	// status="running" for this active row; the stability window
+	// promotes deployment_id → last_good_deployment_id once
+	// stable_since is older than STABLE_WINDOW_SECONDS. Reset to
+	// NULL on every activate / rollback / auto-rollback (see
+	// service.ActivateDeployment / RollbackDeployment and
+	// repository.ResetStableSinceForRollback).
+	StableSince *time.Time `db:"stable_since"`
 }
 
 // AppEnv stores environment variables for an app.
