@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::config::{ingress_host, Config};
 use crate::routing::RouteEntry;
+use crate::traffic::TrafficSplitCache;
 
 const SERVER_NAME_HTTPS: &str = "edge_https";
 const SERVER_NAME_HTTP: &str = "edge_http";
@@ -75,9 +76,13 @@ impl CaddyClient {
 /// ]
 /// ```
 ///
+/// The `traffic_cache` is consulted for authoritative weights. If a cached
+/// split exists for a `(tenant_id, app_name)` the cached weight is used;
+/// otherwise `e.weight` (from the heartbeat, defaulting to 100) is used.
+///
 /// A single entry omits the `weight` key, which Caddy defaults to `1` for
 /// that sole upstream — identical routing behaviour to the legacy path.
-pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
+pub fn render_routes(entries: &[RouteEntry], cfg: &Config, traffic_cache: &TrafficSplitCache) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
     let mut groups: std::collections::HashMap<
@@ -113,13 +118,17 @@ pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
                 let e = group_sorted[0];
                 serde_json::json!([{"dial": format!("{}:{}", e.worker_addr, e.port)}])
             } else {
-                // Multiple deployments — weighted upstreams.
+                // Multiple deployments — use cached weights when available.
                 serde_json::json!(group_sorted.iter().map(|e| {
-                    let upstream = serde_json::json!({
+                    // Use cached traffic split weight if available, otherwise
+                    // fall back to the heartbeat weight (default 100).
+                    let weight = e.deployment_id.as_ref().and_then(|did| {
+                        traffic_cache.weight(tenant_id, app_name, did)
+                    }).unwrap_or(e.weight);
+                    serde_json::json!({
                         "dial": format!("{}:{}", e.worker_addr, e.port),
-                        "weight": e.weight,
-                    });
-                    upstream
+                        "weight": weight,
+                    })
                 }).collect::<Vec<_>>())
             };
 
@@ -187,6 +196,7 @@ pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
 mod tests {
     use super::*;
     use crate::routing::RouteEntry;
+    use crate::traffic::TrafficSplitCache;
     use std::time::Instant;
 
     fn entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
@@ -232,13 +242,15 @@ mod tests {
             refresh_debounce_ms: 1000,
             http_to_https: true,
             admin_token: None,
+            control_plane_api_url: "http://localhost:8080".into(),
         }
     }
 
     #[test]
     fn render_empty_table_still_emits_servers_and_tls() {
         let cfg = test_cfg();
-        let cfg_json = render_routes(&[], &cfg);
+        let cache = TrafficSplitCache::default();
+        let cfg_json = render_routes(&[], &cfg, &cache);
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
         assert!(servers.contains_key(SERVER_NAME_HTTP));
@@ -260,12 +272,13 @@ mod tests {
     #[test]
     fn render_three_entries_produces_three_routes_with_correct_hosts() {
         let cfg = test_cfg();
+        let cache = TrafficSplitCache::default();
         let entries = vec![
             entry("t_acme", "api", "1.2.3.4", 8081),
             entry("t_acme", "web", "1.2.3.4", 8082),
             entry("t_globex", "api", "5.6.7.8", 9000),
         ];
-        let cfg_json = render_routes(&entries, &cfg);
+        let cfg_json = render_routes(&entries, &cfg, &cache);
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -303,11 +316,12 @@ mod tests {
     #[test]
     fn canary_two_deployments_rendered_as_weighted_upstreams() {
         let cfg = test_cfg();
+        let cache = TrafficSplitCache::default();
         let entries = vec![
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 95),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 5),
         ];
-        let cfg_json = render_routes(&entries, &cfg);
+        let cfg_json = render_routes(&entries, &cfg, &cache);
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -345,8 +359,9 @@ mod tests {
     #[test]
     fn single_deployment_omits_weight_key() {
         let cfg = test_cfg();
+        let cache = TrafficSplitCache::default();
         let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
-        let cfg_json = render_routes(&entries, &cfg);
+        let cfg_json = render_routes(&entries, &cfg, &cache);
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         assert_eq!(upstreams.as_array().unwrap().len(), 1);
@@ -363,7 +378,8 @@ mod tests {
     fn http_to_https_disabled_omits_port_80_server() {
         let mut cfg = test_cfg();
         cfg.http_to_https = false;
-        let cfg_json = render_routes(&[], &cfg);
+        let cache = TrafficSplitCache::default();
+        let cfg_json = render_routes(&[], &cfg, &cache);
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
@@ -371,10 +387,67 @@ mod tests {
 
     #[test]
     fn automatic_https_is_disabled_so_wildcard_cert_wins() {
-        let cfg_json = render_routes(&[], &test_cfg());
+        let cache = TrafficSplitCache::default();
+        let cfg_json = render_routes(&[], &test_cfg(), &cache);
         assert_eq!(
             cfg_json["apps"]["http"]["automatic_https"]["disable"],
             serde_json::Value::Bool(true)
         );
+    }
+
+    /// A `weight=0` deployment (draining) must still be included in the
+    /// upstreams list so Caddy can honour the weight even if it's 0.
+    #[test]
+    fn weight_zero_deployment_is_included_in_upstreams() {
+        let cfg = test_cfg();
+        let cache = TrafficSplitCache::default();
+        let entries = vec![
+            canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 0),
+            canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
+        ];
+        let cfg_json = render_routes(&entries, &cfg, &cache);
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams_arr = upstreams.as_array().unwrap();
+        assert_eq!(upstreams_arr.len(), 2);
+        // Both upstreams are present; weight=0 is rendered explicitly.
+        let by_dial: std::collections::HashMap<_, _> = upstreams_arr
+            .iter()
+            .map(|u| (u["dial"].as_str().unwrap().to_string(), u["weight"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(by_dial.get("1.2.3.4:8081"), Some(&0));
+        assert_eq!(by_dial.get("1.2.3.5:8082"), Some(&100));
+    }
+
+    /// Cached traffic split weights override the heartbeat-derived weights.
+    /// Heartbeat says weight=100 for both, but the cache says 5/95 — the
+    /// rendered upstreams must use the cached values.
+    #[test]
+    fn traffic_cache_overrides_heartbeat_weights() {
+        let cfg = test_cfg();
+        let mut cache = TrafficSplitCache::default();
+        cache.update(
+            "t_acme".to_string(),
+            "api".to_string(),
+            std::collections::HashMap::from([
+                ("d_v1".to_string(), 5),
+                ("d_v2".to_string(), 95),
+            ]),
+        );
+        // Heartbeat weights are 100/100 — cache should override to 5/95.
+        let entries = vec![
+            canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100),
+            canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
+        ];
+        let cfg_json = render_routes(&entries, &cfg, &cache);
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams_arr = upstreams.as_array().unwrap();
+        let by_dial: std::collections::HashMap<_, _> = upstreams_arr
+            .iter()
+            .map(|u| (u["dial"].as_str().unwrap().to_string(), u["weight"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(by_dial.get("1.2.3.4:8081"), Some(&5));
+        assert_eq!(by_dial.get("1.2.3.5:8082"), Some(&95));
     }
 }

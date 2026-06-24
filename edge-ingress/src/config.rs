@@ -27,6 +27,7 @@ pub struct Config {
     pub refresh_debounce_ms: u64,
     pub http_to_https: bool,
     pub admin_token: Option<String>,
+    pub control_plane_api_url: String,
 }
 
 impl Config {
@@ -45,6 +46,8 @@ impl Config {
     /// - `CADDY_ADMIN_TOKEN` (if set, must match the value on the Caddy process)
     /// - `REFRESH_DEBOUNCE_MS` (default: `1000`)
     /// - `HTTP_TO_HTTPS` (default: `true`) — 308-redirect :80 → :443
+    /// - `CONTROL_PLANE_API_URL` (default: `http://localhost:8080`) — used
+    ///   by the ingress to fetch canary traffic splits at render time
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Config {
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
@@ -65,6 +68,8 @@ impl Config {
             admin_token: std::env::var("CADDY_ADMIN_TOKEN")
                 .ok()
                 .filter(|v| !v.is_empty()),
+            control_plane_api_url: std::env::var("CONTROL_PLANE_API_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
         })
     }
 }

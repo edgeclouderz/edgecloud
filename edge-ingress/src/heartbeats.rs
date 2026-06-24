@@ -20,6 +20,8 @@ use crate::caddy::{render_routes, CaddyClient};
 use crate::config::Config;
 use crate::messages::HeartbeatMessage;
 use crate::routing::{RouteEntry, RoutingTable};
+use crate::traffic::{spawn_fetcher, SharedCache};
+use reqwest::Client;
 
 const STALE_AFTER: Duration = Duration::from_secs(180);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
@@ -37,10 +39,21 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
     // Spawn the renderer + the periodic pruner. Both share a `Notify` flag
     // so we collapse bursts of heartbeats into a single Caddy reload.
     let render_notify = Arc::new(Notify::new());
+
+    // Traffic-split cache shared between the fetcher and the renderer.
+    let traffic_cache: SharedCache = Default::default();
+    let http_client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest Client must build");
+    let traffic_cache_for_renderer = traffic_cache.clone();
+    let traffic_cache_for_push = traffic_cache.clone();
+    spawn_fetcher(http_client, cfg.control_plane_api_url.clone(), traffic_cache.clone());
     spawn_renderer(
         cfg.clone(),
         table.clone(),
         caddy.clone(),
+        traffic_cache_for_renderer,
         render_notify.clone(),
     );
     spawn_pruner(table.clone(), render_notify.clone());
@@ -48,7 +61,7 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
     // Push the initial empty config so Caddy's admin API has a known state
     // before the first heartbeat lands. (Otherwise Caddy might still be
     // serving its default config, e.g. `:2019` admin only.)
-    if let Err(e) = push_now(&cfg, &table, &caddy).await {
+    if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache_for_push).await {
         warn!(err = %e, "initial Caddy load failed (will retry on first heartbeat)");
     }
 
@@ -133,6 +146,7 @@ fn spawn_renderer(
     cfg: Config,
     table: Arc<RoutingTable>,
     caddy: Arc<CaddyClient>,
+    traffic_cache: SharedCache,
     notify: Arc<Notify>,
 ) {
     tokio::spawn(async move {
@@ -145,7 +159,7 @@ fn spawn_renderer(
             // burst. That's acceptable for v1; if it becomes a problem,
             // switch to a trailing-edge debounce using a watch channel.
             sleep(Duration::from_millis(cfg.refresh_debounce_ms)).await;
-            if let Err(e) = push_now(&cfg, &table, &caddy).await {
+            if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache).await {
                 error!(err = %e, "Caddy reload failed");
             } else {
                 debug!("Caddy config reloaded");
@@ -170,9 +184,10 @@ fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>) {
     });
 }
 
-async fn push_now(cfg: &Config, table: &RoutingTable, caddy: &CaddyClient) -> Result<()> {
+async fn push_now(cfg: &Config, table: &RoutingTable, caddy: &CaddyClient, traffic_cache: &SharedCache) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
-    let json = render_routes(&snap, cfg);
+    let traffic_cache = traffic_cache.read().await;
+    let json = render_routes(&snap, cfg, &traffic_cache);
     caddy.load_config(&json).await
 }
 

@@ -222,7 +222,11 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 
 	// Partial weight: canary activation.
 	// Get the currently active deployment (if any) to build the traffic split.
-	current, _ := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
+	current, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("warning: GetActiveDeployment failed: %v; proceeding without current", err)
+		// continue without current — new deployment gets 100% traffic
+	}
 	splits := []domain.TrafficSplitEntry{
 		{DeploymentID: deploymentID, Weight: weight},
 	}
