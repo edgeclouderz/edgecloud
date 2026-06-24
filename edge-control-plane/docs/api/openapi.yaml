@@ -775,6 +775,23 @@ paths:
   # -------------------------------------------------------------------------
   # Public
   # -------------------------------------------------------------------------
+  /metrics:
+    get:
+      operationId: getAllMetrics
+      summary: Prometheus metrics scrape endpoint (all tenants)
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for all tenants.
+        Unauthenticated — intended for internal operator/Prometheus scrape access
+        only. Do not expose on the public load balancer.
+      security: []
+      responses:
+        '200':
+          description: Prometheus text-format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /health:
     get:
       operationId: health
@@ -1502,6 +1519,24 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /api/v1/metrics:
+    get:
+      operationId: getTenantMetrics
+      summary: Prometheus metrics for the authenticated tenant
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for the calling tenant only.
+        Includes request counts, outbound bytes, and any guest-emitted counters,
+        gauges, and histogram samples from `edge:observe`.
+      responses:
+        '200':
+          description: Prometheus text-format metrics for this tenant
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   # -------------------------------------------------------------------------
   # Admin: Tenants
