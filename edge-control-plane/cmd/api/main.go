@@ -115,7 +115,8 @@ func main() {
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
-	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
+	metricsAgg := service.NewMetricsAggregator()
+	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv(), metricsAgg)
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
@@ -131,6 +132,7 @@ func main() {
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
+	metricsHandler := handler.NewMetricsHandler(metricsAgg)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -139,6 +141,10 @@ func main() {
 
 	// Setup router
 	mux := http.NewServeMux()
+
+	// Global Prometheus metrics scrape endpoint — unauthenticated, intended for
+	// internal operator access only. Do not expose this path on the public LB.
+	mux.HandleFunc("GET /metrics", metricsHandler.GetAllMetrics)
 
 	// Health check
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -262,6 +268,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
+	api.HandleFunc("GET /api/v1/metrics", metricsHandler.GetTenantMetrics)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()

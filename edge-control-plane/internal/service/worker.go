@@ -11,7 +11,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
-	"github.com/nats-io/nats.go"
+	nats "github.com/nats-io/nats.go"
 )
 
 // Sentinel errors for WorkerService Register.
@@ -65,6 +65,7 @@ type WorkerService struct {
 	activeRepo   activeRepoInterface
 	nc           *nats.Conn
 	stableWindow time.Duration
+	metricsAgg   *MetricsAggregator
 }
 
 // NewWorkerService creates a new WorkerService.
@@ -75,7 +76,7 @@ type WorkerService struct {
 // the default (30s, configurable via STABLE_WINDOW_SECONDS env). The
 // CLI accepts any non-negative integer; sub-second precision is not
 // supported.
-func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration) *WorkerService {
+func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration, metricsAgg *MetricsAggregator) *WorkerService {
 	if stableWindow <= 0 {
 		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
 	}
@@ -85,6 +86,7 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 		activeRepo:   activeRepo,
 		nc:           nc,
 		stableWindow: stableWindow,
+		metricsAgg:   metricsAgg,
 	}
 }
 
@@ -235,6 +237,33 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	// writes — byte deltas must reach the DB even when the subscriber is
 	// shutting down. Context values (trace IDs, etc.) are preserved.
 	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
+
+	// Ingest observer metrics into the in-memory aggregator so they are
+	// immediately available at the Prometheus scrape endpoints. Pure
+	// in-memory — no DB round-trip, so we do it inline (cheap).
+	if s.metricsAgg != nil {
+		s.ingestMetrics(hb.Apps)
+	}
+}
+
+// ingestMetrics decodes the apps JSON from a heartbeat and feeds each app's
+// observer_metrics (plus the built-in request_count / outbound_bytes) into
+// the MetricsAggregator so they are immediately available at the Prometheus
+// scrape endpoints.
+func (s *WorkerService) ingestMetrics(appsRaw json.RawMessage) {
+	if len(appsRaw) == 0 {
+		return
+	}
+	var apps map[string]domain.AppStatus
+	if err := json.Unmarshal(appsRaw, &apps); err != nil {
+		return
+	}
+	for appName, app := range apps {
+		if app.TenantID == "" {
+			continue
+		}
+		s.metricsAgg.Ingest(app.TenantID, appName, app.RequestCount, app.OutboundBytes, app.ObserverMetrics)
+	}
 }
 
 // checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
