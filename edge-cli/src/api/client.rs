@@ -154,6 +154,56 @@ pub struct RollbackResponse {
     pub deployment_id: String,
 }
 
+/// One tenant log record as returned by GET
+/// `/api/v1/apps/{appName}/logs` (issue #77). Mirrors the Go
+/// `domain.LogEntry` field-for-field; the only divergence is
+/// `labels`, which the CLI decodes into a `serde_json::Value` so
+/// `edge logs` can pretty-print arbitrary label shapes without
+/// needing a typed schema per record.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogEntry {
+    #[serde(default)]
+    pub id: i64,
+    pub tenant_id: String,
+    pub deployment_id: String,
+    pub app_name: String,
+    pub worker_id: String,
+    pub region: String,
+    pub level: String,
+    pub message: String,
+    /// `serde_json::Value` with `#[serde(default)]` so an empty
+    /// JSON object on the wire deserializes to `Value::Null`
+    /// rather than failing. The CLI uses this in JSON-pipe mode
+    /// (`edge logs myapp | jq`) where shape preservation matters
+    /// more than typed access.
+    #[serde(default)]
+    pub labels: serde_json::Value,
+    pub ts: String,
+}
+
+/// Envelope returned by `GET /api/v1/apps/{appName}/logs`. The
+/// `since` field carries the RFC3339 cutoff the server actually
+/// applied; the CLI's `--follow` mode uses it to advance the next
+/// poll's `since` (plus 1ms) so it does not re-fetch the rows it
+/// just printed.
+#[derive(Debug, Deserialize)]
+pub struct LogListResponse {
+    pub items: Vec<LogEntry>,
+    pub limit: u32,
+    #[serde(default)]
+    pub since: String,
+}
+
+/// Body of GET `/api/v1/apps/{appName}/active`. Mirrors the
+/// `Deployment` row from the control plane. We only need `status`
+/// (for the "app is crashed" hint) so we declare just the field
+/// we use — adding more fields is a wire-shape pin, not a
+/// necessity.
+#[derive(Debug, Deserialize)]
+pub struct ActiveDeployment {
+    pub status: String,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -214,6 +264,43 @@ impl ApiClient {
     /// Group accessor for auth-related endpoints (e.g. whoami).
     pub fn auth(&self) -> Auth<'_> {
         Auth { client: self }
+    }
+
+    /// Group accessor for the logs read endpoint (issue #77).
+    /// Returns [`Logs`], which owns the `list` method that calls
+    /// `GET /api/v1/apps/{appName}/logs`.
+    pub fn logs(&self) -> Logs<'_> {
+        Logs { client: self }
+    }
+
+    /// Fetch the currently active deployment for `app_name`.
+    /// Returns `Ok(None)` when the server reports 404 (no active
+    /// deployment). All other errors propagate as `anyhow::Error`.
+    ///
+    /// This exists so the `edge logs` command can show a one-shot
+    /// "app is crashed" hint when the active row's status says so
+    /// — a separate `logs` call would needlessly couple the
+    /// read path to a write-shape row.
+    pub fn get_active(&self, app_name: &str) -> Result<Option<ActiveDeployment>> {
+        let url = format!("{}/api/v1/apps/{}/active", self.base_url, app_name);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("get active failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let body: ActiveDeployment = serde_json::from_str(&resp.text()?)?;
+        Ok(Some(body))
     }
 
     /// Upload a deployment artifact.
@@ -525,6 +612,77 @@ impl<'a> Auth<'a> {
             }
             ApiError::Transient { source } => source,
         })
+    }
+}
+
+/// Log read endpoints (issue #77). Borrows the parent [`ApiClient`].
+pub struct Logs<'a> {
+    client: &'a ApiClient,
+}
+
+impl<'a> Logs<'a> {
+    /// GET `/api/v1/apps/{appName}/logs` — list the most recent
+    /// log entries for the app, newest first.
+    ///
+    /// All query parameters are optional. `since_rfc3339` is an
+    /// absolute RFC3339 cutoff (the caller converts a relative
+    /// `--since 5m` into an absolute timestamp before calling).
+    /// The server defaults to the last 5 minutes when omitted.
+    /// `level` is the minimum severity (`trace|debug|info|warn|error`).
+    /// `limit` is clamped to [1, 1000] server-side; the CLI sends
+    /// the user-supplied value through unmodified.
+    ///
+    /// Errors: any non-2xx becomes a flat `anyhow::Error` carrying
+    /// the status and body. 4xx rejections (e.g. invalid level)
+    /// surface as the message so `edge logs` can show the
+    /// server-typed reason to the user.
+    pub fn list(
+        &self,
+        app_name: &str,
+        since_rfc3339: Option<&str>,
+        level: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<LogListResponse> {
+        let mut url = format!("{}/api/v1/apps/{}/logs", self.client.base_url, app_name);
+        let mut parsed =
+            reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
+        if let Some(since) = since_rfc3339 {
+            if !since.is_empty() {
+                parsed.query_pairs_mut().append_pair("since", since);
+            }
+        }
+        if let Some(lvl) = level {
+            if !lvl.is_empty() {
+                parsed.query_pairs_mut().append_pair("level", lvl);
+            }
+        }
+        if let Some(n) = limit {
+            // `0` is the CLI's "use server default" signal (the
+            // handler treats it the same as omitted). We only emit
+            // the param when > 0 so the URL is clean.
+            if n > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("limit", &n.to_string());
+            }
+        }
+        url = parsed.to_string();
+
+        let resp = self
+            .client
+            .http
+            .get(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("logs failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let body: LogListResponse = serde_json::from_str(&resp.text()?)?;
+        Ok(body)
     }
 }
 
