@@ -11,6 +11,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // MaxDomainsPerApp caps the number of custom domains a single app can
@@ -75,17 +76,43 @@ var (
 	ErrDomainQuotaExceeded = errors.New("too many domains for this app")
 )
 
-// appLookupForDomain is the narrow contract DomainService needs from
-// AppService. Kept as an interface so handler/service tests can mock
-// just the (tenant, app) existence check without standing up the full
-// AppService + AppRepository + QuotaRepository graph.
+// appLookupForDomain is the narrow contract DomainService needs to
+// lock an (tenant, app) row from inside a transaction. The `WithTx`
+// method returns a new instance bound to a *sqlx.Tx so the
+// `SELECT … FOR UPDATE` runs on the same transaction (and the row
+// lock is held until commit/rollback) — this is what closes the
+// count-then-insert race in AddDomain.
+//
+// In production this is implemented by `*repository.AppRepository`,
+// which already exposes WithTx + GetForUpdate. We keep it as an
+// interface here so handler/service tests can substitute a mock
+// without standing up the full AppRepository + Postgres graph.
+//
+// The WithTx return type is the concrete *repository.AppRepository
+// (matching the existing pattern in the repository package's
+// other repos).
 type appLookupForDomain interface {
+	WithTx(tx *sqlx.Tx) *repository.AppRepository
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	// GetForUpdate locks the (tenant, app) row for the lifetime of the
+	// surrounding tx so concurrent domain inserts against the same
+	// app serialize on the parent row — closing the count-then-insert
+	// race that would otherwise let two callers at count==cap-1 both
+	// insert and overshoot MaxDomainsPerApp. Returns (nil, nil) when
+	// the app does not exist; service maps that to ErrAppNotFound.
+	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error)
 }
 
 // DomainRepositoryInterface is the narrow contract DomainService needs
 // from DomainRepository. Mirrors the pattern in worker.go / app.go.
+//
+// `WithTx` returns a *repository.DomainRepository (the concrete
+// type, not the interface) — this matches the existing pattern in
+// *repository.AppRepository, *repository.DeploymentRepository, and
+// *repository.ActiveDeploymentRepository. The receiver re-uses
+// the interface methods on the tx-bound instance.
 type DomainRepositoryInterface interface {
+	WithTx(tx *sqlx.Tx) *repository.DomainRepository
 	Create(ctx context.Context, d *domain.Domain) error
 	GetByID(ctx context.Context, id string) (*domain.Domain, error)
 	GetByFQDN(ctx context.Context, fqdn string) (*domain.Domain, error)
@@ -98,18 +125,26 @@ type DomainRepositoryInterface interface {
 
 // DomainService handles custom-domain business logic.
 type DomainService struct {
+	db         *sqlx.DB
 	domainRepo DomainRepositoryInterface
-	appSvc     appLookupForDomain
+	appLookup  appLookupForDomain
 }
 
-// NewDomainService creates a new DomainService. The appSvc dependency is
-// required: AddDomain refuses to bind an FQDN to a (tenant, app) pair
-// that does not already exist (auto-creating an app on domain-add would
-// surprise tenants with stray `apps` rows).
-func NewDomainService(domainRepo *repository.DomainRepository, appSvc appLookupForDomain) *DomainService {
+// NewDomainService creates a new DomainService. The `db` is the
+// shared *sqlx.DB so AddDomain can wrap count+insert in a single
+// transaction (see AddDomain's doc comment). The `appLookup`
+// dependency is the (tenant, app) row-lock provider — production
+// passes `*repository.AppRepository`, which already exposes
+// WithTx + GetForUpdate. The `*AppService` wrapper is intentionally
+// NOT used here: AddDomain needs the FOR UPDATE to run on the same
+// tx as the count + insert, and a *AppService pass-through would
+// re-enter the shared *sqlx.DB (a different physical connection)
+// which would release the row lock immediately.
+func NewDomainService(db *sqlx.DB, domainRepo *repository.DomainRepository, appLookup *repository.AppRepository) *DomainService {
 	return &DomainService{
+		db:         db,
 		domainRepo: domainRepo,
-		appSvc:     appSvc,
+		appLookup:  appLookup,
 	}
 }
 
@@ -120,56 +155,62 @@ func NewDomainService(domainRepo *repository.DomainRepository, appSvc appLookupF
 // Returns ErrInvalidFQDN, ErrDomainQuotaExceeded, or an unwrapped DB
 // error. Callers (handlers, tests) match via errors.Is.
 //
-// The per-app quota (`MaxDomainsPerApp = 50`) is BEST-EFFORT — the
-// count and insert are not wrapped in a transaction, so two concurrent
-// calls can both observe `count == 49` and both insert, briefly
-// exceeding the cap. The 50-domain ceiling and low request rate make
-// the race window small; the v2 follow-up closes it with a
-// `SELECT … FOR UPDATE` on the parent `apps` row, mirroring
-// `service/deployment.go`. The follow-up must also add a sqlmock-based
-// integration test that pins the no-overshoot invariant.
+// Concurrency: the per-app quota (`MaxDomainsPerApp = 50`) is enforced
+// inside a transaction that takes `SELECT … FOR UPDATE` on the parent
+// `apps` row, mirroring the pattern in
+// `service/deployment.go::ActivateDeployment`. Two concurrent
+// `AddDomain` calls targeting the same (tenant, app) therefore
+// serialize on the parent row — the second one observes the first's
+// inserted count and (if it pushes the count to or past the cap)
+// returns ErrDomainQuotaExceeded. The lock is released on commit
+// or rollback.
+//
+// `GetForUpdate` returns (nil, nil) when no app exists; we map that
+// to ErrAppNotFound. The error mapping happens inside the tx so a
+// non-existent app doesn't leave the lock hanging (the rollback
+// releases it).
 func (s *DomainService) AddDomain(ctx context.Context, tenantID, appName, fqdn string) (*domain.Domain, error) {
 	if !IsValidFQDN(fqdn) {
 		return nil, fmt.Errorf("%w %q: must be RFC-1035 shape, lowercase, ≤253 chars, no wildcard, no .edgecloud.dev suffix", ErrInvalidFQDN, fqdn)
 	}
 
-	app, err := s.appSvc.Get(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("looking up app: %w", err)
-	}
-	if app == nil {
-		return nil, fmt.Errorf("%w: %s", ErrAppNotFound, appName)
-	}
+	var d *domain.Domain
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// Bind the appLookup to the surrounding tx so the
+		// FOR UPDATE on apps(tenant_id, name) runs on the
+		// same connection. The lock is held until commit/rollback.
+		txApp := s.appLookup.WithTx(tx)
+		app, err := txApp.GetForUpdate(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("locking app row: %w", err)
+		}
+		if app == nil {
+			return fmt.Errorf("%w: %s", ErrAppNotFound, appName)
+		}
 
-	// BEST-EFFORT quota check (see AddDomain's doc comment). The
-	// count + insert here are not wrapped in a transaction, so two
-	// concurrent `AddDomain` calls can both observe `count == cap-1`
-	// and both insert. The 50-domain cap is high enough and the
-	// request rate low enough that the race window is small, but
-	// this MUST be closed in v2 — the planned fix is a tx-wrapped
-	// `SELECT … FROM apps WHERE id = $1 FOR UPDATE` followed by
-	// `CountByApp` and `Create` on the same `*sqlx.Tx`, mirroring
-	// the pattern in `service/deployment.go`. The follow-up will
-	// also add an integration test that pins the no-overshoot
-	// invariant under concurrent inserts.
-	count, err := s.domainRepo.CountByApp(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("counting domains: %w", err)
-	}
-	if count >= MaxDomainsPerApp {
-		return nil, fmt.Errorf("%w: %d (max %d)", ErrDomainQuotaExceeded, count, MaxDomainsPerApp)
-	}
+		txRepo := s.domainRepo.WithTx(tx)
+		count, err := txRepo.CountByApp(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("counting domains: %w", err)
+		}
+		if count >= MaxDomainsPerApp {
+			return fmt.Errorf("%w: %d (max %d)", ErrDomainQuotaExceeded, count, MaxDomainsPerApp)
+		}
 
-	d := &domain.Domain{
-		ID:        "dom_" + uuid.New().String(),
-		TenantID:  tenantID,
-		AppName:   appName,
-		FQDN:      fqdn,
-		Status:    domain.DomainStatusPending,
-		CreatedAt: time.Now(),
-	}
-	if err := s.domainRepo.Create(ctx, d); err != nil {
-		return nil, fmt.Errorf("creating domain: %w", err)
+		d = &domain.Domain{
+			ID:        "dom_" + uuid.New().String(),
+			TenantID:  tenantID,
+			AppName:   appName,
+			FQDN:      fqdn,
+			Status:    domain.DomainStatusPending,
+			CreatedAt: time.Now(),
+		}
+		if err := txRepo.Create(ctx, d); err != nil {
+			return fmt.Errorf("creating domain: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return d, nil
 }
