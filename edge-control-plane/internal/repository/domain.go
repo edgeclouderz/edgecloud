@@ -22,6 +22,13 @@ func NewDomainRepository(db *sqlx.DB) *DomainRepository {
 	return &DomainRepository{db: db}
 }
 
+// NewDomainRepositoryFromDBTX constructs a repository bound to a DBTX
+// (either *sqlx.DB or *sqlx.Tx). Used by tests that need a tx-bound
+// repo without standing up a full database connection.
+func NewDomainRepositoryFromDBTX(dbtx DBTX) *DomainRepository {
+	return &DomainRepository{db: dbtx}
+}
+
 // WithTx returns a new DomainRepository using the provided transaction.
 func (r *DomainRepository) WithTx(tx *sqlx.Tx) *DomainRepository {
 	return &DomainRepository{db: tx}
