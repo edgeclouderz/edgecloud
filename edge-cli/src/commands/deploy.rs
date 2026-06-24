@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use super::state_io::load_state_optional;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
@@ -15,12 +16,24 @@ use crate::state::State;
 /// path (with `--id`) ignores `regions` because regions are baked
 /// into the deployment row at upload time; activation reads them from
 /// the row, not from the CLI flag.
+///
+/// `auto_rollback` is the tenant opt-in for the worker-driven auto-
+/// rollback + heartbeat-driven stability-window promotion (issue
+/// #74). It is forwarded to the upload path; the activate path
+/// ignores it because the flag was already set at upload time and
+/// is read from the deployment row by ActivateDeployment.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String]) -> Result<()> {
+pub fn run(
+    path: &Path,
+    app: &str,
+    id: Option<&str>,
+    regions: &[String],
+    auto_rollback: bool,
+) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions)
+    run_upload(path, app, regions, auto_rollback)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -28,8 +41,13 @@ pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String]) -> Resu
 /// `app`: positional app-name override. When empty, read from `edge.toml`.
 /// `regions`: list of regions to replicate to. Empty slice = server's
 /// default region.
+/// `auto_rollback`: tenant opt-in for issue #74 — when true, the
+/// deployment row and (at activate time) the active_deployments row
+/// get `auto_rollback_enabled = true`, which gates the
+/// worker-driven auto-rollback trigger and the heartbeat-driven
+/// stability-window promotion.
 #[cfg(feature = "network")]
-fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
+fn run_upload(path: &Path, app: &str, regions: &[String], auto_rollback: bool) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
         app.to_string()
@@ -48,7 +66,7 @@ fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes, regions)?;
+    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback)?;
 
     let live_url = resp.url.clone();
     // Persist the regions the server actually accepted (it may
@@ -77,6 +95,8 @@ fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
 ///
 /// App name is resolved with precedence: positional `app` > `.edge/state.json.app_name`.
 /// API base URL must come from `edge.toml` (matches `edge activate` semantics).
+/// On success, `.edge/state.json` is updated so subsequent commands
+/// (`status`, `open`, `rollback`) see the new active id.
 #[cfg(feature = "network")]
 fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let state = load_state_optional(path)?;
@@ -89,35 +109,39 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let client = ApiClient::new(base_url)?;
     client.activate(&app_name, deployment_id, None)?;
 
+    // Capture the URL we'll print BEFORE `state` is moved into the save
+    // block below. The save only mutates `deployment_id`, so the URL we
+    // capture here is byte-identical to what we'd re-read from disk
+    // afterwards — but we avoid one redundant state.json read on the
+    // success path. Empty URLs (or a state for a different app) suppress
+    // the URL line entirely instead of printing a misleading blank.
+    let url_to_print = url_to_print(state.as_ref(), &app_name);
+
+    // Update state.json if it exists for this app.
+    if let Some(mut s) = state {
+        if s.app_name == app_name {
+            s.deployment_id = deployment_id.to_string();
+            s.save(path)?;
+        }
+    }
+
     output::success("Activated successfully");
     println!("  ID: {deployment_id}");
-    // Only show the URL from state.json when it corresponds to the app we just
-    // activated. A stale state.json from a different app would be misleading.
-    match state {
-        Some(s) if s.app_name == app_name => println!("  URL: {}", s.live_url),
-        _ => println!("  (run `edge status` to view)"),
+    match url_to_print {
+        Some(url) => println!("  URL: {url}"),
+        None => println!("  (run `edge status` to view)"),
     }
     Ok(())
 }
 
-/// Load `.edge/state.json` if it exists. Suppress only `NotFound`; surface
-/// parse/IO errors so the user gets a real diagnostic instead of a generic
-/// "requires an app name" message.
-fn load_state_optional(path: &Path) -> Result<Option<State>> {
-    match State::load(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) => {
-            let is_not_found = e.chain().any(|c| {
-                c.downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-            });
-            if is_not_found {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-    }
+/// Decide whether to print `  URL: <live_url>` for the just-activated
+/// app. Returns Some(url) only when state.json exists, belongs to the
+/// same app we activated, and has a non-empty `live_url`; otherwise
+/// None (caller prints the "run `edge status` to view" hint).
+fn url_to_print(state: Option<&State>, app_name: &str) -> Option<String> {
+    state
+        .filter(|s| s.app_name == app_name && !s.live_url.is_empty())
+        .map(|s| s.live_url.clone())
 }
 
 /// Resolve the app name to use for the activate path.
@@ -138,7 +162,13 @@ fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _app: &str, _id: Option<&str>, _regions: &[String]) -> Result<()> {
+pub fn run(
+    _path: &Path,
+    _app: &str,
+    _id: Option<&str>,
+    _regions: &[String],
+    _auto_rollback: bool,
+) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
 
@@ -200,29 +230,42 @@ mod tests {
     }
 
     #[test]
-    fn load_state_optional_returns_none_when_missing() {
-        // A directory with no .edge/state.json at all.
-        let dir = tempfile::tempdir().unwrap();
-        let got = load_state_optional(dir.path()).unwrap();
-        assert!(got.is_none());
+    fn url_to_print_is_some_when_state_app_matches_with_url() {
+        // The just-activated app has a state.json with a populated
+        // live_url — we should print it.
+        let s = state_with("myapp");
+        let got = url_to_print(Some(&s), "myapp");
+        assert_eq!(got, Some("https://example.test".to_string()));
     }
 
     #[test]
-    fn load_state_optional_surfaces_parse_error() {
-        // A .edge/state.json that exists but is not valid JSON — must surface
-        // the error rather than silently treating it as "no state".
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".edge")).unwrap();
-        std::fs::write(
-            dir.path().join(".edge").join("state.json"),
-            "{not valid json",
-        )
-        .unwrap();
-        let err = load_state_optional(dir.path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("failed to parse") || msg.contains("parse"),
-            "expected a parse error, got: {msg}"
-        );
+    fn url_to_print_is_none_when_state_app_differs() {
+        // state.json belongs to a different app — printing its URL
+        // would be misleading. Suppress the URL line.
+        let s = state_with("state-app");
+        let got = url_to_print(Some(&s), "different-app");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn url_to_print_is_none_when_state_live_url_is_empty() {
+        // state.json exists for the right app but live_url is empty
+        // (e.g. it was never set by an `edge deploy` upload). Printing
+        // "  URL: " with nothing after it is a UX bug — suppress.
+        let s = State {
+            deployment_id: "d_test".to_string(),
+            app_name: "myapp".to_string(),
+            live_url: String::new(),
+            regions: vec![],
+        };
+        let got = url_to_print(Some(&s), "myapp");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn url_to_print_is_none_when_state_is_missing() {
+        // No state.json at all — the caller has nothing to print.
+        let got = url_to_print(None, "myapp");
+        assert_eq!(got, None);
     }
 }

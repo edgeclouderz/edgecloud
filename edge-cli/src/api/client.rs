@@ -146,6 +146,14 @@ pub struct WhoamiResponse {
     pub created_at: String,
 }
 
+/// Response from POST `/api/apps/{appName}/rollback`. The
+/// `deployment_id` field is the deployment that is now active after
+/// the rollback — i.e., the prior `last_good_deployment_id`.
+#[derive(Debug, Deserialize)]
+pub struct RollbackResponse {
+    pub deployment_id: String,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -215,27 +223,47 @@ impl ApiClient {
     /// region" (the control plane applies the same default). The values
     /// are passed through the `?regions=` query parameter as a
     /// comma-separated string; the server splits, validates, and dedupes.
+    ///
+    /// `auto_rollback` is the tenant opt-in for issue #74 — when
+    /// true, the server stores `auto_rollback_enabled = true` on both
+    /// the deployment and active_deployments rows, which gates the
+    /// worker-driven auto-rollback trigger and the heartbeat-driven
+    /// stability-window promotion. Defaults to false on the wire (the
+    /// server rejects unknown query values with 400 rather than
+    /// silently coercing typos to false).
     pub fn deploy(
         &self,
         app_name: &str,
         wasm_bytes: &[u8],
         regions: &[String],
+        auto_rollback: bool,
     ) -> Result<DeployResponse> {
         use reqwest::blocking::multipart;
 
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
+        // Always parse the URL so we can append optional query params
+        // (regions, auto-rollback) uniformly. Even when both are
+        // absent, this is a cheap operation and avoids branching.
+        let mut parsed =
+            reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
         if !regions.is_empty() {
             // Use reqwest::Url to percent-encode the comma list so a
             // region with a stray `+` or non-ASCII char doesn't break
             // the URL. The server splits on `,` so the encoding is
             // applied per the CSV string as a whole.
-            let mut parsed =
-                reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
             parsed
                 .query_pairs_mut()
                 .append_pair("regions", &regions.join(","));
-            url = parsed.to_string();
         }
+        if auto_rollback {
+            // Only emit the param when true. `?auto-rollback=false` is
+            // redundant (the server defaults to false) and would
+            // clutter the URL in logs.
+            parsed
+                .query_pairs_mut()
+                .append_pair("auto-rollback", "true");
+        }
+        url = parsed.to_string();
         let part = multipart::Part::bytes(wasm_bytes.to_vec()).file_name("payload");
         let form = multipart::Form::new().part("payload", part);
 
@@ -416,6 +444,29 @@ impl ApiClient {
             .into_iter()
             .map(|s| (s.deployment_id, s.weight))
             .collect())
+    }
+
+    /// Rollback the active deployment of `app_name` to the stored
+    /// `last_good_deployment_id`. Returns the deployment id that is now
+    /// active. If the server returns 409 ("no previous deployment to
+    /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
+    /// caller can detect that via `body.contains("no previous")`.
+    pub fn rollback(&self, app_name: &str) -> Result<RollbackResponse> {
+        let url = format!("{}/api/v1/apps/{}/rollback", self.base_url, app_name);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("rollback failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
 
     /// List all deployments for an app.
