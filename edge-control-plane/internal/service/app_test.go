@@ -76,6 +76,10 @@ func (m *mockQuotaRepoForApps) GetByTenantID(ctx context.Context, tenantID strin
 	return &domain.Quota{MaxApps: 5, MaxMemoryMB: 256}, nil
 }
 
+func (m *mockQuotaRepoForApps) AddOutboundBytes(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+	return &domain.Quota{}, nil
+}
+
 // appSvcForTest builds an AppService with mock dependencies.
 // Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
 // Delete is not testable without a real DB connection for repository.Transaction.
