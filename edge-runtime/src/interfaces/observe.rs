@@ -1,6 +1,5 @@
 //! `edge:observe` — metrics and structured logging.
 
-use metrics::NoopRecorder;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -20,8 +19,97 @@ pub const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
 /// Label pairs for metric metadata.
 type MetricLabels = Vec<(String, String)>;
 
-/// Guard that ensures the global metrics recorder is set exactly once.
-static RECORDER_GUARD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+// ---------------------------------------------------------------------------
+// MetricsAccumulator — shared per-app metric store
+// ---------------------------------------------------------------------------
+
+/// Shared accumulator for per-app metrics emitted via `edge:observe`.
+///
+/// Designed after `RequestMeter`: the supervisor creates one per app before
+/// constructing `RuntimeState`, holds an `Arc` clone (cheap — just a refcount
+/// bump), and calls `snapshot()` at heartbeat time to produce the
+/// `Vec<MetricSample>` shipped to the control plane.
+///
+/// The `Observer` inside `RuntimeState` holds the same `Arc`; every
+/// `increment_counter` / `record_gauge` / `record_histogram` call writes to
+/// the shared backing maps so the supervisor sees live data without touching
+/// the Wasmtime `Store`.
+type HistogramMap = HashMap<String, Vec<(f64, MetricLabels)>>;
+
+pub struct MetricsAccumulator {
+    counters: Arc<RwLock<HashMap<String, (u64, MetricLabels)>>>,
+    gauges: Arc<RwLock<HashMap<String, (f64, MetricLabels)>>>,
+    histograms: Arc<RwLock<HistogramMap>>,
+}
+
+impl MetricsAccumulator {
+    pub fn new() -> Self {
+        Self {
+            counters: Arc::new(RwLock::new(HashMap::new())),
+            gauges: Arc::new(RwLock::new(HashMap::new())),
+            histograms: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Snapshot current metric state for heartbeat shipping.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            counters: self.counters.read().map(|c| c.clone()).unwrap_or_default(),
+            gauges: self.gauges.read().map(|g| g.clone()).unwrap_or_default(),
+            histograms: self
+                .histograms
+                .read()
+                .map(|h| h.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn increment(&self, name: &str, labels: &[(String, String)]) {
+        if let Ok(mut c) = self.counters.write() {
+            let entry = c.entry(name.to_string()).or_insert_with(|| (0, Vec::new()));
+            entry.0 += 1;
+            entry.1 = labels.to_vec();
+        }
+    }
+
+    pub(crate) fn set_gauge(&self, name: &str, value: f64, labels: &[(String, String)]) {
+        if let Ok(mut g) = self.gauges.write() {
+            g.insert(name.to_string(), (value, labels.to_vec()));
+        }
+    }
+
+    pub(crate) fn add_histogram(&self, name: &str, value: f64, labels: &[(String, String)]) {
+        if let Ok(mut h) = self.histograms.write() {
+            h.entry(name.to_string())
+                .or_default()
+                .push((value, labels.to_vec()));
+        }
+    }
+}
+
+impl Clone for MetricsAccumulator {
+    /// Cheap clone — just bumps the inner `Arc` refcounts.
+    fn clone(&self) -> Self {
+        Self {
+            counters: Arc::clone(&self.counters),
+            gauges: Arc::clone(&self.gauges),
+            histograms: Arc::clone(&self.histograms),
+        }
+    }
+}
+
+impl Default for MetricsAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of all metrics for one app instance.
+pub struct MetricsSnapshot {
+    pub counters: HashMap<String, (u64, MetricLabels)>,
+    pub gauges: HashMap<String, (f64, MetricLabels)>,
+    pub histograms: HashMap<String, Vec<(f64, MetricLabels)>>,
+}
 
 // ---------------------------------------------------------------------------
 // Log level — mirrors the WIT `edge:observe::log-level` enum
@@ -156,6 +244,12 @@ pub struct ObserveConfig {
     pub log_sink: Arc<dyn LogSink>,
     /// Per-app identity stamped on every emitted record.
     pub app_ctx: AppLogContext,
+    /// Shared metrics accumulator. When `Some`, the Observer writes all
+    /// counter/gauge/histogram updates to the provided accumulator so the
+    /// supervisor can snapshot metrics at heartbeat time without accessing
+    /// the Wasmtime Store. When `None`, a private accumulator is created
+    /// (data is visible within the process but not exported).
+    pub metrics_acc: Option<Arc<MetricsAccumulator>>,
 }
 
 impl Default for ObserveConfig {
@@ -164,6 +258,7 @@ impl Default for ObserveConfig {
             min_log_level: LogLevel::Info,
             log_sink: Arc::new(NoopLogSink),
             app_ctx: AppLogContext::default(),
+            metrics_acc: None,
         }
     }
 }
@@ -187,24 +282,35 @@ impl ObserveConfig {
         self.min_log_level = level;
         self
     }
+
+    /// Attach a shared `MetricsAccumulator`. The Observer will write every
+    /// metric update to this accumulator so the supervisor can call
+    /// `accumulator.snapshot()` at heartbeat time. The supervisor holds the
+    /// `Arc` clone; the Observer holds another — cheap, no data is copied.
+    pub fn with_metrics_accumulator(mut self, acc: Arc<MetricsAccumulator>) -> Self {
+        self.metrics_acc = Some(acc);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Observer
 // ---------------------------------------------------------------------------
 
-/// Metrics exporter backed by a no-op recorder.
+/// Per-app metrics and log emitter.
 ///
-/// This is **intentional for now**: metrics are accumulated in local storage
-/// (visible to tests and logging) but not exported to a real backend (Prometheus,
-/// DataDog, etc.). Production deployments must replace the global recorder by
-/// calling `metrics::set_global_recorder` with a real exporter before instantiating
-/// this type.
+/// Metrics (counters, gauges, histograms) are stored in a `MetricsAccumulator`
+/// that is either injected by the supervisor (for export via heartbeat) or
+/// created internally (for test / ephemeral use). Either way the guest-facing
+/// WIT calls succeed — the difference is whether the data reaches the control
+/// plane.
+///
+/// Log emission is handled by the configured `LogSink` (worker → HTTP; tests →
+/// in-memory capture; default → no-op discard).
 pub struct Observer {
-    /// Local counters for observability.
-    counters: RwLock<HashMap<String, (u64, MetricLabels)>>,
-    gauges: RwLock<HashMap<String, (f64, MetricLabels)>>,
-    histograms: RwLock<HashMap<String, Vec<(f64, MetricLabels)>>>,
+    /// Shared metrics store. Written on every counter/gauge/histogram call;
+    /// read by the supervisor's heartbeat snapshot.
+    acc: Arc<MetricsAccumulator>,
     /// Destination for emitted log records.
     log_sink: Arc<dyn LogSink>,
     /// Per-app identity stamped on every emitted record.
@@ -226,32 +332,36 @@ impl Default for Observer {
 }
 
 impl Observer {
-    /// Creates a new `Observer` and (once per process) installs a no-op global
-    /// metrics recorder.
-    ///
-    /// Uses `NoopLogSink` so emitted log records are dropped. Production code
-    /// (the worker) constructs an `Observer` via `ObserveConfig::with_log_sink`
-    /// so logs reach the control plane.
+    /// Creates a new `Observer` with an internal (non-shared) metrics
+    /// accumulator and a `NoopLogSink`. Production code (the worker)
+    /// constructs an `Observer` via `ObserveConfig` so metrics reach
+    /// the heartbeat pipeline and logs reach the control plane.
     pub fn new() -> Self {
         Self::from_config(ObserveConfig::new())
     }
 
     /// Create a new Observer from an ObserveConfig.
     pub fn from_config(config: ObserveConfig) -> Self {
-        // Set a no-op global recorder on first construction.
-        let _ = RECORDER_GUARD.get_or_init(|| {
-            metrics::set_global_recorder(&NoopRecorder)
-                .expect("failed to set global metrics recorder");
-        });
+        let acc = config
+            .metrics_acc
+            .unwrap_or_else(|| Arc::new(MetricsAccumulator::new()));
         Self {
-            counters: RwLock::new(HashMap::new()),
-            gauges: RwLock::new(HashMap::new()),
-            histograms: RwLock::new(HashMap::new()),
+            acc,
             log_sink: config.log_sink,
             app_ctx: config.app_ctx,
             min_log_level: config.min_log_level,
             dropped_size_cap_count: AtomicU64::new(0),
         }
+    }
+
+    /// Return a clone of the underlying metrics accumulator.
+    ///
+    /// Callers that need to snapshot metrics outside the Wasmtime Store (e.g.
+    /// the supervisor at heartbeat time) should hold their own `Arc` clone
+    /// created before constructing `RuntimeState`, not call this method.
+    /// This accessor is provided for test introspection.
+    pub fn accumulator(&self) -> Arc<MetricsAccumulator> {
+        Arc::clone(&self.acc)
     }
 
     /// Increment a counter by 1.
@@ -261,13 +371,7 @@ impl Observer {
         } else {
             labels
         };
-        if let Ok(mut counters) = self.counters.write() {
-            let entry = counters
-                .entry(name.to_string())
-                .or_insert_with(|| (0, Vec::new()));
-            entry.0 += 1;
-            entry.1 = effective_labels.to_vec();
-        }
+        self.acc.increment(name, effective_labels);
         tracing::debug!(counter = name, labels = ?effective_labels, "counter incremented");
     }
 
@@ -278,9 +382,7 @@ impl Observer {
         } else {
             labels
         };
-        if let Ok(mut gauges) = self.gauges.write() {
-            gauges.insert(name.to_string(), (value, effective_labels.to_vec()));
-        }
+        self.acc.set_gauge(name, value, effective_labels);
         tracing::debug!(gauge = name, value = value, labels = ?effective_labels, "gauge recorded");
     }
 
@@ -291,12 +393,7 @@ impl Observer {
         } else {
             labels
         };
-        if let Ok(mut histograms) = self.histograms.write() {
-            histograms
-                .entry(name.to_string())
-                .or_insert_with(Vec::new)
-                .push((value, effective_labels.to_vec()));
-        }
+        self.acc.add_histogram(name, value, effective_labels);
         tracing::debug!(histogram = name, value = value, labels = ?effective_labels, "histogram recorded");
     }
 
@@ -380,7 +477,8 @@ impl Observer {
     /// Returns the current value of a counter for testing.
     #[cfg(test)]
     pub fn get_counter(&self, name: &str) -> Option<u64> {
-        self.counters
+        self.acc
+            .counters
             .read()
             .ok()
             .and_then(|c| c.get(name).map(|(v, _)| *v))
@@ -402,7 +500,8 @@ impl Observer {
     /// Returns the current value of a gauge for testing.
     #[cfg(test)]
     pub fn get_gauge(&self, name: &str) -> Option<f64> {
-        self.gauges
+        self.acc
+            .gauges
             .read()
             .ok()
             .and_then(|g| g.get(name).map(|(v, _)| *v))
@@ -411,7 +510,8 @@ impl Observer {
     /// Returns all recorded values for a histogram for testing.
     #[cfg(test)]
     pub fn get_histogram(&self, name: &str) -> Option<Vec<f64>> {
-        self.histograms
+        self.acc
+            .histograms
             .read()
             .ok()
             .and_then(|h| h.get(name).map(|v| v.iter().map(|(val, _)| *val).collect()))
@@ -693,6 +793,31 @@ mod tests {
             observer.dropped_record_count(),
             1,
             "drop counter should reflect only the 1 oversized record"
+        );
+    }
+
+    /// When an external `MetricsAccumulator` is injected, the Observer writes
+    /// metric updates to the shared accumulator so the supervisor can snapshot
+    /// them at heartbeat time without accessing the Wasmtime Store.
+    #[test]
+    fn test_shared_metrics_accumulator() {
+        let acc = Arc::new(MetricsAccumulator::new());
+        let observer =
+            Observer::from_config(ObserveConfig::new().with_metrics_accumulator(Arc::clone(&acc)));
+
+        observer.increment_counter("hits", &[("route".into(), "/api".into())]);
+        observer.increment_counter("hits", &[]);
+        observer.record_gauge("active_conns", 7.0, &[]);
+        observer.record_histogram("latency_ms", 12.5, &[]);
+
+        let snap = acc.snapshot();
+        assert_eq!(snap.counters.get("hits").map(|(v, _)| *v), Some(2));
+        assert_eq!(snap.gauges.get("active_conns").map(|(v, _)| *v), Some(7.0));
+        assert_eq!(
+            snap.histograms
+                .get("latency_ms")
+                .map(|v| v.iter().map(|(x, _)| *x).collect::<Vec<_>>()),
+            Some(vec![12.5])
         );
     }
 }
