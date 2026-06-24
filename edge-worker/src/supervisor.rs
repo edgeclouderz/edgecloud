@@ -135,10 +135,20 @@ impl Supervisor {
             self.stop_app(key).await?;
         }
 
-        // Acquire a port.
+        // Acquire a port. Under concurrent canary startup multiple instances of the
+        // same app may briefly compete for ports; propagate the error gracefully
+        // instead of panicking.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
-            pool.acquire().expect("port pool exhausted")
+            match pool.acquire() {
+                Some(p) => p,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "port pool exhausted — no free ports available for {}",
+                        app_name
+                    ));
+                }
+            }
         };
 
         // Download artifact (blocking on first request).

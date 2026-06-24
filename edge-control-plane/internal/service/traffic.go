@@ -146,9 +146,12 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	var primaryHash string
 	routes := make([]nats.DeploymentRoute, len(splits))
 	for i, sp := range splits {
-		d, _ := s.deploymentRepo.GetByID(ctx, sp.DeploymentID)
+		d, err := s.deploymentRepo.GetByID(ctx, sp.DeploymentID)
+		if err != nil || d == nil {
+			return fmt.Errorf("deployment %q not found", sp.DeploymentID)
+		}
 		routes[i] = nats.DeploymentRoute{DeploymentID: sp.DeploymentID, Weight: sp.Weight}
-		if i == 0 || primaryHash == "" {
+		if i == 0 {
 			primaryHash = d.Hash
 		}
 	}
