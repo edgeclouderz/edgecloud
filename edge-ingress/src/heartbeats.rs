@@ -185,6 +185,7 @@ mod tests {
                 outbound_bytes: 0,
                 tenant_id: "t_a".to_string(),
                 port: 8081,
+                observer_metrics: vec![],
             },
         );
         let hb = HeartbeatMessage {
@@ -228,6 +229,7 @@ mod tests {
                 outbound_bytes: 0,
                 tenant_id: "t_a".to_string(),
                 port: 8081,
+                observer_metrics: vec![],
             },
         );
         let hb = HeartbeatMessage {
@@ -270,6 +272,7 @@ mod tests {
                 outbound_bytes: 0,
                 tenant_id: "t_a".to_string(),
                 port: 8081,
+                observer_metrics: vec![],
             },
         );
         let hb = HeartbeatMessage {
