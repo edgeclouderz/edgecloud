@@ -1,13 +1,37 @@
-//! In-memory routing table: `(tenant_id, app_name, deployment_id)` → RouteEntry.
+//! In-memory routing table: `(tenant_id, app_name)` → RouteEntry
+//! + `fqdn` → (tenant_id, app_name).
 //!
-//! The table is updated on every heartbeat and pruned periodically to drop
-//! entries that haven't been refreshed within `stale_after`. The composite key
-//! allows multiple deployment IDs for the same `(tenant, app)` to coexist,
-//! enabling canary/blue-green deployments where v1 and v2 run concurrently.
+//! The composite key `(tenant_id, app_name)` lets multiple deployment IDs
+//! for the same `(tenant, app)` coexist, enabling canary/blue-green
+//! deployments where v1 and v2 run concurrently. v1 keeps a single entry
+//! per `(tenant, app, deployment_id)` key (the freshest one seen), so two
+//! tenants deploying the same app name never collide on the routing
+//! table — their routes are kept under separate keys even though they
+//! share the same `app_name`.
+//!
+//! The FQDN map (`by_fqdn`) is an INTERNAL detail of the routing table
+//! (issue #83). External callers never see it — they call
+//! `register_fqdn` / `deregister_fqdn` / `apply_poll_snapshot` to keep it
+//! in sync with the control plane's DB, and the renderer reads
+//! `fqdn_snapshot()` to know which FQDNs to render. The `RouteEntry`
+//! struct does NOT carry upstream info on the FQDN side — at render time
+//! the renderer looks up the upstream via the (tenant, app) key in
+//! `by_app`. A FQDN whose app has no upstream is silently skipped.
+//!
+//! Why two maps instead of one? Because the renderer needs to answer
+//! "what upstream should I use for this FQDN?" at every render. If the
+//! FQDN map stored upstreams itself, we'd have to walk the FQDN map and
+//! update upstream info on every heartbeat — but the heartbeat path
+//! doesn't know which FQDNs exist for a given (tenant, app). Composing
+//! at render time keeps the heartbeat pipeline simple: upsert the
+//! upstream; that's it. The 30s poller handles FQDN membership; the
+//! heartbeat handles upstream freshness.
+
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +49,32 @@ pub struct RouteEntry {
     pub worker_addr: String,
     pub port: u16,
     pub last_seen: Instant,
+}
+
+/// Binding from a custom FQDN to a (tenant, app) tuple. Carries NO
+/// upstream info — the renderer looks that up from `by_app` at render
+/// time. This decouples heartbeat-driven upstream churn from the slower
+/// FQDN membership changes driven by the 30s control-plane poll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FqdnBinding {
+    pub tenant_id: String,
+    pub app_name: String,
+    pub fqdn: String,
+}
+
+/// Domain row shape matching the Go control plane's `domain.Domain`.
+/// Wire-compatible with the JSON emitted by `GET /api/internal/domains`.
+/// `status` and `last_error` / `verified_at` are intentionally NOT in
+/// this struct: the ingress only cares about FQDN membership, not
+/// per-domain state. The control plane's status transitions are
+/// reflected in Caddy's view via the `tls-allowed` endpoint, not via
+/// this snapshot.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Domain {
+    pub id: String,
+    pub tenant_id: String,
+    pub app_name: String,
+    pub fqdn: String,
 }
 
 /// Composite key. Two tenants may share an `app_name`; their routes must
@@ -60,13 +110,15 @@ impl AppKey {
 }
 
 pub struct RoutingTable {
-    inner: RwLock<HashMap<AppKey, RouteEntry>>,
+    by_app: RwLock<HashMap<AppKey, RouteEntry>>,
+    by_fqdn: RwLock<HashMap<String, FqdnBinding>>,
 }
 
 impl RoutingTable {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            by_app: RwLock::new(HashMap::new()),
+            by_fqdn: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -100,7 +152,7 @@ impl RoutingTable {
             self.remove(&key).await;
             return;
         }
-        let mut inner = self.inner.write().await;
+        let mut inner = self.by_app.write().await;
         inner.insert(
             key.clone(),
             RouteEntry {
@@ -117,14 +169,14 @@ impl RoutingTable {
 
     /// Remove the entry under a single `(tenant_id, app_name, deployment_id)` key.
     pub async fn remove(&self, key: &AppKey) {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.by_app.write().await;
         inner.remove(key);
     }
 
     /// Drop entries whose `last_seen` is older than `older_than`. Returns
     /// the list of removed keys so the caller can log them.
     pub async fn remove_stale(&self, older_than: Duration) -> Vec<AppKey> {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.by_app.write().await;
         let cutoff = Instant::now() - older_than;
         let stale: Vec<AppKey> = inner
             .iter()
@@ -139,14 +191,105 @@ impl RoutingTable {
 
     /// Snapshot of all current routes. Order is unspecified.
     pub async fn snapshot(&self) -> Vec<RouteEntry> {
-        let inner = self.inner.read().await;
+        let inner = self.by_app.read().await;
+        inner.values().cloned().collect()
+    }
+
+    /// Snapshot of all current FQDN bindings. Used by the Caddy renderer
+    /// to emit per-FQDN routes (with per-route `tls.on_demand`).
+    pub async fn fqdn_snapshot(&self) -> Vec<FqdnBinding> {
+        let inner = self.by_fqdn.read().await;
         inner.values().cloned().collect()
     }
 
     /// Number of currently routable app instances.
     #[allow(dead_code, clippy::len_without_is_empty)]
     pub async fn len(&self) -> usize {
-        self.inner.read().await.len()
+        self.by_app.read().await.len()
+    }
+
+    /// Register or overwrite a single FQDN → (tenant, app) binding.
+    /// Called by the 30s poller as part of `apply_poll_snapshot` (or
+    /// exercised directly by unit tests in this module). No upstream
+    /// info stored — see the module-level doc comment for why.
+    ///
+    /// Visibility is `pub(crate)` rather than `pub` so the production
+    /// poller path (`apply_poll_snapshot`) is the only way external
+    /// code mutates the FQDN table. A future contributor who calls
+    /// `register_fqdn` from outside the poller would break the
+    /// diff-based `apply_poll_snapshot` invariant (the next 30s poll
+    /// would mark the manually-inserted FQDN as `removed`).
+    #[allow(dead_code)] // exercised by unit tests in this module; production goes through apply_poll_snapshot
+    pub(crate) async fn register_fqdn(&self, fqdn: &str, tenant_id: &str, app_name: &str) {
+        let mut inner = self.by_fqdn.write().await;
+        inner.insert(
+            fqdn.to_string(),
+            FqdnBinding {
+                tenant_id: tenant_id.to_string(),
+                app_name: app_name.to_string(),
+                fqdn: fqdn.to_string(),
+            },
+        );
+    }
+
+    /// Remove a single FQDN binding. Used by `apply_poll_snapshot` when
+    /// a previously-seen FQDN is absent from the new poll response.
+    #[allow(dead_code)]
+    pub(crate) async fn deregister_fqdn(&self, fqdn: &str) {
+        let mut inner = self.by_fqdn.write().await;
+        inner.remove(fqdn);
+    }
+
+    /// Apply a fresh poll snapshot atomically: union of (old, new) minus
+    /// (old minus new). Returns `(added, removed)` so the caller can
+    /// log the churn without re-snapshotting. Two-phase: compute diff
+    /// while holding the read lock, then apply under the write lock —
+    /// the read lock is dropped before the write lock is acquired, so
+    /// other readers aren't blocked on the I/O.
+    pub async fn apply_poll_snapshot(
+        &self,
+        domains: Vec<Domain>,
+    ) -> (Vec<String>, Vec<String>) {
+        let new_fqdns: HashMap<String, Domain> = domains
+            .into_iter()
+            .map(|d| (d.fqdn.clone(), d))
+            .collect();
+
+        // Compute added + removed under the read lock.
+        let (added, removed) = {
+            let current = self.by_fqdn.read().await;
+            let added: Vec<String> = new_fqdns
+                .keys()
+                .filter(|fqdn| !current.contains_key(*fqdn))
+                .cloned()
+                .collect();
+            let removed: Vec<String> = current
+                .keys()
+                .filter(|fqdn| !new_fqdns.contains_key(*fqdn))
+                .cloned()
+                .collect();
+            (added, removed)
+        };
+
+        // Apply under the write lock.
+        let mut current = self.by_fqdn.write().await;
+        for fqdn in &removed {
+            current.remove(fqdn);
+        }
+        for fqdn in &added {
+            if let Some(d) = new_fqdns.get(fqdn) {
+                current.insert(
+                    fqdn.clone(),
+                    FqdnBinding {
+                        tenant_id: d.tenant_id.clone(),
+                        app_name: d.app_name.clone(),
+                        fqdn: fqdn.clone(),
+                    },
+                );
+            }
+        }
+
+        (added, removed)
     }
 }
 
@@ -289,5 +432,87 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].deployment_id, None);
         assert_eq!(snap[0].weight, 100);
+    }
+
+    /// FQDN bindings live in their own map (`by_fqdn`) and do NOT
+    /// share keys with `by_app`. Two tenants can have the same FQDN
+    /// only in pathological cases (the control plane should reject
+    /// duplicates before they reach us), but the table itself is
+    /// keyed by FQDN string.
+    #[tokio::test]
+    async fn fqdn_snapshot_returns_registered_bindings() {
+        let t = RoutingTable::new();
+        t.register_fqdn("api.acme.com", "t_a", "api").await;
+        t.register_fqdn("blog.acme.com", "t_b", "blog").await;
+        let snap = t.fqdn_snapshot().await;
+        assert_eq!(snap.len(), 2);
+        let fqdns: std::collections::HashSet<String> =
+            snap.iter().map(|b| b.fqdn.clone()).collect();
+        assert!(fqdns.contains("api.acme.com"));
+        assert!(fqdns.contains("blog.acme.com"));
+    }
+
+    /// `deregister_fqdn` removes a single binding; others are kept.
+    #[tokio::test]
+    async fn deregister_fqdn_removes_only_target() {
+        let t = RoutingTable::new();
+        t.register_fqdn("a.example.com", "t_a", "api").await;
+        t.register_fqdn("b.example.com", "t_a", "api").await;
+        t.deregister_fqdn("a.example.com").await;
+        let snap = t.fqdn_snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].fqdn, "b.example.com");
+    }
+
+    /// `apply_poll_snapshot` is the production diff path. First
+    /// poll seeds two FQDNs; second poll removes one and adds a new
+    /// one; the diff returned is exactly `{added: [new], removed: [gone]}`.
+    #[tokio::test]
+    async fn apply_poll_snapshot_diff() {
+        let t = RoutingTable::new();
+        // First poll: two bindings.
+        let (added, removed) = t
+            .apply_poll_snapshot(vec![
+                Domain {
+                    id: "d_1".into(),
+                    tenant_id: "t_a".into(),
+                    app_name: "api".into(),
+                    fqdn: "api.acme.com".into(),
+                },
+                Domain {
+                    id: "d_2".into(),
+                    tenant_id: "t_b".into(),
+                    app_name: "web".into(),
+                    fqdn: "web.acme.com".into(),
+                },
+            ])
+            .await;
+        assert_eq!(added.len(), 2);
+        assert!(removed.is_empty());
+
+        // Second poll: drop d_1, add d_3.
+        let (added, removed) = t
+            .apply_poll_snapshot(vec![
+                Domain {
+                    id: "d_2".into(),
+                    tenant_id: "t_b".into(),
+                    app_name: "web".into(),
+                    fqdn: "web.acme.com".into(),
+                },
+                Domain {
+                    id: "d_3".into(),
+                    tenant_id: "t_c".into(),
+                    app_name: "blog".into(),
+                    fqdn: "blog.acme.com".into(),
+                },
+            ])
+            .await;
+        assert_eq!(added, vec!["blog.acme.com".to_string()]);
+        assert_eq!(removed, vec!["api.acme.com".to_string()]);
+
+        // Final state: 2 bindings, the survivors.
+        let snap = t.fqdn_snapshot().await;
+        assert_eq!(snap.len(), 2);
+
     }
 }
