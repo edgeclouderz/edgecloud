@@ -42,8 +42,9 @@ type AppConfig struct {
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
 // Workers use this to run multiple deployments of the same app concurrently.
 type DeploymentRoute struct {
-	DeploymentID string `json:"deployment_id"`
-	Weight       int    `json:"weight"`
+	DeploymentID   string `json:"deployment_id"`
+	DeploymentHash string `json:"deployment_hash"`
+	Weight         int    `json:"weight"`
 }
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.

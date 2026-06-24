@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -19,6 +21,11 @@ type TrafficService struct {
 	tenantRepo     *repository.TenantRepository
 	quotaRepo      *repository.QuotaRepository
 	publisher      nats.Publisher
+	// defaultRegion is the fallback when none of the splits' deployments
+	// declare any regions of their own. Mirrors DeploymentService.defaultRegion
+	// (which gets it from config) so a control plane that runs without an
+	// explicit region still publishes to a subject every worker subscribes to.
+	defaultRegion string
 }
 
 // NewTrafficService creates a TrafficService.
@@ -30,6 +37,7 @@ func NewTrafficService(
 	tenantRepo *repository.TenantRepository,
 	quotaRepo *repository.QuotaRepository,
 	publisher nats.Publisher,
+	defaultRegion string,
 ) *TrafficService {
 	return &TrafficService{
 		splitRepo:      splitRepo,
@@ -39,6 +47,7 @@ func NewTrafficService(
 		tenantRepo:     tenantRepo,
 		quotaRepo:      quotaRepo,
 		publisher:      publisher,
+		defaultRegion:  defaultRegion,
 	}
 }
 
@@ -141,8 +150,10 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	}
 
 	// Build the routes list for the nats.AppConfig.
-	// The primary deployment's hash is used as DeploymentHash; all instances
-	// share the same env/allowlist/max_memory.
+	// Each route carries its OWN deployment_hash — the worker needs the
+	// per-route hash to download and verify the right artifact (the
+	// top-level AppConfig.DeploymentHash only covers the primary). All
+	// routes share the same env/allowlist/max_memory from the app config.
 	var primaryHash string
 	routes := make([]nats.DeploymentRoute, len(splits))
 	for i, sp := range splits {
@@ -150,14 +161,41 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 		if err != nil || d == nil {
 			return fmt.Errorf("deployment %q not found", sp.DeploymentID)
 		}
-		routes[i] = nats.DeploymentRoute{DeploymentID: sp.DeploymentID, Weight: sp.Weight}
+		routes[i] = nats.DeploymentRoute{
+			DeploymentID:   sp.DeploymentID,
+			DeploymentHash: d.Hash,
+			Weight:         sp.Weight,
+		}
 		if i == 0 {
 			primaryHash = d.Hash
 		}
 	}
 
-	// Publish to default region "global". A future phase will fan out per
-	// deployment's region list (matching the ActivateDeployment pattern).
+	// Fan out the TaskMessage to the union of regions declared by every
+	// split's deployment. A worker subscribed to one of those regions will
+	// pick up the message via its `filter_subject` and reconcile.
+	// Previously this hardcoded `"global"`, which works for the wildcard
+	// `edgecloud.tasks.>` subject but means no worker actually consumes
+	// the message in a multi-region setup (their consumers are filtered
+	// to their own region subject).
+	regionSet := make(map[string]struct{}, len(splits))
+	for _, sp := range splits {
+		d, err := s.deploymentRepo.GetByID(ctx, sp.DeploymentID)
+		if err != nil || d == nil {
+			continue
+		}
+		for _, r := range domain.StringArrayTo(d.Regions) {
+			regionSet[r] = struct{}{}
+		}
+	}
+	regions := make([]string, 0, len(regionSet))
+	for r := range regionSet {
+		regions = append(regions, r)
+	}
+	if len(regions) == 0 {
+		regions = []string{s.defaultRegion}
+	}
+
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
 		Timestamp: time.Now(),
@@ -174,5 +212,15 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 		},
 	}
 
-	return s.publisher.PublishTaskUpdate("global", msg)
+	var failedRegions []string
+	for _, region := range regions {
+		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
+			log.Printf("publishing task update for traffic split failed for region %q (tenant %s, app %s): %v", region, tenantID, appName, err)
+			failedRegions = append(failedRegions, region)
+		}
+	}
+	if len(failedRegions) > 0 {
+		return fmt.Errorf("publishing traffic split failed for region(s): %s", strings.Join(failedRegions, ","))
+	}
+	return nil
 }

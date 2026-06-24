@@ -250,6 +250,7 @@ mod tests {
             http_to_https: true,
             admin_token: None,
             control_plane_api_url: "http://localhost:8080".into(),
+            internal_token: None,
         }
     }
 

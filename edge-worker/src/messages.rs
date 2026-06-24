@@ -36,6 +36,13 @@ pub enum TaskMessage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeploymentRoute {
     pub deployment_id: String,
+    /// SHA-256 of this deployment's wasm artifact. Each route carries its
+    /// own hash — the top-level `AppSpec::deployment_hash` only describes
+    /// the primary deployment, so without this field the worker would
+    /// download the primary's binary for every canary route (and verify it
+    /// against the wrong hash, failing for any deployment whose artifact
+    /// differs from the primary's).
+    pub deployment_hash: String,
     /// Reserved for canary weight propagation; the worker currently uses 100%
     /// for every route and applies the weight at the ingress layer. Held on the
     /// struct so the wire format stays in sync with `edge-ingress` and the

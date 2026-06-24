@@ -119,7 +119,7 @@ func main() {
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
-	trafficSvc := service.NewTrafficService(trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher)
+	trafficSvc := service.NewTrafficService(trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
@@ -286,6 +286,17 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 
 	mux.Handle("/api/v1/", apiWithAuth)
 	mux.Handle("/api/v1/admin/", apiWithOwner)
+
+	// Service-to-service read endpoint that the edge-ingress polls to
+	// apply Caddy weights for canary/blue-green traffic splits. Registered
+	// on the parent mux with a more specific pattern than the /api/v1/
+	// catch-all so Go 1.22's longest-match rule routes the request here
+	// rather than into apiWithAuth (where an unauthenticated ingress
+	// would 401 and the canary split would never reach Caddy).
+	mux.Handle(
+		"GET /api/v1/internal/traffic/{tenantID}/{appName}",
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)),
+	)
 
 	// Internal endpoints (worker-facing, JWT auth)
 	// Workers consume the latest contract; these paths are intentionally unversioned.

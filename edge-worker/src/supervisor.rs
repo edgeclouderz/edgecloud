@@ -64,21 +64,45 @@ impl Supervisor {
         };
 
         // Build the desired set from the task message.
-        // When spec.routes is Some, run all listed deployments concurrently.
-        // When None, run the primary deployment_id (legacy behaviour).
-        let mut desired_keys: HashMap<(String, String), (&str, &AppSpec)> = HashMap::new();
+        // When spec.routes is Some, run all listed deployments concurrently —
+        // each route carries its OWN deployment_id and deployment_hash, so
+        // the worker downloads and runs the right binary for every entry.
+        // When None, run the primary deployment_id with the spec-level hash
+        // (legacy behaviour).
+        //
+        // The value carries the per-route hash alongside the spec so the
+        // restart-decision and download paths can use route-scoped data
+        // instead of always falling back to spec.deployment_id /
+        // spec.deployment_hash (which described only the primary).
+        struct DesiredEntry<'a> {
+            app_name: &'a str,
+            spec: &'a AppSpec,
+            deployment_id: &'a str,
+            deployment_hash: &'a str,
+        }
+        let mut desired_keys: HashMap<(String, String), DesiredEntry> = HashMap::new();
         for (app_name, spec) in &desired_apps {
             if let Some(ref routes) = spec.routes {
                 for route in routes {
                     desired_keys.insert(
                         (app_name.clone(), route.deployment_id.clone()),
-                        (app_name.as_str(), spec),
+                        DesiredEntry {
+                            app_name: app_name.as_str(),
+                            spec,
+                            deployment_id: route.deployment_id.as_str(),
+                            deployment_hash: route.deployment_hash.as_str(),
+                        },
                     );
                 }
             } else {
                 desired_keys.insert(
                     (app_name.clone(), spec.deployment_id.clone()),
-                    (app_name.as_str(), spec),
+                    DesiredEntry {
+                        app_name: app_name.as_str(),
+                        spec,
+                        deployment_id: spec.deployment_id.as_str(),
+                        deployment_hash: spec.deployment_hash.as_str(),
+                    },
                 );
             }
         }
@@ -93,14 +117,18 @@ impl Supervisor {
         }
 
         // Start or restart instances that are missing or changed.
-        for (key, (app_name, spec)) in &desired_keys {
+        for (key, entry) in &desired_keys {
             let is_new = !current_keys.contains_key(key);
             // Restart if: no entry (new), bad status (crashed/hung), OR the
-            // deployment_id at this key differs from what we want.
+            // deployment_id at this key differs from what we want. Use the
+            // per-route deployment_id (entry.deployment_id), NOT
+            // spec.deployment_id — otherwise canary routes would always
+            // appear "changed" relative to the primary, causing every
+            // reconcile to tear down the canary.
             let current_dep_id = current_deployment_ids.get(key);
             let needs_restart = is_new
                 || current_dep_id
-                    .map(|id| id != &spec.deployment_id)
+                    .map(|id| id != entry.deployment_id)
                     .unwrap_or(false)
                 || current_keys
                     .get(key)
@@ -108,8 +136,17 @@ impl Supervisor {
                     .unwrap_or(false);
 
             if needs_restart {
-                if let Err(e) = self.start_app(key, spec, &tenant_id).await {
-                    tracing::error!(app_name, deployment_id = %key.1, err = %e, "failed to start app");
+                if let Err(e) = self
+                    .start_app(
+                        key,
+                        entry.deployment_id,
+                        entry.deployment_hash,
+                        entry.spec,
+                        &tenant_id,
+                    )
+                    .await
+                {
+                    tracing::error!(app_name = %entry.app_name, deployment_id = %key.1, err = %e, "failed to start app");
                 }
             }
         }
@@ -118,14 +155,22 @@ impl Supervisor {
     }
 
     /// Start a new app or restart a changed one.
+    ///
+    /// `deployment_id` and `deployment_hash` are the per-route values
+    /// (for canary routes) or the primary values (legacy single-deployment
+    /// mode). Both come from `DesiredEntry`; passing them in keeps the
+    /// caller — which knows whether this is a canary route or a primary —
+    /// in control, instead of having `start_app` reach back into the spec
+    /// and accidentally use the wrong id/hash for canaries.
     async fn start_app(
         &self,
         key: &(String, String),
+        deployment_id: &str,
+        deployment_hash: &str,
         spec: &AppSpec,
         tenant_id: &str,
     ) -> anyhow::Result<()> {
         let app_name = &key.0;
-        let deployment_id = &key.1;
 
         // Validate tenant_id before any filesystem or store operations.
         // Reject path-traversal characters that could escape the base persistence directory.
@@ -159,12 +204,17 @@ impl Supervisor {
         };
 
         // Download artifact (blocking on first request).
-        // Note: Downloader::get_artifact verifies SHA-256 against
-        // spec.deployment_hash before returning; on mismatch/empty/malformed it
+        // Note: Downloader::get_artifact verifies SHA-256 against the
+        // per-route hash before returning; on mismatch/empty/malformed it
         // returns Err, which this arm propagates and the port-release path handles.
+        // Passing spec.deployment_id / spec.deployment_hash here would always
+        // download the primary binary and verify it against the primary's
+        // hash — canary routes would serve the wrong code (and any
+        // deployment whose artifact differs from the primary would fail
+        // verification outright).
         let artifact = match self
             .downloader
-            .get_artifact(&spec.deployment_id, &spec.deployment_hash)
+            .get_artifact(deployment_id, deployment_hash)
             .await
         {
             Ok(a) => a,
@@ -219,7 +269,7 @@ impl Supervisor {
         // Create request meter
         let meter = Arc::new(RequestMeter::new(
             tenant_id.to_string(),
-            spec.deployment_id.clone(),
+            deployment_id.to_string(),
         ));
 
         let instance_pre_clone = instance_pre.clone();
@@ -257,7 +307,9 @@ impl Supervisor {
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
-        let dep_id_for_loop = deployment_id.clone();
+        // `deployment_id` is `&str` (function parameter), so we need
+        // to_string() to move an owned String into the 'static closure.
+        let dep_id_for_loop = deployment_id.to_string();
         let handle = tokio::spawn(async move {
             Self::run_app_loop(
                 instance_pre_clone,
@@ -281,7 +333,7 @@ impl Supervisor {
 
         // Register the app instance (Arc<Mutex<>> for interior mutability).
         let instance = Arc::new(std::sync::Mutex::new(AppInstance {
-            deployment_id: spec.deployment_id.clone(),
+            deployment_id: deployment_id.to_string(),
             app_name: app_name.to_string(),
             tenant_id: tenant_id_for_instance,
             port: raw_port,

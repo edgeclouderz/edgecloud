@@ -67,3 +67,28 @@ func (h *TrafficHandler) GetTraffic(w http.ResponseWriter, r *http.Request) {
 		"splits":   splits,
 	})
 }
+
+// GetTrafficInternal handles GET /api/v1/internal/traffic/{tenantID}/{appName}.
+// Mounted under the `internalAuth` middleware (shared-secret header), this is
+// the read endpoint the edge-ingress polls to apply Caddy weights. Unlike
+// GetTraffic, the tenant is not derived from an authenticated context — it
+// comes from the URL path because the ingress is a service-to-service caller,
+// not a tenant. The split query is the same as GetTraffic's; only the
+// authentication and how the tenant is identified differ.
+func (h *TrafficHandler) GetTrafficInternal(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	appName := r.PathValue("appName")
+
+	splits, err := h.trafficSvc.GetTraffic(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("GetTrafficInternal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"app_name": appName,
+		"splits":   splits,
+	})
+}

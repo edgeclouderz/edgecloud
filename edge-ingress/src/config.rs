@@ -28,6 +28,14 @@ pub struct Config {
     pub http_to_https: bool,
     pub admin_token: Option<String>,
     pub control_plane_api_url: String,
+    /// Shared secret presented in `X-Internal-Token` when fetching traffic
+    /// splits from the control plane. Must match the control plane's
+    /// `EDGE_INTERNAL_TOKEN`; otherwise the control plane's
+    /// `internalAuth` middleware returns 401 and the Caddy weights
+    /// never get applied (canary/blue-green silently no-ops). `None`
+    /// means the header is omitted — which the control plane treats
+    /// as a 401, so a production deployment must set this.
+    pub internal_token: Option<String>,
 }
 
 impl Config {
@@ -70,6 +78,9 @@ impl Config {
                 .filter(|v| !v.is_empty()),
             control_plane_api_url: std::env::var("CONTROL_PLANE_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
+            internal_token: std::env::var("EDGE_INTERNAL_TOKEN")
+                .ok()
+                .filter(|v| !v.is_empty()),
         })
     }
 }

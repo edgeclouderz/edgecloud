@@ -52,6 +52,7 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
         http_client,
         cfg.control_plane_api_url.clone(),
         traffic_cache.clone(),
+        cfg.internal_token.clone(),
     );
     spawn_renderer(
         cfg.clone(),

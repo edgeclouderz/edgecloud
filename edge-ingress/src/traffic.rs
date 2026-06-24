@@ -96,8 +96,18 @@ async fn fetch_app_split(
     api_url: &str,
     tenant_id: &str,
     app_name: &str,
+    internal_token: Option<&str>,
 ) -> Option<DeploymentWeights> {
-    let url = format!("{}/api/v1/apps/{}/traffic", api_url, app_name);
+    // /api/v1/internal/traffic/{tenantID}/{appName} is mounted under the
+    // control plane's `internalAuth` middleware, which gates on
+    // `X-Internal-Token`. The tenant is in the URL path because the
+    // ingress isn't tenant-authenticated — it's a service-to-service
+    // caller. The CLI's `edge traffic show` uses a different
+    // tenant-authenticated endpoint.
+    let url = format!(
+        "{}/api/v1/internal/traffic/{}/{}",
+        api_url, tenant_id, app_name
+    );
     #[derive(serde::Deserialize)]
     struct SplitEntry {
         deployment_id: String,
@@ -108,7 +118,11 @@ async fn fetch_app_split(
         splits: Vec<SplitEntry>,
     }
 
-    let resp = match http.get(&url).send().await {
+    let mut req = http.get(&url);
+    if let Some(token) = internal_token {
+        req = req.header("X-Internal-Token", token);
+    }
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(tenant = %tenant_id, app = %app_name, err = %e, "failed to fetch traffic split");
@@ -140,7 +154,12 @@ pub type SharedCache = Arc<RwLock<TrafficSplitCache>>;
 
 /// Spawn a background task that periodically re-fetches traffic splits for
 /// all known apps. It also periodically removes stale cache entries.
-pub fn spawn_fetcher(http: reqwest::Client, api_url: String, cache: SharedCache) {
+pub fn spawn_fetcher(
+    http: reqwest::Client,
+    api_url: String,
+    cache: SharedCache,
+    internal_token: Option<String>,
+) {
     tokio::spawn(async move {
         let fetch_interval = Duration::from_secs(30);
         let mut ticker = tokio::time::interval(fetch_interval);
@@ -153,7 +172,14 @@ pub fn spawn_fetcher(http: reqwest::Client, api_url: String, cache: SharedCache)
                 cache.known_apps()
             };
             for (tenant_id, app_name) in apps {
-                let weights = fetch_app_split(&http, &api_url, &tenant_id, &app_name).await;
+                let weights = fetch_app_split(
+                    &http,
+                    &api_url,
+                    &tenant_id,
+                    &app_name,
+                    internal_token.as_deref(),
+                )
+                .await;
                 if let Some(weights) = weights {
                     let mut cache = cache.write().await;
                     cache.update(tenant_id.clone(), app_name.clone(), weights);
