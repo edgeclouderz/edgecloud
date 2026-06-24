@@ -96,19 +96,20 @@ func renderApps(b *strings.Builder, tenantID string, apps map[string]appMetrics)
 	)
 
 	for appName, m := range apps {
-		baseLabels := fmt.Sprintf(`tenant_id=%q,app=%q`, tenantID, appName)
+		baseLabels := "tenant_id=" + promQuoteLabelValue(tenantID) + ",app=" + promQuoteLabelValue(appName)
 		reqCountLines = append(reqCountLines, fmt.Sprintf("edge_request_count{%s} %d", baseLabels, m.requestCount))
 		outBytesLines = append(outBytesLines, fmt.Sprintf("edge_outbound_bytes{%s} %d", baseLabels, m.outboundBytes))
 
 		for _, s := range m.samples {
 			labelStr := buildLabelStr(baseLabels, s.Labels)
+			metricLabel := "metric=" + promQuoteLabelValue(s.Name)
 			switch s.Kind {
 			case domain.MetricKindCounter:
-				counterLines = append(counterLines, fmt.Sprintf("edge_counter{%s,metric=%q} %g", labelStr, s.Name, s.Value))
+				counterLines = append(counterLines, fmt.Sprintf("edge_counter{%s,%s} %g", labelStr, metricLabel, s.Value))
 			case domain.MetricKindGauge:
-				gaugeLines = append(gaugeLines, fmt.Sprintf("edge_gauge{%s,metric=%q} %g", labelStr, s.Name, s.Value))
+				gaugeLines = append(gaugeLines, fmt.Sprintf("edge_gauge{%s,%s} %g", labelStr, metricLabel, s.Value))
 			case domain.MetricKindHistogramSample:
-				histogramLines = append(histogramLines, fmt.Sprintf("edge_histogram_sample{%s,metric=%q} %g", labelStr, s.Name, s.Value))
+				histogramLines = append(histogramLines, fmt.Sprintf("edge_histogram_sample{%s,%s} %g", labelStr, metricLabel, s.Value))
 			}
 		}
 	}
@@ -135,18 +136,32 @@ func emitFamily(b *strings.Builder, name, typeName string, lines []string) {
 	}
 }
 
+// reservedLabelNames is the set of label names already present in the base
+// label set plus the `metric` label appended after buildLabelStr. A guest
+// label whose sanitized key collides with one of these would produce a
+// duplicate label name, which Prometheus rejects for the entire scrape sample.
+var reservedLabelNames = map[string]bool{
+	"tenant_id": true,
+	"app":       true,
+	"metric":    true,
+}
+
 // buildLabelStr appends extra guest-supplied labels to the base label set.
-// Label keys from guest code are sanitized to [a-zA-Z_][a-zA-Z0-9_]* (the
-// Prometheus label name grammar) to prevent injection through the unquoted
-// key position in the exposition format. Label values are %q-quoted by the
-// caller and are safe without further escaping.
+// Label keys are sanitized to [a-zA-Z_][a-zA-Z0-9_]* and checked against
+// reserved names; colliding keys are prefixed with "user_" to avoid duplicate
+// label names in the Prometheus output. Label values are quoted with
+// promQuoteLabelValue, which uses only the escape sequences Prometheus accepts.
 func buildLabelStr(base string, extra [][2]string) string {
 	if len(extra) == 0 {
 		return base
 	}
 	var parts []string
 	for _, kv := range extra {
-		parts = append(parts, fmt.Sprintf("%s=%q", sanitizeLabelName(kv[0]), kv[1]))
+		k := sanitizeLabelName(kv[0])
+		if reservedLabelNames[k] {
+			k = "user_" + k
+		}
+		parts = append(parts, k+"="+promQuoteLabelValue(kv[1]))
 	}
 	return base + "," + strings.Join(parts, ",")
 }
@@ -173,4 +188,27 @@ func sanitizeLabelName(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// promQuoteLabelValue returns a Prometheus text-format quoted label value.
+// The Prometheus exposition format only allows three escape sequences inside
+// double-quoted label values: \" \\ \n. Go's %q emits additional escapes
+// (\t, \a, \b, \r, \f, \v, \uXXXX) that Prometheus parsers reject.
+func promQuoteLabelValue(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
