@@ -60,7 +60,11 @@ impl From<serde_json::Error> for ApiError {
 /// Inspect a response and split 2xx (return `Ok`) from 4xx (`Rejected`)
 /// and the rest (`Transient`, after reading whatever body is
 /// available). The body is read once on the non-2xx path.
-fn check_response(resp: Response) -> Result<Response, ApiError> {
+///
+/// `pub(crate)` so sibling accessor structs (`DomainClient`,
+/// `Tenants`, `Keys`, etc.) can reuse the same 2xx/4xx/5xx split
+/// instead of hand-rolling `if !status.is_success()` per method.
+pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);

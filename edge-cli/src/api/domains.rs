@@ -17,6 +17,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::client::check_response;
+
 /// One row of the `domains` table as seen by the tenant. Mirrors the
 /// Go `domain.Domain` struct field-for-field. The `verified_at` and
 /// `last_error` fields are nullable on the server; both are
@@ -40,6 +42,18 @@ pub struct Domain {
     pub verified_at: Option<String>,
 }
 
+/// Wire shape for `GET /api/v1/apps/{app}/domains`. The handler
+/// wraps the array in an object so the OpenAPI spec can document a
+/// named property — `DomainListResponse` mirrors that exactly so
+/// future fields (pagination, totals) can be added without breaking
+/// the CLI. Without this wrapper, decoding the response as
+/// `Vec<Domain>` would silently fail with "missing field `domains`"
+/// on every call.
+#[derive(Debug, Deserialize)]
+struct DomainListResponse {
+    domains: Vec<Domain>,
+}
+
 /// Borrowed accessor for the custom-domain endpoints. Constructed via
 /// `ApiClient::domains()`.
 pub struct DomainClient<'a> {
@@ -58,15 +72,8 @@ impl<'a> DomainClient<'a> {
             .json(&json!({ "fqdn": fqdn }))
             .send()
             .context("POST /api/v1/apps/{app}/domains")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("add domain failed: {status} {body}");
-        }
-
-        let body = resp.text().context("reading add-domain response body")?;
-        serde_json::from_str(&body).context("decoding add-domain response")
+        let resp = check_response(resp).context("add domain request failed")?;
+        resp.json().context("decoding add-domain response")
     }
 
     /// List all custom FQDNs bound to the app.
@@ -79,15 +86,11 @@ impl<'a> DomainClient<'a> {
             .header("Authorization", self.client.auth_header())
             .send()
             .context("GET /api/v1/apps/{app}/domains")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("list domains failed: {status} {body}");
-        }
-
-        let body = resp.text().context("reading list-domains response body")?;
-        serde_json::from_str(&body).context("decoding list-domains response")
+        let resp = check_response(resp).context("list domains request failed")?;
+        let parsed: DomainListResponse = resp
+            .json()
+            .context("decoding list-domains response (missing 'domains' field?)")?;
+        Ok(parsed.domains)
     }
 
     /// Fetch a single row by (app, fqdn).
@@ -105,15 +108,8 @@ impl<'a> DomainClient<'a> {
             .header("Authorization", self.client.auth_header())
             .send()
             .context("GET /api/v1/apps/{app}/domains/{fqdn}")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("get domain failed: {status} {body}");
-        }
-
-        let body = resp.text().context("reading get-domain response body")?;
-        serde_json::from_str(&body).context("decoding get-domain response")
+        let resp = check_response(resp).context("get domain request failed")?;
+        resp.json().context("decoding get-domain response")
     }
 
     /// Unbind a custom FQDN from an app.
@@ -131,13 +127,7 @@ impl<'a> DomainClient<'a> {
             .header("Authorization", self.client.auth_header())
             .send()
             .context("DELETE /api/v1/apps/{app}/domains/{fqdn}")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("remove domain failed: {status} {body}");
-        }
-
+        check_response(resp).context("remove domain request failed")?;
         Ok(())
     }
 }
