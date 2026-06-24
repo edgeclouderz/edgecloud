@@ -669,7 +669,9 @@ async fn test_artifact_hash_mismatch_rejects_app() {
     {
         let state = harness.supervisor.state.read().await;
         assert!(
-            !state.apps.contains_key(&("bad-hash-app".to_string(), "d_hash_bad".to_string())),
+            !state
+                .apps
+                .contains_key(&("bad-hash-app".to_string(), "d_hash_bad".to_string())),
             "tampered-hash app must NOT be registered"
         );
     }
@@ -826,7 +828,10 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state.apps.contains_key(&("cache-dbl-bad-app".to_string(), "d_cache_dbl_bad".to_string())),
+        !state.apps.contains_key(&(
+            "cache-dbl-bad-app".to_string(),
+            "d_cache_dbl_bad".to_string()
+        )),
         "app must NOT be registered when both cache and fresh download fail verification"
     );
     drop(state);
@@ -875,7 +880,9 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state.apps.contains_key(&("download-500-app".to_string(), "d_download_500".to_string())),
+        !state
+            .apps
+            .contains_key(&("download-500-app".to_string(), "d_download_500".to_string())),
         "app must NOT be registered when the control plane returns 500"
     );
     drop(state);
@@ -1078,6 +1085,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     let spec = AppSpec {
         deployment_id: "d_log_emit".to_string(),
         deployment_hash: test_component_hash(),
+        routes: None,
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,

@@ -82,13 +82,15 @@ impl CaddyClient {
 ///
 /// A single entry omits the `weight` key, which Caddy defaults to `1` for
 /// that sole upstream — identical routing behaviour to the legacy path.
-pub fn render_routes(entries: &[RouteEntry], cfg: &Config, traffic_cache: &TrafficSplitCache) -> Value {
+pub fn render_routes(
+    entries: &[RouteEntry],
+    cfg: &Config,
+    traffic_cache: &TrafficSplitCache,
+) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
-    let mut groups: std::collections::HashMap<
-        (&str, &str),
-        Vec<&RouteEntry>,
-    > = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<(&str, &str), Vec<&RouteEntry>> =
+        std::collections::HashMap::new();
     for e in entries {
         groups
             .entry((e.tenant_id.as_str(), e.app_name.as_str()))
@@ -119,17 +121,22 @@ pub fn render_routes(entries: &[RouteEntry], cfg: &Config, traffic_cache: &Traff
                 serde_json::json!([{"dial": format!("{}:{}", e.worker_addr, e.port)}])
             } else {
                 // Multiple deployments — use cached weights when available.
-                serde_json::json!(group_sorted.iter().map(|e| {
-                    // Use cached traffic split weight if available, otherwise
-                    // fall back to the heartbeat weight (default 100).
-                    let weight = e.deployment_id.as_ref().and_then(|did| {
-                        traffic_cache.weight(tenant_id, app_name, did)
-                    }).unwrap_or(e.weight);
-                    serde_json::json!({
-                        "dial": format!("{}:{}", e.worker_addr, e.port),
-                        "weight": weight,
+                serde_json::json!(group_sorted
+                    .iter()
+                    .map(|e| {
+                        // Use cached traffic split weight if available, otherwise
+                        // fall back to the heartbeat weight (default 100).
+                        let weight = e
+                            .deployment_id
+                            .as_ref()
+                            .and_then(|did| traffic_cache.weight(tenant_id, app_name, did))
+                            .unwrap_or(e.weight);
+                        serde_json::json!({
+                            "dial": format!("{}:{}", e.worker_addr, e.port),
+                            "weight": weight,
+                        })
                     })
-                }).collect::<Vec<_>>())
+                    .collect::<Vec<_>>())
             };
 
             json!({
@@ -343,12 +350,7 @@ mod tests {
 
         // Sort by dial for deterministic assertion.
         let mut sorted = upstreams_arr.clone();
-        sorted.sort_by(|a, b| {
-            a["dial"]
-                .as_str()
-                .unwrap()
-                .cmp(&b["dial"].as_str().unwrap())
-        });
+        sorted.sort_by(|a, b| a["dial"].as_str().unwrap().cmp(b["dial"].as_str().unwrap()));
         assert_eq!(sorted[0]["dial"], "1.2.3.4:8081");
         assert_eq!(sorted[0]["weight"], 95);
         assert_eq!(sorted[1]["dial"], "1.2.3.5:8082");
@@ -362,8 +364,8 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
         let cfg_json = render_routes(&entries, &cfg, &cache);
-        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
-            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
+            ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         assert_eq!(upstreams.as_array().unwrap().len(), 1);
         let upstream = &upstreams[0];
         assert_eq!(upstream["dial"], "1.2.3.4:8081");
@@ -406,14 +408,19 @@ mod tests {
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
         let cfg_json = render_routes(&entries, &cfg, &cache);
-        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
-            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
+            ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
         assert_eq!(upstreams_arr.len(), 2);
         // Both upstreams are present; weight=0 is rendered explicitly.
         let by_dial: std::collections::HashMap<_, _> = upstreams_arr
             .iter()
-            .map(|u| (u["dial"].as_str().unwrap().to_string(), u["weight"].as_u64().unwrap()))
+            .map(|u| {
+                (
+                    u["dial"].as_str().unwrap().to_string(),
+                    u["weight"].as_u64().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(by_dial.get("1.2.3.4:8081"), Some(&0));
         assert_eq!(by_dial.get("1.2.3.5:8082"), Some(&100));
@@ -429,10 +436,7 @@ mod tests {
         cache.update(
             "t_acme".to_string(),
             "api".to_string(),
-            std::collections::HashMap::from([
-                ("d_v1".to_string(), 5),
-                ("d_v2".to_string(), 95),
-            ]),
+            std::collections::HashMap::from([("d_v1".to_string(), 5), ("d_v2".to_string(), 95)]),
         );
         // Heartbeat weights are 100/100 — cache should override to 5/95.
         let entries = vec![
@@ -440,12 +444,17 @@ mod tests {
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
         let cfg_json = render_routes(&entries, &cfg, &cache);
-        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
-            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
+            ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
         let by_dial: std::collections::HashMap<_, _> = upstreams_arr
             .iter()
-            .map(|u| (u["dial"].as_str().unwrap().to_string(), u["weight"].as_u64().unwrap()))
+            .map(|u| {
+                (
+                    u["dial"].as_str().unwrap().to_string(),
+                    u["weight"].as_u64().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(by_dial.get("1.2.3.4:8081"), Some(&5));
         assert_eq!(by_dial.get("1.2.3.5:8082"), Some(&95));

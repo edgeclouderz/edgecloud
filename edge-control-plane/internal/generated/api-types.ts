@@ -185,11 +185,20 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Activate a specific deployment as the live version
+         * Activate a deployment, optionally as a canary
          * @description Publishes a task update over NATS JetStream so subscribed workers
-         *     start serving the specified deployment. Only one deployment per app
-         *     can be active at a time — activating a new one replaces the current
-         *     live deployment atomically.
+         *     start serving the specified deployment.
+         *
+         *     When `?weight=100` (default): atomically replaces the live deployment —
+         *     all traffic switches to the new version.
+         *
+         *     When `?weight=N` (0 < N < 100): activates the deployment as a canary
+         *     at N% traffic. The currently active deployment absorbs the remaining
+         *     (100-N)% so traffic always sums to 100. Both deployments run
+         *     concurrently on workers.
+         *
+         *     Use `PUT /api/v1/apps/{appName}/traffic` for full control over
+         *     weighted routing between multiple deployments.
          */
         post: operations["activateDeployment"];
         delete?: never;
@@ -208,6 +217,28 @@ export interface paths {
         /** Get the currently active deployment for an app */
         get: operations["getActiveDeployment"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/apps/{appName}/traffic": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the current traffic split configuration for an app */
+        get: operations["getTrafficSplits"];
+        /**
+         * Set the traffic split configuration for an app (canary/blue-green)
+         * @description Atomically sets the traffic split for an app. Sum of weights must equal 100.
+         *     Publishes a task update to workers so they start all deployments concurrently.
+         */
+        put: operations["setTrafficSplits"];
         post?: never;
         delete?: never;
         options?: never;
@@ -296,6 +327,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/migrate-tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit a multi-file source tree for auto-transformation and WASI compilation
+         * @description Accepts either a zip archive or multipart parts + JSON manifest
+         *     containing C or Rust source files. Each file is analyzed for
+         *     POSIX/WASI migration patterns, auto-transformed where safe, and
+         *     compiled to a WebAssembly component. The resulting artifact is
+         *     stored and a deployment record is created.
+         */
+        post: operations["migrateTree"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/quotas": {
         parameters: {
             query?: never;
@@ -325,6 +380,27 @@ export interface paths {
         post?: never;
         /** Revoke an API key */
         delete: operations["deleteAPIKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/egress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the authenticated tenant's outbound egress allowlist */
+        get: operations["getEgressAllowlist"];
+        /**
+         * Replace the authenticated tenant's outbound egress allowlist
+         * @description Replaces the tenant's allowlist and immediately republishes TaskMessages to all running workers so they enforce the new policy without a manual re-activate. An empty array clears the list (allow-all). A non-empty array restricts outbound HTTP to only the listed hostnames or wildcard patterns (e.g. `api.stripe.com`, `*.sendgrid.net`).
+         */
+        put: operations["updateEgressAllowlist"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -692,6 +768,16 @@ export interface components {
         EnvMap: {
             [key: string]: string;
         };
+        EgressAllowlist: {
+            /**
+             * @description Outbound hostname allowlist. Empty array means allow-all (no restriction). Each entry is either an exact FQDN (`api.stripe.com`) or a single-level wildcard pattern (`*.sendgrid.net`). Entries are stored lowercase.
+             * @example [
+             *       "api.stripe.com",
+             *       "*.sendgrid.net"
+             *     ]
+             */
+            allowlist?: string[];
+        };
         Quota: {
             /** @example t_abc123 */
             tenant_id?: string;
@@ -737,6 +823,46 @@ export interface components {
             patterns_transformed?: components["schemas"]["PatternInfo"][];
             patterns_manual_review?: components["schemas"]["PatternInfo"][];
             errors?: components["schemas"]["ErrorInfo"][];
+        };
+        FullPatternInfo: {
+            /** @example 42 */
+            line?: number;
+            /** @example socket */
+            pattern?: string;
+            /** @example int fd = socket(AF_INET, SOCK_STREAM, 0); */
+            snippet?: string;
+            /** @example wasi:network/tcp-socket */
+            wasi_equivalent?: string;
+            /** @enum {string} */
+            transformability?: "auto-transformable" | "best-effort" | "not-transformable";
+        };
+        FileReport: {
+            /** @example src/main.c */
+            path?: string;
+            /** @enum {string} */
+            status?: "success" | "partial" | "failed";
+            patterns_detected?: components["schemas"]["FullPatternInfo"][];
+            transformations?: components["schemas"]["FullPatternInfo"][];
+            manual_review?: components["schemas"]["FullPatternInfo"][];
+            errors?: components["schemas"]["ErrorInfo"][];
+        };
+        TreeMigrationReport: {
+            /** @enum {string} */
+            status?: "success" | "partial" | "failed";
+            /** @example true */
+            wasm_stored?: boolean;
+            /** @example d_abc123 */
+            deployment_id?: string | null;
+            /** @example hello-world */
+            app_name?: string;
+            files?: components["schemas"]["FileReport"][];
+            errors?: components["schemas"]["ErrorInfo"][];
+            /** @example 5 */
+            files_total?: number;
+            /** @example 3 */
+            files_transformed?: number;
+            /** @example 1 */
+            files_manual_review?: number;
         };
         PatternInfo: {
             /** @example socket */
@@ -1252,7 +1378,13 @@ export interface operations {
     };
     activateDeployment: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Traffic weight for this deployment (0–100). Omit or use 100 for
+                 *     atomic cutover. Values 0–99 trigger canary mode.
+                 */
+                weight?: number;
+            };
             header?: never;
             path: {
                 /** @description Unique name of the app within the tenant. */
@@ -1263,7 +1395,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Deployment activated. */
+            /** @description Deployment activated (or traffic split set for canary). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1300,6 +1432,80 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getTrafficSplits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Traffic split configuration. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example my-app */
+                        app_name?: string;
+                        splits?: {
+                            /** @example d_abc123 */
+                            deployment_id?: string;
+                            weight?: number;
+                            /** Format: date-time */
+                            created_at?: string;
+                        }[];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    setTrafficSplits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    splits: {
+                        /** @example d_abc123 */
+                        deployment_id: string;
+                        weight: number;
+                    }[];
+                };
+            };
+        };
+        responses: {
+            /** @description Traffic split configured. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example traffic_set */
+                        status?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
         };
     };
@@ -1465,6 +1671,73 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    migrateTree: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * @description Unique app name (alphanumeric, hyphens, 1-63 chars).
+                     * @example my-app
+                     */
+                    app_name: string;
+                    /**
+                     * @description Source language.
+                     * @enum {string}
+                     */
+                    language: "c" | "rust";
+                    /**
+                     * Format: binary
+                     * @description Either a zip archive (Content-Type application/zip) or a
+                     *     JSON manifest `{"files":["path1","path2",...]}` referencing
+                     *     individual `file` parts. Zip is the recommended format.
+                     */
+                    tree: string;
+                    /**
+                     * Format: binary
+                     * @description One `file` part per entry in the tree manifest. Required
+                     *     when `tree` is a JSON manifest. Ignored when `tree` is zip.
+                     */
+                    file?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Tree migration report. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TreeMigrationReport"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body too large. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Migration failed (source errors or compile failure). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TreeMigrationReport"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
     getQuota: {
         parameters: {
             query?: never;
@@ -1507,6 +1780,55 @@ export interface operations {
                 };
                 content?: never;
             };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getEgressAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current egress allowlist. Empty array means allow-all (no restriction). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EgressAllowlist"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateEgressAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EgressAllowlist"];
+            };
+        };
+        responses: {
+            /** @description Updated allowlist (normalized to lowercase). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EgressAllowlist"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
         };

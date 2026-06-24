@@ -81,6 +81,7 @@ impl RoutingTable {
     /// Upsert a route under `(tenant_id, app_name, deployment_id)`. Only
     /// `status == "running"` apps are routable; other statuses remove the
     /// entry under this key.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         &self,
         tenant_id: &str,
@@ -194,10 +195,10 @@ mod tests {
         let snap = t.snapshot().await;
         assert_eq!(snap.len(), 2);
 
-        let by_dep: std::collections::HashMap<&str, &RouteEntry> =
-            snap.iter()
-                .flat_map(|e| e.deployment_id.as_deref().map(|d| (d, e)))
-                .collect();
+        let by_dep: std::collections::HashMap<&str, &RouteEntry> = snap
+            .iter()
+            .flat_map(|e| e.deployment_id.as_deref().map(|d| (d, e)))
+            .collect();
         assert_eq!(by_dep["d_v1"].worker_addr, "1.2.3.4");
         assert_eq!(by_dep["d_v1"].weight, 95);
         assert_eq!(by_dep["d_v2"].worker_addr, "1.2.3.5");

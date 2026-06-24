@@ -412,7 +412,10 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
         let v: TrafficResponse = serde_json::from_str(&resp.text()?)?;
-        Ok(v.splits.into_iter().map(|s| (s.deployment_id, s.weight)).collect())
+        Ok(v.splits
+            .into_iter()
+            .map(|s| (s.deployment_id, s.weight))
+            .collect())
     }
 
     /// List all deployments for an app.

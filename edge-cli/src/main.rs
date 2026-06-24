@@ -141,16 +141,17 @@ fn main() -> Result<()> {
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
-        Command::Activate { deployment_id, weight } => commands::activate::run(&cli.path, &deployment_id, weight),
+        Command::Activate {
+            deployment_id,
+            weight,
+        } => commands::activate::run(&cli.path, &deployment_id, weight),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open => commands::open::run(&cli.path),
         Command::Deployments => commands::deployments::run(&cli.path),
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
-            TrafficAction::Show => {
-                return commands::traffic::get(&cli.path);
-            }
+            TrafficAction::Show => commands::traffic::get(&cli.path),
             TrafficAction::Set { splits } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
@@ -160,7 +161,7 @@ fn main() -> Result<()> {
                         Some((id.to_string(), weight))
                     })
                     .collect();
-                return commands::traffic::set(&cli.path, &parsed);
+                commands::traffic::set(&cli.path, &parsed)
             }
         },
     }

@@ -42,8 +42,7 @@ impl TrafficSplitCache {
             tenant_id: tenant_id.to_string(),
             app_name: app_name.to_string(),
         };
-        self.inner.get(&key)?
-            .get(deployment_id).copied()
+        self.inner.get(&key)?.get(deployment_id).copied()
     }
 
     /// Returns true if the cache has a split for this app and it's not stale.
@@ -60,7 +59,10 @@ impl TrafficSplitCache {
 
     /// Update the cache with a new set of splits for an app.
     pub fn update(&mut self, tenant_id: String, app_name: String, weights: DeploymentWeights) {
-        let key = AppKey { tenant_id, app_name };
+        let key = AppKey {
+            tenant_id,
+            app_name,
+        };
         self.inner.insert(key.clone(), weights);
         self.fetched_at.insert(key, Instant::now());
     }
@@ -81,7 +83,10 @@ impl TrafficSplitCache {
 
     /// Get the list of all known (tenant_id, app_name) pairs in the cache.
     pub fn known_apps(&self) -> Vec<(String, String)> {
-        self.inner.keys().map(|k| (k.tenant_id.clone(), k.app_name.clone())).collect()
+        self.inner
+            .keys()
+            .map(|k| (k.tenant_id.clone(), k.app_name.clone()))
+            .collect()
     }
 }
 

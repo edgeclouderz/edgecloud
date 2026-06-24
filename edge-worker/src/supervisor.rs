@@ -38,6 +38,7 @@ impl Supervisor {
     /// Diffs the desired app set against currently running apps and
     /// starts/stops apps accordingly. Supports canary/blue-green: when
     /// `spec.routes` is Some, all listed deployments run concurrently.
+    #[allow(clippy::type_complexity)]
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
         let TaskMessage::TaskUpdate {
             tenant_id,
@@ -65,8 +66,7 @@ impl Supervisor {
         // Build the desired set from the task message.
         // When spec.routes is Some, run all listed deployments concurrently.
         // When None, run the primary deployment_id (legacy behaviour).
-        let mut desired_keys: HashMap<(String, String), (&str, &AppSpec)> =
-            HashMap::new();
+        let mut desired_keys: HashMap<(String, String), (&str, &AppSpec)> = HashMap::new();
         for (app_name, spec) in &desired_apps {
             if let Some(ref routes) = spec.routes {
                 for route in routes {
@@ -99,7 +99,9 @@ impl Supervisor {
             // deployment_id at this key differs from what we want.
             let current_dep_id = current_deployment_ids.get(key);
             let needs_restart = is_new
-                || current_dep_id.map(|id| id != &spec.deployment_id).unwrap_or(false)
+                || current_dep_id
+                    .map(|id| id != &spec.deployment_id)
+                    .unwrap_or(false)
                 || current_keys
                     .get(key)
                     .map(|s| !matches!(s, AppInstanceStatus::Running | AppInstanceStatus::Starting))
@@ -284,11 +286,7 @@ impl Supervisor {
             ticker: Some(ticker),
         }));
 
-        self.state
-            .write()
-            .await
-            .apps
-            .insert(key.clone(), instance);
+        self.state.write().await.apps.insert(key.clone(), instance);
 
         tracing::info!(app_name, deployment_id, port = raw_port, "app started");
         Ok(())

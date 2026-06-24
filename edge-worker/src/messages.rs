@@ -36,6 +36,11 @@ pub enum TaskMessage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeploymentRoute {
     pub deployment_id: String,
+    /// Reserved for canary weight propagation; the worker currently uses 100%
+    /// for every route and applies the weight at the ingress layer. Held on the
+    /// struct so the wire format stays in sync with `edge-ingress` and the
+    /// Go control plane, both of which already read it.
+    #[allow(dead_code)]
     pub weight: u8,
 }
 

@@ -48,7 +48,11 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
         .expect("reqwest Client must build");
     let traffic_cache_for_renderer = traffic_cache.clone();
     let traffic_cache_for_push = traffic_cache.clone();
-    spawn_fetcher(http_client, cfg.control_plane_api_url.clone(), traffic_cache.clone());
+    spawn_fetcher(
+        http_client,
+        cfg.control_plane_api_url.clone(),
+        traffic_cache.clone(),
+    );
     spawn_renderer(
         cfg.clone(),
         table.clone(),
@@ -130,7 +134,7 @@ pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> boo
             .upsert(
                 &app.tenant_id,
                 app_name,
-                deployment_id.as_deref(),
+                deployment_id,
                 100,
                 worker_addr,
                 port,
@@ -184,7 +188,12 @@ fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>) {
     });
 }
 
-async fn push_now(cfg: &Config, table: &RoutingTable, caddy: &CaddyClient, traffic_cache: &SharedCache) -> Result<()> {
+async fn push_now(
+    cfg: &Config,
+    table: &RoutingTable,
+    caddy: &CaddyClient,
+    traffic_cache: &SharedCache,
+) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
     let traffic_cache = traffic_cache.read().await;
     let json = render_routes(&snap, cfg, &traffic_cache);

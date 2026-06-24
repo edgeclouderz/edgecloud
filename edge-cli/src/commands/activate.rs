@@ -21,11 +21,13 @@ pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>) -> Result<()> {
 
     match weight {
         Some(w) if w < 100 => output::success(&format!(
-            "Deployment {} activated with {}% traffic", deployment_id, w
+            "Deployment {} activated with {}% traffic",
+            deployment_id, w
         )),
         Some(100) | None => output::success(&format!("Deployment {} activated", deployment_id)),
         _ => output::success(&format!(
-            "Deployment {} draining (0% traffic)", deployment_id
+            "Deployment {} draining (0% traffic)",
+            deployment_id
         )),
     }
     Ok(())
