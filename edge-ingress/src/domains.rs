@@ -23,13 +23,46 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::routing::RoutingTable;
+
+/// Typed errors from the domain poller. Replaces the previous
+/// `anyhow::anyhow!("control plane returned {status}")` + substring
+/// match pattern: a future status code (e.g. a 418 from a proxy
+/// that embeds a JSON 401 message in its body) would have silently
+/// escaped the substring gate and the poller would have looped
+/// forever on a real auth failure. Typed match on the variant is
+/// the only correct fix.
+#[derive(Debug, Error)]
+pub enum PollError {
+    /// HTTP non-2xx response. `status` and `body` are preserved so
+    /// the operator's log line carries the actual response (not a
+    /// substring match) and the run loop can match on `status` to
+    /// distinguish auth errors from transient 5xx.
+    #[error("control plane returned {status} for {url}: {body}")]
+    HttpStatus {
+        status: u16,
+        url: String,
+        body: String,
+    },
+    #[error("transport: {0}")]
+    Transport(#[from] reqwest::Error),
+    /// Decode failure (malformed JSON in a 2xx response, or any
+    /// other body-shape mismatch). The `reqwest::Error::json()`
+    /// method collapses both transport-time JSON errors and
+    /// serde-time errors into a single `reqwest::Error { kind:
+    /// Decode, ... }`, so we keep the variant stringly-typed —
+    /// preserving the underlying message is what the operator
+    /// needs in the log.
+    #[error("decode: {0}")]
+    Decode(String),
+}
 
 /// Number of consecutive 401/403 responses after which the poller
 /// gives up and returns Err. Three 30s ticks = ~90s of downtime
@@ -90,14 +123,19 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
                 }
             }
             Err(e) => {
-                // Distinguish auth errors (token rotated, revoked) from
-                // transient errors (5xx, network). The former fail-fast
-                // to surface "your token is no good" to the operator;
-                // the latter retry on the next tick as before. The
-                // `fetch_and_apply` error chain includes the HTTP
-                // status code, so substring-matching is reliable.
-                let msg = e.to_string();
-                let is_auth = msg.contains("401") || msg.contains("403");
+                // Typed match on PollError::HttpStatus — replaces
+                // the previous substring match on "401"/"403" that
+                // would have broken on any error message containing
+                // those digits for unrelated reasons. The closure
+                // also matches on 403 because the handler
+                // distinguishes 401 (bad/expired token) from 403
+                // (token good, role wrong) and both should fail-fast
+                // after the budget.
+                let status = match &e {
+                    PollError::HttpStatus { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let is_auth = matches!(status, Some(401) | Some(403));
                 if is_auth {
                     consecutive_auth_errors += 1;
                     if consecutive_auth_errors >= MAX_CONSECUTIVE_AUTH_ERRORS {
@@ -106,7 +144,7 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
                             count = consecutive_auth_errors,
                             "domain poller got {MAX_CONSECUTIVE_AUTH_ERRORS} consecutive 401/403 — failing fast (likely rotated INGRESS_SERVICE_TOKEN); restart with the new token from the control plane's ingest token file"
                         );
-                        return Err(e);
+                        return Err(e.into());
                     }
                     warn!(
                         err = %e,
@@ -135,24 +173,23 @@ pub async fn fetch_and_apply(
     url: &str,
     token: &str,
     table: &RoutingTable,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let resp = http
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+) -> Result<(Vec<String>, Vec<String>), PollError> {
+    let resp = http.get(url).bearer_auth(token).send().await?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("control plane returned {status} for {url}: {body}"));
+        return Err(PollError::HttpStatus {
+            status: status.as_u16(),
+            url: url.to_string(),
+            body,
+        });
     }
 
     let domains: Vec<crate::routing::Domain> = resp
         .json()
         .await
-        .with_context(|| format!("decoding {url} body as Vec<Domain>"))?;
+        .map_err(|e| PollError::Decode(e.to_string()))?;
 
     let (added, removed) = table.apply_poll_snapshot(domains).await;
     Ok((added, removed))
@@ -234,12 +271,15 @@ mod tests {
         let err = fetch_and_apply(&http, &url, "test-token", &table)
             .await
             .expect_err("503 must surface as Err");
-        // The error chain must mention the status code so the warn
-        // log line tells the operator which HTTP code to look for.
-        assert!(
-            err.to_string().contains("503"),
-            "err chain should mention 503, got: {err}"
-        );
+        // Typed match on PollError::HttpStatus — the Display impl
+        // also includes the status code, so the operator's log
+        // line still names "503" without the test relying on it.
+        match err {
+            PollError::HttpStatus { status, .. } => {
+                assert_eq!(status, 503, "status must be 503, got {status}");
+            }
+            other => panic!("expected PollError::HttpStatus, got {other:?}"),
+        }
     }
 
     /// After two polls with different bodies, the second poll must
@@ -334,10 +374,16 @@ mod tests {
         let err = fetch_and_apply(&http, &url, "test-token", &table)
             .await
             .expect_err("malformed JSON must surface as Err");
-        assert!(
-            err.to_string().contains("decoding"),
-            "err chain should mention decoding, got: {err}"
-        );
+        // Typed match: malformed JSON → serde_json::Error →
+        // PollError::Decode. The previous substring match on
+        // "decoding" was a smell: a future refactor that named the
+        // variant differently would silently break the test.
+        match err {
+            PollError::Decode(msg) => {
+                assert!(!msg.is_empty(), "decode error should carry a message");
+            }
+            other => panic!("expected PollError::Decode, got {other:?}"),
+        }
     }
 
     /// `run` with `control_plane_url` empty returns Ok immediately
@@ -395,22 +441,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cfg = Config {
-            nats_url: "nats://localhost:4222".into(),
-            caddy_admin_url: "http://127.0.0.1:2019".into(),
-            region: "test".into(),
-            cert_file: "/tmp/c.pem".into(),
-            key_file: "/tmp/k.pem".into(),
-            listen_http: ":80".into(),
-            listen_https: ":443".into(),
-            refresh_debounce_ms: 1000,
-            http_to_https: true,
-            admin_token: None,
-            control_plane_url: server.uri(),
-            service_token: "stale-token".into(),
-            // Short interval for fast test. 50ms × 3 ticks = 150ms.
-            domain_poll_interval: Duration::from_millis(50),
-        };
+        let cfg = test_cfg_with_poll_interval(server.uri(), Duration::from_millis(50));
         let table = std::sync::Arc::new(RoutingTable::new());
         let notify = std::sync::Arc::new(Notify::new());
 
@@ -421,9 +452,76 @@ mod tests {
             .expect("run loop didn't return within 2s")
             .expect("run task panicked");
         let err = result.expect_err("run must return Err on 3 consecutive 401s");
-        assert!(
-            err.to_string().contains("401"),
-            "err chain should mention 401, got: {err}"
-        );
+        // Typed match on PollError::HttpStatus — the run() function
+        // returns `anyhow::Error` (via `.into()`), so the
+        // PollError variant is wrapped in anyhow. Use a downcast
+        // helper to assert on the variant.
+        let poll_err = err
+            .downcast_ref::<PollError>()
+            .expect("run must surface PollError");
+        match poll_err {
+            PollError::HttpStatus { status, .. } => {
+                assert_eq!(*status, 401, "expected status 401, got {status}");
+            }
+            other => panic!("expected PollError::HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// Typed-error variant: a 403 (token good, role wrong) must
+    /// also trip the fail-fast path, just like 401 (token
+    /// missing/expired). Without the typed match, a future
+    /// status code that just happens to contain "401" or "403"
+    /// in a JSON body would have falsely tripped (or falsely
+    /// missed) the substring gate. Pins the typed variant
+    /// matches on the literal HTTP status.
+    #[tokio::test]
+    async fn run_fails_fast_after_three_consecutive_403s_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/domains"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg_with_poll_interval(server.uri(), Duration::from_millis(50));
+        let table = std::sync::Arc::new(RoutingTable::new());
+        let notify = std::sync::Arc::new(Notify::new());
+
+        let run_handle = tokio::spawn(async move { run(cfg, table, notify).await });
+        let result = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("run loop didn't return within 2s")
+            .expect("run task panicked");
+        let err = result.expect_err("run must return Err on 3 consecutive 403s");
+        let poll_err = err
+            .downcast_ref::<PollError>()
+            .expect("run must surface PollError");
+        match poll_err {
+            PollError::HttpStatus { status, .. } => {
+                assert_eq!(*status, 403, "expected status 403, got {status}");
+            }
+            other => panic!("expected PollError::HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// Build a minimal Config for the run() tests. Filled in with
+    /// dummy file paths and a short poll interval.
+    fn test_cfg_with_poll_interval(control_plane_url: String, poll: Duration) -> Config {
+        Config {
+            nats_url: "nats://localhost:4222".into(),
+            caddy_admin_url: "http://127.0.0.1:2019".into(),
+            region: "test".into(),
+            cert_file: "/tmp/c.pem".into(),
+            key_file: "/tmp/k.pem".into(),
+            listen_http: ":80".into(),
+            listen_https: ":443".into(),
+            refresh_debounce_ms: 1000,
+            http_to_https: true,
+            admin_token: None,
+            control_plane_url,
+            service_token: "stale-token".into(),
+            domain_poll_interval: poll,
+        }
     }
 }
