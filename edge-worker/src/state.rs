@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use edge_runtime::RequestMeter;
+use edge_runtime::{MetricsAccumulator, RequestMeter};
 use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
@@ -32,6 +32,11 @@ pub struct AppInstance {
     pub port: u16,
     pub status: AppInstanceStatus,
     pub meter: Arc<RequestMeter>,
+    /// Shared metrics accumulator. Written by the Observer inside
+    /// RuntimeState on every `edge:observe` counter/gauge/histogram call;
+    /// read by `build_heartbeat` to produce the `observer_metrics` field
+    /// shipped to the control plane.
+    pub metrics: Arc<MetricsAccumulator>,
     /// Channel to signal graceful shutdown to the app task. Wrapped in Option so
     /// it can be taken out of the locked struct to call send().
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
