@@ -49,11 +49,7 @@ pub struct DomainClient<'a> {
 impl<'a> DomainClient<'a> {
     /// Bind a custom FQDN to an existing app. Returns the new row.
     pub fn add(&self, app: &str, fqdn: &str) -> Result<Domain> {
-        let url = format!(
-            "{}/api/apps/{}/domains",
-            self.client.base_url(),
-            app
-        );
+        let url = format!("{}/api/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
             .http()
@@ -75,11 +71,7 @@ impl<'a> DomainClient<'a> {
 
     /// List all custom FQDNs bound to the app.
     pub fn list(&self, app: &str) -> Result<Vec<Domain>> {
-        let url = format!(
-            "{}/api/apps/{}/domains",
-            self.client.base_url(),
-            app
-        );
+        let url = format!("{}/api/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
             .http()

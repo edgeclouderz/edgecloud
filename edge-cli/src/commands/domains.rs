@@ -43,7 +43,7 @@ impl DomainsAction {
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
         let edge_toml = EdgeToml::from_path(path)?;
-        let client = ApiClient::new(edge_toml.deployment.api.clone())?;
+        let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
         let domains = client.domains();
 
         match self {

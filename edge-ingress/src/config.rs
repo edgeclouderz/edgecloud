@@ -88,8 +88,8 @@ impl Config {
                  the domain poller cannot authenticate against the control plane"
             );
         }
-        let domain_poll_interval = parse_duration_env("DOMAIN_POLL_INTERVAL")
-            .unwrap_or(DEFAULT_DOMAIN_POLL_INTERVAL);
+        let domain_poll_interval =
+            parse_duration_env("DOMAIN_POLL_INTERVAL").unwrap_or(DEFAULT_DOMAIN_POLL_INTERVAL);
 
         Ok(Config {
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),

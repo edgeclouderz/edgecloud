@@ -246,14 +246,9 @@ impl RoutingTable {
     /// while holding the read lock, then apply under the write lock —
     /// the read lock is dropped before the write lock is acquired, so
     /// other readers aren't blocked on the I/O.
-    pub async fn apply_poll_snapshot(
-        &self,
-        domains: Vec<Domain>,
-    ) -> (Vec<String>, Vec<String>) {
-        let new_fqdns: HashMap<String, Domain> = domains
-            .into_iter()
-            .map(|d| (d.fqdn.clone(), d))
-            .collect();
+    pub async fn apply_poll_snapshot(&self, domains: Vec<Domain>) -> (Vec<String>, Vec<String>) {
+        let new_fqdns: HashMap<String, Domain> =
+            domains.into_iter().map(|d| (d.fqdn.clone(), d)).collect();
 
         // Compute added + removed under the read lock.
         let (added, removed) = {

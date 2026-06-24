@@ -675,9 +675,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let cfg_json = render_routes(&[], &[], &test_cfg(), &cache);
         assert!(
-            cfg_json["apps"]["tls"]
-                .get("automation")
-                .is_none(),
+            cfg_json["apps"]["tls"].get("automation").is_none(),
             "no automation block when control_plane_url is empty"
         );
     }
