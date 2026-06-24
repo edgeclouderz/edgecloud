@@ -37,14 +37,15 @@ type MetricLabels = Vec<(String, String)>;
 type HistogramMap = HashMap<String, Vec<(f64, MetricLabels)>>;
 
 /// Build a composite key that uniquely identifies one (metric_name, label_set)
-/// time series. The null byte separator can't appear in a valid metric name or
-/// label value, so no two distinct (name, labels) pairs can collide.
+/// time series. Uses `\x00` as separator between all segments — name, key, and
+/// value — so a label key containing `=` cannot collide with a label value on a
+/// different pair.
 fn series_key(name: &str, labels: &[(String, String)]) -> String {
     let mut key = name.to_string();
     for (k, v) in labels {
         key.push('\x00');
         key.push_str(k);
-        key.push('=');
+        key.push('\x00');
         key.push_str(v);
     }
     key
