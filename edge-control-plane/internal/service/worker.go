@@ -376,7 +376,17 @@ func (s *WorkerService) evaluateStability(ctx context.Context, tenantID string, 
 	}
 
 	now := time.Now()
-	for appName, app := range apps {
+	for rawKey, app := range apps {
+		// Heartbeat key is "app_name:deployment_id" for canary/blue-green
+		// deployments (see edge-worker/src/supervisor.rs build_heartbeat).
+		// `active_deployments.app_name` is keyed on the bare app_name, so we
+		// strip any ":deployment_id" suffix before the lookup — otherwise
+		// activeRepo.Get never matches and the auto-rollback stability
+		// window never arms or fires (silent regression of #74).
+		appName := rawKey
+		if i := strings.IndexByte(rawKey, ':'); i >= 0 {
+			appName = rawKey[:i]
+		}
 		ad, err := s.activeRepo.Get(ctx, tenantID, appName)
 		if err != nil {
 			log.Printf("stability: Get(%s, %s) failed: %v", tenantID, appName, err)

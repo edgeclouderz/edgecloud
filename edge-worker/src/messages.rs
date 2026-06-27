@@ -32,11 +32,36 @@ pub enum TaskMessage {
     },
 }
 
+/// DeploymentRoute: a single destination in a weighted traffic split.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeploymentRoute {
+    pub deployment_id: String,
+    /// SHA-256 of this deployment's wasm artifact. Each route carries its
+    /// own hash — the top-level `AppSpec::deployment_hash` only describes
+    /// the primary deployment, so without this field the worker would
+    /// download the primary's binary for every canary route (and verify it
+    /// against the wrong hash, failing for any deployment whose artifact
+    /// differs from the primary's).
+    pub deployment_hash: String,
+    /// Reserved for canary weight propagation; the worker currently uses 100%
+    /// for every route and applies the weight at the ingress layer. Held on the
+    /// struct so the wire format stays in sync with `edge-ingress` and the
+    /// Go control plane, both of which already read it.
+    #[allow(dead_code)]
+    pub weight: u8,
+}
+
 /// AppSpec: specification for a single deployed app.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppSpec {
     pub deployment_id: String,
     pub deployment_hash: String,
+    /// Optional traffic split. When present, the worker runs ALL deployments
+    /// listed (not just the primary one) concurrently. None = legacy mode
+    /// (single deployment_id only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub routes: Option<Vec<DeploymentRoute>>,
     pub env: HashMap<String, String>,
     /// Per-deployment egress allowlist. `None` means allow-all outbound (field
     /// absent or `[]` on the wire — both safe defaults for pre-enforcement
