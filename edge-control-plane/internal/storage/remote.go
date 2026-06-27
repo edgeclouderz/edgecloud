@@ -255,9 +255,30 @@ func (s *RemoteArtifactStore) pullFromPeer(ctx context.Context, tenantID, appNam
 		}
 	}()
 
-	if _, err := io.Copy(stagingFile, resp.Body); err != nil {
+	// Cap the peer stream at MaxArtifactSize+1 so we can detect an oversize
+	// response during the copy itself, before committing it to staging.
+	// Without this, a compromised peer can return multi-GiB and the only
+	// remaining bound is the 120s httpClient.Timeout + free disk space.
+	//
+	// io.LimitReader does NOT return an error on overflow by itself — it
+	// silently stops at the cap. We use a +1 sentinel and Stat the staging
+	// file after the copy: anything beyond MaxArtifactSize triggers an
+	// ErrArtifactTooLarge return BEFORE the Sync/Close/Rename block, so no
+	// canonical cache file is ever created for an oversize response. The
+	// existing defer (above) cleans the partial staging file.
+	limited := io.LimitReader(resp.Body, MaxArtifactSize+1)
+	if _, err := io.Copy(stagingFile, limited); err != nil {
 		stagingFile.Close()
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: write staging: %w", err)
+	}
+	info, err := stagingFile.Stat()
+	if err != nil {
+		stagingFile.Close()
+		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: stat staging: %w", err)
+	}
+	if info.Size() > MaxArtifactSize {
+		stagingFile.Close()
+		return fmt.Errorf("%w: peer response is %d bytes", ErrArtifactTooLarge, info.Size())
 	}
 	// fsync so the bytes are durable before we publish the rename.
 	if err := stagingFile.Sync(); err != nil {
