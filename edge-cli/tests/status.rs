@@ -26,16 +26,22 @@ mod common;
 /// the two test files share conventions — copy-paste rather than
 /// extract because the field set is tiny and the file boundary
 /// keeps test setup self-contained.
+///
+/// The `[project].name` is derived from `app_name` rather than
+/// hardcoded so the fixture is internally consistent (no future test
+/// that reads `[project].name` will be confused by a stale string).
 fn seed_project(project: &TempDir, app_name: &str) {
     std::fs::write(
         project.path().join("edge.toml"),
-        r#"[project]
-name = "statustest"
+        format!(
+            r#"[project]
+name = "{app_name}"
 version = "0.1.0"
 target = "wasm32-wasip2"
 
 [deployment]
-"#,
+"#
+        ),
     )
     .unwrap();
     std::fs::create_dir_all(project.path().join(".edge")).unwrap();
@@ -249,9 +255,12 @@ async fn status_runtime_falls_back_to_state_json_when_arg_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// Error path — 500 from `/status` surfaces as a non-zero exit and a
-// useful stderr message. Differs from `edge logs`' silent skip
-// because the user explicitly asked for the data.
+// Error path — 500 from `/status` surfaces as exit code 1 with the
+// status code AND body in the stderr. Differs from `edge logs`'
+// silent skip because the user explicitly asked for the data.
+// `Transient` errors (5xx, network) flow through `get_json_anyhow`'s
+// `source` branch — the underlying "server returned 500 ..." reaches
+// stderr verbatim.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -281,8 +290,49 @@ async fn status_runtime_propagates_500_with_exit_code_1() {
     cmd.arg("myapp");
 
     cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("runtime status"));
+        .code(1)
+        .stderr(predicate::str::contains("500"))
+        .stderr(predicate::str::contains("INTERNAL"));
+}
+
+// ---------------------------------------------------------------------------
+// Error path — 4xx from `/status` (e.g. NOT_FOUND) is flattened into
+// the top-frame error message via `get_json_anyhow`'s `Rejected`
+// branch: `runtime status failed: <status> <body>`. The op prefix
+// tells the user which call failed without forcing them to read a
+// `Caused by:` chain.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_runtime_propagates_404_with_flattened_error() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/status"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": {"code": "NOT_FOUND", "message": "no such app"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("status");
+    cmd.arg("runtime");
+    cmd.arg("myapp");
+
+    cmd.assert()
+        .code(1)
+        .stderr(predicate::str::contains("runtime status failed"))
+        .stderr(predicate::str::contains("NOT_FOUND"));
 }
 
 // ---------------------------------------------------------------------------
