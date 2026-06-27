@@ -133,6 +133,7 @@ func main() {
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
+	workerStatusHandler := handler.NewWorkerStatusHandler(workerSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -218,6 +219,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("DELETE /api/apps/{appName}/env/{key}", redirectTo("/api/v1/apps/"+"{appName}/env/"+"{key}"))
 	mux.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", redirectTo("/api/v1/apps/"+"{appName}/activate/"+"{deploymentID}"))
 	mux.HandleFunc("GET /api/apps/{appName}/logs", redirectTo("/api/v1/apps/"+"{appName}/logs"))
+	mux.HandleFunc("GET /api/apps/{appName}/status", redirectTo("/api/v1/apps/"+"{appName}/status"))
 	// Deploy & status
 	mux.HandleFunc("POST /api/deploy/{appName}", redirectTo("/api/v1/deploy/"+"{appName}"))
 	mux.HandleFunc("GET /api/status/{deploymentID}", redirectTo("/api/v1/status/"+"{deploymentID}"))
@@ -251,6 +253,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
 	api.HandleFunc("POST /api/v1/apps/{appName}/rollback", deploymentHandler.Rollback)
 	api.HandleFunc("GET /api/v1/apps/{appName}/active", deploymentHandler.GetActive)
+	api.HandleFunc("GET /api/v1/apps/{appName}/status", workerStatusHandler.Get)
 	api.HandleFunc("GET /api/v1/auth/whoami", authHandler.Whoami)
 	api.HandleFunc("POST /api/v1/apps/{appName}/env", envHandler.Set)
 	api.HandleFunc("GET /api/v1/apps/{appName}/env", envHandler.List)

@@ -389,6 +389,48 @@ components:
             to a specific ts in that case).
           example: 2026-06-24T11:55:00Z
 
+    AppWorkerStatus:
+      type: object
+      description: |
+        Tenant-facing projection of the worker-reported status of one
+        app, returned by `GET /api/v1/apps/{appName}/status`. `status`
+        is the same string the worker publishes in NATS heartbeats
+        (one of `running`, `starting`, `stopping`, `crashed`, `hung`),
+        plus `unknown` when no worker has reported on this app yet.
+
+        `last_heartbeat` is null when no worker has ever reported on
+        the app. There is no server-side TTL on heartbeats — a dead
+        worker leaves its last-known status behind indefinitely. The
+        client should treat a heartbeat older than a few minutes
+        (the worker default is 30s) as stale.
+      properties:
+        app_name:
+          type: string
+          example: myapp
+        status:
+          type: string
+          enum: [running, starting, stopping, crashed, hung, unknown]
+          example: running
+        last_heartbeat:
+          type: string
+          format: date-time
+          nullable: true
+          example: 2026-06-24T12:00:00Z
+        region:
+          type: string
+          example: us-east-1
+        worker_id:
+          type: string
+          example: w_us-east-1_h01
+        exit_code:
+          type: integer
+          format: int32
+          nullable: true
+          description: |
+            Process exit code from the worker's last observation of
+            this app. Set on `crashed` statuses, absent otherwise.
+          example: 137
+
     # -------------------------------------------------------------------------
     # Ingress
     # -------------------------------------------------------------------------
@@ -1317,6 +1359,47 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LogListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/status:
+    get:
+      operationId: getAppWorkerStatus
+      summary: Get the worker-reported status of an app
+      description: |
+        Returns the most recent worker-reported status for the named
+        app within the caller's tenant. The `status` field is the
+        same string the worker publishes in NATS heartbeats
+        (`running`, `starting`, `stopping`, `crashed`, `hung`), or
+        `unknown` when no worker has reported on this app yet.
+
+        A `crashed` status surfaces when the worker observed the
+        app's WASM component exit with a non-zero code or fail
+        health checks. The CLI's `edge logs` uses this status to
+        print a rollback hint when fresh (< 5 minutes old).
+
+        There is no server-side TTL on heartbeats — a dead worker
+        leaves its last-known status behind indefinitely. The
+        client should treat a `last_heartbeat` older than a few
+        minutes as stale.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Worker-reported status (or "unknown" if no worker has reported).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppWorkerStatus'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':

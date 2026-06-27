@@ -195,6 +195,34 @@ pub struct LogListResponse {
     pub since: String,
 }
 
+/// Worker-reported status of one app, returned by
+/// `GET /api/v1/apps/{appName}/status`. Mirrors the Go
+/// `domain.AppWorkerStatus` field-for-field.
+///
+/// `status` is the same string the worker publishes in NATS
+/// heartbeats (`running` | `starting` | `stopping` | `crashed` |
+/// `hung` | `unknown`). The CLI's `edge logs` uses
+/// `status == "crashed"` to decide whether to print the
+/// `edge rollback` hint (issue #77 §5).
+///
+/// `last_heartbeat` is `None` when no worker has reported on the
+/// app. The CLI treats a heartbeat older than 5 minutes as stale
+/// (the worker default is 30s) and suppresses the hint, because a
+/// stale `crashed` is more likely a dead worker than an actually
+/// crashed app.
+#[derive(Debug, Deserialize)]
+pub struct AppWorkerStatus {
+    pub app_name: String,
+    pub status: String,
+    /// RFC3339 timestamp; `None` when no worker has reported.
+    pub last_heartbeat: Option<String>,
+    pub region: String,
+    pub worker_id: String,
+    /// Process exit code from the worker's last observation.
+    /// `None` when not provided (e.g. running, hung, or unknown).
+    pub exit_code: Option<i32>,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -309,6 +337,19 @@ impl ApiClient {
     /// `GET /api/v1/apps/{appName}/logs`.
     pub fn logs(&self) -> Logs<'_> {
         Logs { client: self }
+    }
+
+    /// GET `/api/v1/apps/{appName}/status` — the worker's last reported
+    /// status for an app. Powers the `edge logs` crashed-hint (issue
+    /// #77 §5) and is a useful debugging primitive on its own.
+    ///
+    /// Returns `Result<AppWorkerStatus, ApiError>` so callers (e.g.
+    /// `edge logs`) can choose whether to fail loudly or silently
+    /// skip on a 4xx/5xx. The hint path uses the second form: a
+    /// failed status fetch must NOT prevent the log fetch from
+    /// proceeding, because logs are the user's actual goal.
+    pub fn get_app_status(&self, app_name: &str) -> Result<AppWorkerStatus, ApiError> {
+        self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
     }
 
     /// Upload a deployment artifact.

@@ -13,19 +13,20 @@
 //!   longer follow than that interactively.
 //! * TTY mode: pretty line per entry, ANSI-colored level.
 //! * Pipe mode: one JSON object per line (jq-friendly).
-//!
-//! No "app is crashed" hint: the deployment row's status is one of
-//! deployed / active / failed / migrated. The `crashed` value is a
-//! worker AppStatus published only via NATS heartbeats and is not
-//! yet exposed via a tenant-API endpoint. Once it is, re-introduce
-//! a stderr-only hint here so pipe-mode JSON output stays clean.
+//! * One-shot `crashed` hint: if a worker has reported the app as
+//!   `crashed` (issue #77 §5) within the last 5 minutes, we print a
+//!   `output::hint` line pointing at `edge rollback <app>`. The
+//!   hint is shown once at startup, not on every `--follow` tick —
+//!   the status endpoint is not polled during follow, so a
+//!   deployment that crashes mid-follow will not trigger the hint
+//!   until the user restarts the command.
 
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::state_io::load_state_optional;
 use crate::api::{ApiClient, LogEntry};
@@ -121,6 +122,14 @@ pub fn run(
 
     let is_tty = std::io::stdout().is_terminal();
     let since_rfc = rfc3339_in_past(since);
+
+    // Issue #77 §5: if a worker has reported the app as `crashed`
+    // within the last 5 minutes, prepend a hint pointing at
+    // `edge rollback <app>`. Done BEFORE the first `logs().list()`
+    // call so the hint appears above the user's first batch. In
+    // `--follow` mode the status endpoint is not polled again —
+    // this is a one-shot startup hint, by design.
+    maybe_print_crashed_hint(&client, &app_name);
 
     if follow {
         run_follow(&client, &app_name, &since_rfc, level, limit, is_tty)
@@ -326,6 +335,107 @@ fn format_utc_rfc3339(secs: u64) -> String {
 /// stays in one place.
 fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
     super::state_io::resolve_app_name("edge logs", app, state)
+}
+
+/// One-shot `crashed` hint for issue #77 §5. Called at the top of
+/// `run` for both the single-shot and `--follow` paths. Silently
+/// swallows every error: a missing or broken `/status` endpoint
+/// must never fail the `edge logs` command — the log query is the
+/// primary purpose, the hint is a courtesy.
+fn maybe_print_crashed_hint(client: &ApiClient, app_name: &str) {
+    let Ok(status) = client.get_app_status(app_name) else {
+        return;
+    };
+    if status.status == "crashed" && is_fresh(status.last_heartbeat.as_deref()) {
+        output::hint(&format!(
+            "deployment is crashed — run `edge rollback {app_name}` to roll back"
+        ));
+    }
+}
+
+/// Threshold for "the worker is still alive and just reported this".
+/// 5 minutes = heartbeat interval (30s, per whitepaper §5.6) × 10 —
+/// generous enough to tolerate a few missed heartbeats, tight enough
+/// that a dead worker stops emitting the hint within a few minutes.
+/// A stale crash is a deployment in an unknown state, not an
+/// actively-crashed one; we suppress the hint to avoid misleading
+/// the user.
+const STALE_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+
+/// Parse an RFC3339 timestamp and return true iff it is within
+/// `STALE_HEARTBEAT` of now. Returns false on any parse failure
+/// (missing field, malformed timestamp, clock skew) so a broken
+/// timestamp never produces a misleading hint.
+fn is_fresh(rfc3339: Option<&str>) -> bool {
+    let Some(s) = rfc3339 else {
+        return false;
+    };
+    let Ok(parsed) = chrono_parse_rfc3339(s) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let age = now - parsed;
+    age >= 0 && age <= STALE_HEARTBEAT.as_secs() as i64
+}
+
+/// Minimal RFC3339 parser for the subset the server emits:
+/// `YYYY-MM-DDTHH:MM:SSZ` (UTC, second precision, trailing `Z`).
+/// We parse it without pulling chrono because the CLI already
+/// formats RFC3339 timestamps with `format_utc_rfc3339` (seconds
+/// precision, trailing `Z`) — so any timestamp the server sends
+/// in response to `GET /status` is guaranteed to match this
+/// format. A more permissive parser (offsets, fractional seconds)
+/// would mask upstream changes; a stricter one would surface them
+/// as parse failures that the helper correctly swallows.
+fn chrono_parse_rfc3339(s: &str) -> Result<i64, ()> {
+    // Expected layout: "YYYY-MM-DDTHH:MM:SSZ" (17 bytes after
+    // subtracting the date and `Z`; total 20 bytes).
+    if s.len() != 20 {
+        return Err(());
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(());
+    }
+    let parse_u32 = |a: usize, c: usize| -> Result<u32, ()> {
+        let chunk = &s[a..c];
+        if !chunk.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        // We've already validated length and digits; unwrap is safe.
+        chunk.parse::<u32>().map_err(|_| ())
+    };
+    let year = parse_u32(0, 4)?;
+    let month = parse_u32(5, 7)?;
+    let day = parse_u32(8, 10)?;
+    let hour = parse_u32(11, 13)?;
+    let minute = parse_u32(14, 16)?;
+    let second = parse_u32(17, 19)?;
+
+    // Days-from-civil (Howard Hinnant). Adapted for the
+    // March-as-3 pivot to share math with `format_utc_rfc3339`.
+    let (m, y_adj) = if month <= 2 {
+        (month + 9, year - 1)
+    } else {
+        (month - 3, year)
+    };
+    let era = (y_adj as i64).div_euclid(400);
+    let yoe = (y_adj as i64 - era * 400) as u64; // [0, 399]
+    let doy = (153 * (m as u64) + 2) / 5 + (day as u64) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + (doe as i64) - 719_468;
+
+    let secs_of_day = (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+    Ok(days * 86_400 + secs_of_day)
 }
 
 // ---------------------------------------------------------------------------
