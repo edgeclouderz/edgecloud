@@ -10,48 +10,33 @@
 //! Skip in CI with: SKIP_INTEGRATION_TESTS=1 cargo test ...
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerRequest;
-use testcontainers::ImageExt;
 use testcontainers_modules::nats::Nats;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use edge_runtime::interfaces::observe::LogSink;
-use edge_worker::auth::WorkerJwtSigner;
-use edge_worker::config::Config;
-use edge_worker::downloader::Downloader;
-use edge_worker::log_forwarder::LogForwarder;
 use edge_worker::messages::{AppSpec, HeartbeatMessage, TaskMessage};
-use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
-use edge_worker::port_pool::PortPool;
-use edge_worker::state::{AppInstanceStatus, WorkerState};
+use edge_worker::state::AppInstanceStatus;
 use edge_worker::supervisor::Supervisor;
 
-// TODO(shared-test-harness): this helper is a byte-for-byte copy of the
-// same code in `edge-ingress/tests/integration.rs`. Extract both
-// `should_skip_integration_tests` and the testcontainers NATS startup
-// into a shared `edge-test-helpers` crate (workspace-relative) so a
-// future change to the test-skip policy or NATS startup contract lands
-// in one place.
-
-/// Returns true if integration tests should be skipped (e.g., in CI environments
-/// where Docker is unavailable or unreliable for container tests).
-fn should_skip_integration_tests() -> bool {
-    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
-        || !std::path::Path::new("/var/run/docker.sock").exists()
-}
+// Phase 2: `should_skip_integration_tests`, `nats_container`, and
+// `build_supervisor` were extracted to the `edge-test-helpers` crate.
+// Imported here so the rest of the test file can keep using the
+// un-prefixed names. Note: we don't import `build_supervisor` from
+// edge_test_helpers at module level because the file's own
+// `build_supervisor` (a 7-arg convenience wrapper used by the
+// multi-worker pinning test) would shadow it. The shared
+// `build_supervisor` is called via the full
+// `edge_test_helpers::build_supervisor(...)` path where needed.
+use edge_test_helpers::nats::{nats_container, should_skip_integration_tests};
 
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
@@ -75,37 +60,6 @@ fn test_component_hash() -> String {
 /// worker attaches. Production code uses `WORKER_JWT_SECRET` from env.
 const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret";
 
-/// Construct a `Config` matching the worker's runtime expectations, with the
-/// JWT fields populated to known test values.
-#[allow(dead_code)]
-fn test_config(
-    worker_id: &str,
-    region: &str,
-    nats_url: String,
-    control_plane_url: String,
-) -> Config {
-    Config {
-        worker_id: worker_id.to_string(),
-        region: region.to_string(),
-        nats_url,
-        control_plane_url,
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
-        heartbeat_interval_secs: 30,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: "test-group".to_string(),
-        consumer_name: format!("test-{}", worker_id),
-        worker_addr: "test-host:0".to_string(),
-        worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-    }
-}
-
 /// Timeout for subscribing to heartbeats.
 const HEARTBEAT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -124,6 +78,15 @@ const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 /// `cache_dir` is critical: a shared `/tmp/...` cache leaks state across
 /// tests, so a tampered-cache test would poison every later test that uses
 /// the same `deployment_id`.
+///
+/// Phase 2: this struct is kept as a thin convenience wrapper (not deleted
+/// as the original plan suggested) because every test needs three
+/// pieces of state set up together — the mock server, the NATS URL,
+/// and the supervisor. Inlining the setup into each of the 10+
+/// call sites would add ~70 LoC of boilerplate for ~30 LoC saved.
+/// The deduplication win comes from the inner now delegating to
+/// `edge_test_helpers::{nats_container, test_config, build_supervisor}`
+/// instead of carrying its own copies of each.
 pub struct TestHarness {
     pub nats_url: String,
     pub mock_server: MockServer,
@@ -149,21 +112,20 @@ impl TestHarness {
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
 
-        // Delegate supervisor wiring to the shared helper used by the
-        // multi-worker queue-group test so there is one canonical path
-        // for constructing a Supervisor in tests. The per-test tempdir
-        // is passed in so cache-poisoning tests don't leak state across
-        // the suite (test_cached_tampered_artifact_*).
-        let supervisor = build_supervisor(
-            &nats_url,
+        // Build a Config with the test defaults from edge-test-helpers,
+        // then override the per-test fields (cache_dir, queue_group,
+        // consumer_name) that the harness-specific setup needs.
+        let mut cfg = edge_test_helpers::test_config(
             "test-worker",
             "test-region",
-            "test-pinning-group",
-            "test-consumer",
-            &mock_server.uri(),
-            cache_dir.path(),
-        )
-        .await?;
+            nats_url.clone(),
+            mock_server.uri(),
+        );
+        cfg.cache_dir = cache_dir.path().to_path_buf();
+        cfg.queue_group = "test-pinning-group".to_string();
+        cfg.consumer_name = "test-consumer".to_string();
+
+        let supervisor = edge_test_helpers::build_supervisor(cfg).await?;
 
         Ok(Self {
             nats_url,
@@ -179,27 +141,10 @@ impl TestHarness {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Start a NATS container and return (container, url).
-///
-/// Uses a simple duration-based wait instead of the built-in stderr matching,
-/// which can be unreliable in CI where NATS log messages may appear out of order.
-/// A hard startup_timeout bounds the total wait so the test fails fast on error.
-async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
-        .with_startup_timeout(std::time::Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration {
-            length: std::time::Duration::from_secs(5),
-        }])
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("get NATS port");
-    (container, format!("{}:{}", host, port))
-}
+// `nats_container` was extracted to `edge_test_helpers::nats::nats_container`
+// (Phase 2). It was previously inlined here as a byte-identical copy of the
+// helper in `edge-worker/tests/ingress_wire_integration.rs` and
+// `edge-ingress/tests/integration.rs`.
 
 /// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
 async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<HeartbeatMessage> {
@@ -342,69 +287,26 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     let (container, nats_url) = nats_container().await;
     std::mem::forget(container); // keep alive for test; dropped when test fn returns
 
-    let config = Config {
-        worker_id: "test-worker".to_string(),
-        region: "test-region".to_string(),
-        worker_addr: "test-host:0".to_string(),
-        nats_url: nats_url.clone(),
-        control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
-        heartbeat_interval_secs: 30,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: "test-heartbeat-group".to_string(),
-        consumer_name: "test-heartbeat-consumer".to_string(),
-        worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-    };
-
-    let engine = edge_runtime::create_engine().context("create engine")?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
+    // Phase 2: build the Config via the shared test_config factory,
+    // then override the per-test fields (queue_group, consumer_name,
+    // worker_jwt_secret). The defaults for the rest come from
+    // edge_test_helpers::test_config — same values the inline literal
+    // used, so this is a pure refactor (no behavioral change).
+    let mut config = edge_test_helpers::test_config(
+        "test-worker",
+        "test-region",
+        nats_url.clone(),
+        "http://localhost:9999".to_string(),
     );
+    config.queue_group = "test-heartbeat-group".to_string();
+    config.consumer_name = "test-heartbeat-consumer".to_string();
+    // This test specifically exercises the JWT round-trip
+    // (test_emit_log_reaches_log_ingest_endpoint decodes the token the
+    // worker emits), so use the canonical TEST_JWT_SECRET instead of
+    // the "test-secret" placeholder default.
+    config.worker_jwt_secret = String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap();
 
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-
-    let nats = Arc::new(
-        NatsClientImpl::connect(&nats_url)
-            .await
-            .context("connect nats")?,
-    ) as Arc<dyn NatsClientTrait>;
-
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer,
-    );
-
-    let supervisor = Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-    });
+    let supervisor = edge_test_helpers::build_supervisor(config).await?;
 
     // Build and publish a heartbeat manually
     let heartbeat = supervisor.build_heartbeat().await;
@@ -494,6 +396,15 @@ async fn test_stop_all_apps() {
 /// cache-poisoning tests) can be plumbed through. Pass
 /// `Path::new("/tmp/edge-worker-test-cache")` for tests that don't care
 /// about cache isolation.
+///
+/// Phase 2: this is now a thin wrapper around the shared
+/// `edge_test_helpers::{test_config, build_supervisor}` so a future
+/// `Config` field change only touches one site. Kept as a wrapper (not
+/// removed) because the multi-worker queue-group test and the harness
+/// both call it with the same 7-arg signature — collapsing the call
+/// sites into direct `build_supervisor(test_config(...))` calls would
+/// either repeat the per-test overrides 10+ times or force a builder
+/// pattern that obscures the call.
 async fn build_supervisor(
     nats_url: &str,
     worker_id: &str,
@@ -503,64 +414,22 @@ async fn build_supervisor(
     control_plane_url: &str,
     cache_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<Supervisor>> {
-    let config = Config {
-        worker_id: worker_id.to_string(),
-        region: region.to_string(),
-        worker_addr: "test-host:0".to_string(),
-        nats_url: nats_url.to_string(),
-        control_plane_url: control_plane_url.to_string(),
-        cache_dir: cache_dir.to_path_buf(),
-        heartbeat_interval_secs: 30,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: queue_group.to_string(),
-        consumer_name: consumer_name.to_string(),
-        // JWT secret + tenant id are required by Config::from_env but in
-        // tests we construct Config directly and never hit the auth path
-        // against a real control plane (the mock server accepts anything
-        // on /api/internal/*). Any non-empty placeholder works.
-        worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-    };
+    // Start from the shared test defaults, then layer the per-call
+    // overrides (cache_dir for the tempdir, queue_group/consumer_name
+    // for the multi-worker pinning test). Defaults for the other fields
+    // (worker_addr, port ranges, JWT placeholders) come from
+    // `test_config` and are documented in `edge-test-helpers`.
+    let mut cfg = edge_test_helpers::test_config(
+        worker_id,
+        region,
+        nats_url.to_string(),
+        control_plane_url.to_string(),
+    );
+    cfg.cache_dir = cache_dir.to_path_buf();
+    cfg.queue_group = queue_group.to_string();
+    cfg.consumer_name = consumer_name.to_string();
 
-    let engine = edge_runtime::create_engine()?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-    let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer,
-    );
-    Ok(Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-    }))
+    edge_test_helpers::build_supervisor(cfg).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,4 +1033,228 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     assert_eq!(entry["message"], "hello from worker");
     assert_eq!(entry["labels"]["request_id"], "abc");
     assert_eq!(entry["labels"]["path"], "/api/foo");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: log_forwarder spool durability
+// ---------------------------------------------------------------------------
+//
+// The two tests below exercise the worker's end-to-end log durability
+// pipeline: a control-plane outage must spool the failed batch to disk,
+// and a fresh worker on startup must replay the spool contents into the
+// in-memory buffer before the flush loop kicks in. Both run against a
+// wiremock server (no NATS, no real control plane) so they can run
+// without Docker on the developer machine.
+//
+// They construct a `LogForwarder` directly with a tempdir-backed spool
+// — the supervisor-level wiring is already covered by
+// `test_emit_log_reaches_log_ingest_endpoint` above.
+//
+// `edge_test_helpers::build_supervisor` is intentionally NOT used here:
+// these tests want a fresh per-test spool (not the shared
+// `/tmp/edge-worker-test-spool` that the harness opens). A fresh
+// `TempDir` per test prevents cross-test contamination.
+
+#[tokio::test]
+#[allow(deprecated)] // WorkerJwtSigner::new is deprecated; test predates bootstrap
+async fn test_log_forwarder_survives_outage() {
+    use edge_runtime::interfaces::observe::{AppLogContext, LogLevel, LogRecord};
+    use edge_spool::Spool;
+    use edge_worker::auth::WorkerJwtSigner;
+    use edge_worker::log_forwarder::LogForwarder;
+
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    // Wiremock returns 503 for every POST. We don't try to switch to
+    // 204 mid-test (wiremock priority + expect() behavior is fragile);
+    // the unit test `flush_2xx_leaves_spool_empty` covers the recovery
+    // half. This test proves the failure half: a sustained outage
+    // spools the batch instead of dropping it.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/internal/logs"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    // Fresh per-test spool.
+    let spool_dir = tempfile::TempDir::new().expect("tempdir");
+    let spool = Arc::new(Spool::open(spool_dir.path()).await.expect("open spool"));
+
+    let signer = WorkerJwtSigner::new(
+        b"test-secret".to_vec(),
+        "edgecloud",
+        "w_test",
+        "test-region",
+        "t_test",
+    );
+    let f = LogForwarder::new(
+        mock_server.uri(),
+        "w_test",
+        "test-region",
+        signer,
+        spool.clone(),
+        1u64 << 30,
+    )
+    .await;
+
+    let record = LogRecord {
+        timestamp_ms: 0,
+        level: LogLevel::Info,
+        message: "during-outage".to_string(),
+        labels: vec![],
+    };
+    let ctx = AppLogContext {
+        app_name: "outage-app".to_string(),
+        tenant_id: "t_test".to_string(),
+        deployment_id: "d_outage".to_string(),
+    };
+    f.push(record, ctx);
+    f.flush_now().await;
+
+    // The POST reached the mock once.
+    let received = mock_server.received_requests().await.expect("received");
+    let posts: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/api/internal/logs" && r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1, "expected one POST during outage");
+
+    // The 503 response triggered `persist_failure` → spool append.
+    // The in-memory buffer is drained (drain happens at swap time,
+    // before the POST) and the spool now holds the failed batch.
+    let drained = spool.drain().await.expect("drain spool");
+    assert_eq!(
+        drained.len(),
+        1,
+        "outage must leave the failed batch in the spool"
+    );
+    let batch: serde_json::Value = drained.into_iter().next().unwrap();
+    let entries = batch["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "during-outage");
+}
+
+#[tokio::test]
+#[allow(deprecated)] // WorkerJwtSigner::new is deprecated; test predates bootstrap
+async fn test_log_forwarder_survives_worker_restart() {
+    use edge_spool::Spool;
+    use edge_worker::auth::WorkerJwtSigner;
+    use edge_worker::log_forwarder::LogForwarder;
+
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    // Wiremock returns 204 for every POST. After restart, the new
+    // LogForwarder should replay the spool contents and POST each
+    // pending batch.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/internal/logs"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2) // exactly 2 — one per replayed batch
+        .mount(&mock_server)
+        .await;
+
+    // Build a fresh spool and pre-populate it with two batches.
+    // This simulates "the previous worker crashed with two batches
+    // unsent on disk".
+    let spool_dir = tempfile::TempDir::new().expect("tempdir");
+    let spool = Spool::open(spool_dir.path()).await.expect("open spool");
+
+    let batch_1 = serde_json::json!({
+        "entries": [{
+            "tenant_id": "t_test",
+            "deployment_id": "d_xyz",
+            "app_name": "my-app",
+            "worker_id": "w_test",
+            "region": "test-region",
+            "level": "info",
+            "message": "from-run-1",
+            "labels": {},
+        }]
+    });
+    let batch_2 = serde_json::json!({
+        "entries": [{
+            "tenant_id": "t_test",
+            "deployment_id": "d_xyz",
+            "app_name": "my-app",
+            "worker_id": "w_test",
+            "region": "test-region",
+            "level": "warn",
+            "message": "from-run-1-too",
+            "labels": {},
+        }]
+    });
+    spool.append(&batch_1).await.expect("append batch 1");
+    spool.append(&batch_2).await.expect("append batch 2");
+    assert!(
+        spool.size() > 0,
+        "spool should have content before restart simulation"
+    );
+
+    // Build a fresh LogForwarder pointing at the same spool. The
+    // constructor's `replay_spool` should drain the two pending
+    // batches into the in-memory buffer.
+    let spool = Arc::new(spool);
+    let signer = WorkerJwtSigner::new(
+        b"test-secret".to_vec(),
+        "edgecloud",
+        "w_test",
+        "test-region",
+        "t_test",
+    );
+    let f = LogForwarder::new(
+        mock_server.uri(),
+        "w_test",
+        "test-region",
+        signer,
+        spool.clone(),
+        1u64 << 30,
+    )
+    .await;
+
+    // Flush the replayed buffer to the control plane. Replay is
+    // proven by the wiremock POSTs below — if replay didn't run,
+    // the buffer would be empty and the mock would receive 0 POSTs.
+    f.flush_now().await;
+
+    // Wiremock received exactly 2 POSTs.
+    let received = mock_server.received_requests().await.expect("received");
+    let posts: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/api/internal/logs" && r.method == "POST")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        2,
+        "expected exactly 2 POSTs (one per replayed batch), got {}",
+        posts.len()
+    );
+
+    // Spool is empty — replay drained it, flush succeeded.
+    let drained = spool.drain().await.expect("drain");
+    assert!(
+        drained.is_empty(),
+        "spool must be empty after successful replay + flush"
+    );
+
+    // Both messages reached the control plane.
+    let messages: Vec<String> = posts
+        .iter()
+        .map(|r| {
+            let parsed: serde_json::Value = serde_json::from_slice(&r.body).expect("body is JSON");
+            parsed["entries"][0]["message"]
+                .as_str()
+                .expect("entry.message")
+                .to_string()
+        })
+        .collect();
+    assert!(messages.contains(&"from-run-1".to_string()));
+    assert!(messages.contains(&"from-run-1-too".to_string()));
 }
