@@ -149,6 +149,17 @@ func TestActivate_PublishFailed_Returns502(t *testing.T) {
 	if _, ok := top["regions_failed"]; !ok {
 		t.Errorf("body missing top-level regions_failed: %s", rr.Body.String())
 	}
+	// Body must not leak the sentinel or the raw NATS error. Sibling
+	// 502 tests in deployment_rollback_test.go and
+	// internal_auto_rollback_test.go carry the same assertions; restoring
+	// them here means a future regression that adds err.Error() to the
+	// message field will fail the activate path too.
+	if strings.Contains(rr.Body.String(), "nats unreachable") {
+		t.Errorf("body leaks raw error: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
 }
 
 // TestActivate_PublishFailed_TypedError_SurfacesRegionBreakdown covers
@@ -193,6 +204,13 @@ func TestActivate_PublishFailed_TypedError_SurfacesRegionBreakdown(t *testing.T)
 	}
 	if got, want := top.RegionsFailed, []string{"eu-west"}; !equalStrings(got, want) {
 		t.Errorf("regions_failed = %v, want %v", got, want)
+	}
+	// Body must not leak the sentinel or the raw wrapped error even on
+	// the typed-error path. Mirrors the negative assertions in the
+	// sibling 502 tests (deployment_rollback_test.go:205-211 and
+	// internal_auto_rollback_test.go:258-263).
+	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
 	}
 }
 
