@@ -4,6 +4,28 @@
  */
 
 export interface paths {
+    "/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Prometheus metrics scrape endpoint (all tenants)
+         * @description Returns Prometheus text-format (0.0.4) metrics for all tenants.
+         *     Unauthenticated — intended for internal operator/Prometheus scrape access
+         *     only. Do not expose on the public load balancer.
+         */
+        get: operations["getAllMetrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -425,6 +447,28 @@ export interface paths {
          * @description Replaces the tenant's allowlist and immediately republishes TaskMessages to all running workers so they enforce the new policy without a manual re-activate. An empty array clears the list (allow-all). A non-empty array restricts outbound HTTP to only the listed hostnames or wildcard patterns (e.g. `api.stripe.com`, `*.sendgrid.net`).
          */
         put: operations["updateEgressAllowlist"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Prometheus metrics for the authenticated tenant
+         * @description Returns Prometheus text-format (0.0.4) metrics for the calling tenant only.
+         *     Includes request counts, outbound bytes, and any guest-emitted counters,
+         *     gauges, and histogram samples from `edge:observe`.
+         */
+        get: operations["getTenantMetrics"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -1112,6 +1156,26 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getAllMetrics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Prometheus text-format metrics */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
     health: {
         parameters: {
             query?: never;
@@ -1920,6 +1984,27 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
+        };
+    };
+    getTenantMetrics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Prometheus text-format metrics for this tenant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
         };
     };
     listTenants: {
