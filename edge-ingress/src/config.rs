@@ -52,7 +52,6 @@ pub struct Config {
     pub service_token: String,
     /// How often to poll `/api/internal/domains` (default 30s).
     pub domain_poll_interval: Duration,
-
 }
 
 impl Config {
@@ -78,7 +77,6 @@ impl Config {
     ///   `CONTROL_PLANE_URL` is set)
     /// - `DOMAIN_POLL_INTERVAL` (default: 30s; parsed as a Go-style
     ///   duration string, e.g. `30s`, `1m`, `500ms`)
-
     pub fn from_env() -> anyhow::Result<Self> {
         let control_plane_url = std::env::var("CONTROL_PLANE_URL").unwrap_or_default();
         let service_token = std::env::var("INGRESS_SERVICE_TOKEN").unwrap_or_default();
@@ -118,7 +116,6 @@ impl Config {
             control_plane_url,
             service_token,
             domain_poll_interval,
-
         })
     }
 }

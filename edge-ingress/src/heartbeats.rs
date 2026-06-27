@@ -45,7 +45,7 @@ pub async fn run(
         .with_context(|| format!("connecting to NATS at {}", cfg.nats_url))?;
     info!(url = %cfg.nats_url, region = %cfg.region, "connected to NATS");
 
-// Spawn the renderer + the periodic pruner. Both share the same
+    // Spawn the renderer + the periodic pruner. Both share the same
     // `Notify` flag (passed in by the caller) so we collapse bursts of
     // heartbeats into a single Caddy reload.
 

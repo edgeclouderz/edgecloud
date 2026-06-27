@@ -408,6 +408,8 @@ mod tests {
             control_plane_url: String::new(),
             service_token: "ignored".into(),
             domain_poll_interval: Duration::from_secs(30),
+            control_plane_api_url: "http://localhost:8080".into(),
+            internal_token: None,
         };
         let table = std::sync::Arc::new(RoutingTable::new());
         let notify = std::sync::Arc::new(Notify::new());
@@ -582,6 +584,8 @@ mod tests {
             control_plane_url,
             service_token: "stale-token".into(),
             domain_poll_interval: poll,
+            control_plane_api_url: "http://localhost:8080".into(),
+            internal_token: None,
         }
     }
 }

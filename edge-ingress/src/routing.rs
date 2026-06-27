@@ -27,7 +27,6 @@
 //! upstream; that's it. The 30s poller handles FQDN membership; the
 //! heartbeat handles upstream freshness.
 
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -513,7 +512,6 @@ mod tests {
         // Final state: 2 bindings, the survivors.
         let snap = t.fqdn_snapshot().await;
         assert_eq!(snap.len(), 2);
-
     }
 
     /// Regression test for PR #133 review finding #2: the two-phase
