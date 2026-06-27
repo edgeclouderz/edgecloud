@@ -27,6 +27,7 @@ type appRepoInterface interface {
 	// Added for the v2 quota-race fix in AddDomain (issue #83 second-pass
 	// review); the lock is held for the caller's tx lifetime.
 	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error)
 }
 
 // AppService handles app business logic.
@@ -308,4 +309,19 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		return fmt.Errorf("creating app: %w", err)
 	}
 	return nil
+}
+
+// DeleteIfNoDeployments removes the apps row for (tenantID, appName)
+// only when zero deployments exist for that app. Used by
+// DeploymentService.Deploy as a compensating write when the first
+// deploy of an app fails at the artifact save step — CreateIfNotExists
+// has already inserted the apps row, and we don't want to leave it
+// orphaned with zero deployments.
+//
+// The conditional DELETE is safe to call concurrently with other
+// deploys: if any deployment exists (succeeded, failed, or in
+// flight), the call is a no-op. Best-effort — callers should log
+// the error and proceed, not fail the request.
+func (s *AppService) DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error) {
+	return s.appRepo.DeleteIfNoDeployments(ctx, tenantID, appName)
 }

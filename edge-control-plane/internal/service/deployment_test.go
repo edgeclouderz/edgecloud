@@ -350,3 +350,90 @@ func TestDeploy_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
 		t.Errorf("sqlmock expectations not met (the compensating DELETE may not have been issued): %v", err)
 	}
 }
+
+// TestDeploy_ArtifactSaveFailure_RollsBackAppsRowToo verifies the
+// second tier of compensating writes: when the artifact save fails
+// after CreateIfNotExists has just inserted an apps row (i.e. this
+// is the first deploy of the app), the apps row must also be
+// cleaned up — but only if no other deployment succeeded for this
+// app, otherwise we'd corrupt a working app. The conditional DELETE
+// `NOT EXISTS (SELECT 1 FROM deployments ...)` is implemented at
+// repository level; this test exercises the service-level wiring.
+//
+// We exercise this by setting sqlmock expectations for the
+// deployment INSERT, the compensating deployment DELETE, AND the
+// apps-row cleanup DELETE. Artifact save fails at MkdirAll because
+// the parent is a file, not a directory. CreateIfNotExists takes
+// the no-lock path (s.db == nil) so we don't have to mock the
+// quota SELECT FOR UPDATE — quotaRepo is replaced with a stub.
+func TestDeploy_ArtifactSaveFailure_RollsBackAppsRowToo(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	// CreateIfNotExists: count-by-tenant (under the SELECT FOR UPDATE tx).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"xmax"}).AddRow(true))
+
+	// DeploymentService.Deploy: quota + count lookups, deployment
+	// INSERT, compensating DELETE.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// Apps-row compensating DELETE — guarded by NOT EXISTS so it's
+	// a no-op if any deployment exists. The conditional means the
+	// query string contains both the DELETE and the subquery.
+	// Fired BEFORE the deployment-row DELETE because the Deploy
+	// rollback calls appSvc.DeleteIfNoDeployments first, then
+	// rollbackArtifactSave which calls repo.DeleteByID. The repo
+	// method uses GetContext with `RETURNING true`, so this is a
+	// Query, not an Exec.
+	mock.ExpectQuery(regexp.QuoteMeta(`DELETE FROM apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deployments`)).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Artifact save fails at MkdirAll because the parent is a file.
+	tmpDir := t.TempDir()
+	blocker := tmpDir + "/blocker"
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	badDir := blocker + "/subdir"
+
+	// AppService with a real *AppRepository over the same sqlmock DB
+	// so the DELETE FROM apps in the rollback fires against the
+	// mocked connection. s.db is left nil so CreateIfNotExists
+	// takes the test (no-FOR-UPDATE) path — avoids having to mock
+	// BEGIN / SELECT FROM tenants FOR UPDATE / COMMIT. quotaRepo is
+	// a stub returning a generous quota.
+	appSvc := &AppService{
+		appRepo:   repository.NewAppRepository(db),
+		quotaRepo: &mockQuotaRepoForApps{},
+	}
+
+	svc := &DeploymentService{
+		deploymentRepo: repository.NewDeploymentRepository(db),
+		quotaRepo:      repository.NewQuotaRepository(db),
+		artifactStore:  storage.NewArtifactStore(badDir),
+		appSvc:         appSvc,
+	}
+
+	good := bytes.NewReader(validWasmBytes)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	if err == nil {
+		t.Fatal("expected Deploy to fail when artifact save fails")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (the apps-row compensating DELETE may not have been issued): %v", err)
+	}
+}

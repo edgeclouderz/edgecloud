@@ -354,14 +354,22 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
 
-// Save artifact. On failure the rollback helper removes the
-	// deployment row we just inserted and any partial blob Save
-	// may have left on disk (Save is non-atomic). We inline the
-	// rollback here rather than call rollbackArtifactSave because
-	// the production s.artifactStore is the ctx-aware
-	// storage.ArtifactStore, while rollbackArtifactSave takes the
-	// non-ctx service.ArtifactStoreInterface.
+// Save artifact. On failure the rollback removes the deployment
+	// row we just inserted and any partial blob Save may have left on
+	// disk (Save is non-atomic). If this was the first deploy of the
+	// app (so CreateIfNotExists above just inserted the apps row),
+	// also clean up the apps row via DeleteIfNoDeployments —
+	// best-effort, since an apps row with zero deployments is a soft
+	// orphan, not a hard leak. We inline the row/blob rollback rather
+	// than call rollbackArtifactSave because the production
+	// s.artifactStore is the ctx-aware storage.ArtifactStore, while
+	// rollbackArtifactSave takes the non-ctx service.ArtifactStoreInterface.
 	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
+		if s.appSvc != nil {
+			if _, delErr := s.appSvc.DeleteIfNoDeployments(ctx, tenantID, appName); delErr != nil {
+				log.Printf("rollback apps-row cleanup failed after artifact save error: tenant_id=%s app_name=%s error=%v", tenantID, appName, delErr)
+			}
+		}
 		if delErr := s.deploymentRepo.DeleteByID(ctx, deployment.ID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", deployment.ID, delErr)
 		}
