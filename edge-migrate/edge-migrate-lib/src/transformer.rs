@@ -103,7 +103,12 @@ impl Transformer {
         // `manual_review` rather than slicing an inverted range and
         // panicking.
         let mut sorted = transformable;
-        sorted.sort_by_key(|m| (m.original_start_byte, std::cmp::Reverse(m.original_end_byte)));
+        sorted.sort_by_key(|m| {
+            (
+                m.original_start_byte,
+                std::cmp::Reverse(m.original_end_byte),
+            )
+        });
 
         let source_bytes = source.as_bytes();
 
@@ -160,10 +165,7 @@ impl Transformer {
             // with `prev_end > orig_start` would panic. Route to
             // `manual_review` instead — the surrounding emit has
             // already covered the original source content.
-            if orig_end > source_bytes.len()
-                || orig_start > orig_end
-                || orig_start < prev_end
-            {
+            if orig_end > source_bytes.len() || orig_start > orig_end || orig_start < prev_end {
                 tracing::warn!(
                     "skipping match that overlaps a prior emit (orig_start={}, orig_end={}, prev_end={}, source_len={}); routing to manual_review",
                     orig_start,
@@ -1117,7 +1119,9 @@ int main() {
             result.transformed_source
         );
         assert!(
-            !result.transformed_source.contains("wasi_ip_name_lookup_resolve"),
+            !result
+                .transformed_source
+                .contains("wasi_ip_name_lookup_resolve"),
             "G3: wasi_ip_name_lookup_resolve emit must NOT appear; got:\n{}",
             result.transformed_source
         );
@@ -1209,8 +1213,7 @@ int main() {
             if let Some(bv) = socket_match.bound_var.as_ref() {
                 let decl_slice =
                     &source_bytes[bv.original_decl_start_byte..bv.original_decl_end_byte];
-                let decl_str = std::str::from_utf8(decl_slice)
-                    .expect("decl slice is valid UTF-8");
+                let decl_str = std::str::from_utf8(decl_slice).expect("decl slice is valid UTF-8");
                 // The slice must start at the type prefix (no leading
                 // whitespace, no `;` from a previous statement) and
                 // end at the statement-terminating `;`.

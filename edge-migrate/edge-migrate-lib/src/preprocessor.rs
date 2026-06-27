@@ -296,11 +296,7 @@ fn build_line_map(text: &str, filename_hint: &str) -> Vec<u32> {
 /// at file boundaries, not at every source line, so a match on a
 /// synthetic line is not remappable. Single-line matches on user-file
 /// lines are exact.
-fn build_byte_map(
-    expanded_text: &str,
-    line_map: &[u32],
-    original_source: &str,
-) -> Vec<(u32, u32)> {
+fn build_byte_map(expanded_text: &str, line_map: &[u32], original_source: &str) -> Vec<(u32, u32)> {
     // Precompute original-source line starts: line_starts_orig[0] = 0,
     // line_starts_orig[i] = byte offset of the i-th line (0-indexed).
     // A line starts at the byte after each `\n` in the original.
@@ -340,8 +336,6 @@ fn build_byte_map(
     }
     result
 }
-
-
 
 /// Heuristic count of `#define` directives in the original source.
 /// Used for `PreprocessorInfo.macros_expanded` — not exact, but a
@@ -597,9 +591,21 @@ foo
         let byte_map = build_byte_map(text, &line_map, original);
         // Synthetic linemarker lines (entries 0, 2, 4) get u32::MAX
         // for the original byte.
-        assert_eq!(byte_map[0].1, u32::MAX, "linemarker line should be synthetic");
-        assert_eq!(byte_map[2].1, u32::MAX, "linemarker line should be synthetic");
-        assert_eq!(byte_map[4].1, u32::MAX, "linemarker line should be synthetic");
+        assert_eq!(
+            byte_map[0].1,
+            u32::MAX,
+            "linemarker line should be synthetic"
+        );
+        assert_eq!(
+            byte_map[2].1,
+            u32::MAX,
+            "linemarker line should be synthetic"
+        );
+        assert_eq!(
+            byte_map[4].1,
+            u32::MAX,
+            "linemarker line should be synthetic"
+        );
         // User-file source lines map to actual byte offsets in the
         // original source. line_map[1]=1 → byte 0; line_map[3]=3 → byte 27.
         assert_eq!(byte_map[1].1, 0, "line 1 maps to original byte 0");
@@ -631,6 +637,7 @@ foo
         assert_eq!(byte_map[3], (29, 29));
     }
 
+    #[test]
     fn test_parse_linemarker_basic() {
         let (n, f) = parse_linemarker("# 1 \"foo.c\"").unwrap();
         assert_eq!(n, 1);
