@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -407,15 +408,18 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("creating deployment record: %w", err)
 	}
 
-	// Store wasm artifact
+// Store wasm artifact. On failure, remove both the deployment row
+	// we just inserted and any partial blob Save may have left on
+	// disk (Save is non-atomic). We inline the rollback rather than
+	// call rollbackArtifactSave because the production s.artifactStore
+	// is the ctx-aware storage.ArtifactStore, while rollbackArtifactSave
+	// takes the non-ctx service.ArtifactStoreInterface.
 	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		// Compensating write: remove the row we just inserted so we
-		// don't leave a deployment pointing at no artifact. Log the
-		// rollback error (don't swallow) but return the original
-		// save error to preserve the handler's existing error
-		// mapping.
 		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
 		}
 		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
@@ -902,14 +906,14 @@ func (s *MigrationService) MigrateTree(
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
+// See the rollback comment in MigrationService.Migrate for why
+	// both the row and any partial blob are cleaned up here.
 	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		// Compensating write: remove the row we just inserted so we
-		// don't leave a deployment pointing at no artifact. Log the
-		// rollback error (don't swallow) but return the original
-		// save error to preserve the handler's existing error
-		// mapping.
 		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
 		}
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}

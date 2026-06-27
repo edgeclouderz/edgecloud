@@ -56,6 +56,12 @@ type mockArtifactStore struct {
 	// saveErr makes Save return this error if non-nil. Used by the
 	// rollback tests to trigger the compensating-write path.
 	saveErr error
+	// deleteCalls records each Delete invocation. Used by the
+	// rollback tests to assert the artifact-blob compensating write
+	// fired (not just the row delete).
+	deleteCalls []string
+	// deleteErr returns this error from Delete if non-nil.
+	deleteErr error
 }
 
 func newMockArtifactStore() *mockArtifactStore {
@@ -84,7 +90,12 @@ func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploym
 }
 
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
-	delete(m.artifacts, tenantID+"/"+appName+"/"+deploymentID)
+	key := tenantID + "/" + appName + "/" + deploymentID
+	m.deleteCalls = append(m.deleteCalls, key)
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	delete(m.artifacts, key)
 	return nil
 }
 
@@ -999,5 +1010,71 @@ func TestMigrate_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
 	if len(repo.deleteCalls) != 1 {
 		t.Errorf("expected DeleteByID to be called once, got %d calls",
 			len(repo.deleteCalls))
+	}
+	// The artifact blob must also be cleaned up. Save never
+	// succeeded (saveErr returned immediately), so Delete is
+	// expected to fire as the second half of the rollback symmetry.
+	if len(store.deleteCalls) != 1 {
+		t.Errorf("expected artifact.Delete to be called once, got %d calls",
+			len(store.deleteCalls))
+	}
+}
+
+// TestRollbackArtifactSave_DeletesRowAndBlob exercises the helper
+// directly without invoking the migration subprocess. This locks the
+// "both DeleteByID and Delete fire" contract for every caller of
+// rollbackArtifactSave (Migrate, MigrateTree, Deploy) without
+// needing edge-migrate + clang on PATH — covering the case where
+// the existing TestMigrate_ArtifactSaveFailure_RollsBackDeployment
+// would otherwise skip silently on CI.
+func TestRollbackArtifactSave_DeletesRowAndBlob(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	saveErr := errors.New("disk full (test)")
+
+	gotErr := rollbackArtifactSave(context.Background(), repo, store,
+		"tenant-1", "myapp", "d_abc", saveErr)
+
+	if gotErr == nil {
+		t.Fatal("expected rollback to return the wrapped save error")
+	}
+	if !errors.Is(gotErr, saveErr) {
+		t.Errorf("returned error %v does not wrap saveErr %v", gotErr, saveErr)
+	}
+	if !strings.Contains(gotErr.Error(), "saving artifact") {
+		t.Errorf("returned error %q does not include wrap verb", gotErr.Error())
+	}
+	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != "d_abc" {
+		t.Errorf("DeleteByID calls = %v, want [d_abc]", repo.deleteCalls)
+	}
+	if len(store.deleteCalls) != 1 {
+		t.Errorf("artifact.Delete calls = %d, want 1", len(store.deleteCalls))
+	}
+}
+
+// TestRollbackArtifactSave_TolerantOfDeleteErrors verifies that a
+// failing DeleteByID or artifact.Delete does NOT mask the original
+// save error — the caller still sees the underlying disk-full (or
+// whatever) reason, and the inner rollback error is logged but not
+// surfaced. Without this guarantee the helper would either change
+// the error mapping at every call site or silently swallow real
+// cleanup failures.
+func TestRollbackArtifactSave_TolerantOfDeleteErrors(t *testing.T) {
+	repo := &mockDeploymentRepo{deleteErr: errors.New("db gone (test)")}
+	store := &mockArtifactStore{deleteErr: errors.New("fs gone (test)")}
+	saveErr := errors.New("disk full (test)")
+
+	gotErr := rollbackArtifactSave(context.Background(), repo, store,
+		"tenant-1", "myapp", "d_abc", saveErr)
+
+	if !errors.Is(gotErr, saveErr) {
+		t.Errorf("returned error %v does not wrap saveErr %v", gotErr, saveErr)
+	}
+	// Both Delete calls must still have been attempted.
+	if len(repo.deleteCalls) != 1 {
+		t.Errorf("DeleteByID calls = %d, want 1 (attempt even on failure)", len(repo.deleteCalls))
+	}
+	if len(store.deleteCalls) != 1 {
+		t.Errorf("artifact.Delete calls = %d, want 1 (attempt even on failure)", len(store.deleteCalls))
 	}
 }

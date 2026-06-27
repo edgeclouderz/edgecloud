@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -353,15 +354,19 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
 
-	// Save artifact
+// Save artifact. On failure the rollback helper removes the
+	// deployment row we just inserted and any partial blob Save
+	// may have left on disk (Save is non-atomic). We inline the
+	// rollback here rather than call rollbackArtifactSave because
+	// the production s.artifactStore is the ctx-aware
+	// storage.ArtifactStore, while rollbackArtifactSave takes the
+	// non-ctx service.ArtifactStoreInterface.
 	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
-		// Compensating write: remove the row we just inserted so we
-		// don't leave a deployment pointing at no artifact. Log the
-		// rollback error (don't swallow) but return the original
-		// save error to preserve the handler's existing error
-		// mapping.
 		if delErr := s.deploymentRepo.DeleteByID(ctx, deployment.ID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", deployment.ID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, deployment.ID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", deployment.ID, delErr)
 		}
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
