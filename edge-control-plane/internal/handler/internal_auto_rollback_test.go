@@ -5,20 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
-// autoRollbackSvc is the minimum surface InternalHandler.AutoRollback
-// needs. Mirrors stubRollbacker in deployment_rollback_test.go — kept
-// package-local so the test file can stand alone without standing up a
-// full DeploymentService (DB + NATS + publisher + artifact store).
-type autoRollbackSvc struct {
+// stubAutoRollbacker is the minimum implementation of the production
+// autoRollbacker interface (declared in internal.go) that
+// InternalHandler.AutoRollback needs. Mirrors stubRollbacker /
+// stubActivator in the sibling Activate and Rollback test files.
+//
+// The production interface also requires GetDeployment + GetArtifact
+// because Download uses them. These stub methods fail loudly if any
+// AutoRollback test ever accidentally exercises the Download path;
+// AutoRollback tests should only assert on s.called / s.lastTenant /
+// s.lastApp / s.resp / s.err.
+type stubAutoRollbacker struct {
 	resp   string
 	err    error
 	called bool
@@ -27,88 +35,35 @@ type autoRollbackSvc struct {
 	lastApp    string
 }
 
-func (s *autoRollbackSvc) RollbackDeployment(_ context.Context, tenantID, appName string) (string, error) {
+func (s *stubAutoRollbacker) RollbackDeployment(_ context.Context, tenantID, appName string) (string, error) {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName
 	return s.resp, s.err
 }
 
-// autoRollbacker is the narrow contract serveAutoRollbackWithStub
-// dispatches against. Matches service.RollbackDeployment's signature
-// so the production handler and the test stub are interchangeable.
-type autoRollbacker interface {
-	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+func (s *stubAutoRollbacker) GetDeployment(_ context.Context, _, _ string) (*domain.Deployment, error) {
+	panic("stubAutoRollbacker.GetDeployment called from AutoRollback test — wrong code path exercised")
 }
 
-// serveAutoRollbackWithStub mirrors InternalHandler.AutoRollback but
-// takes a narrow interface instead of *service.DeploymentService, so
-// tests don't need a live DB or NATS publisher. The production
-// handler's deploymentSvc field is concrete, so we can't stub it
-// directly without pulling in those dependencies.
-//
-// Kept package-local (lowercase) to scope this test-only helper to
-// the handler package. Behavior matches InternalHandler.AutoRollback
-// byte-for-byte; if you change one, change the other.
-func serveAutoRollbackWithStub(w http.ResponseWriter, r *http.Request, svc autoRollbacker) {
-	appName := r.PathValue("appName")
-
-	var req AutoRollbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
-		return
-	}
-	if req.TenantID == "" || req.AppName == "" {
-		http.Error(w, `{"error": "tenant_id and app_name are required"}`, http.StatusBadRequest)
-		return
-	}
-	if appName == "" {
-		appName = req.AppName
-	}
-	if appName != req.AppName {
-		http.Error(w, `{"error": "app_name in URL and body must match"}`, http.StatusBadRequest)
-		return
-	}
-
-	newID, err := svc.RollbackDeployment(r.Context(), req.TenantID, appName)
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrNoLastGood):
-			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
-		case errors.Is(err, service.ErrNoActiveDeployment):
-			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
-		case errors.Is(err, service.ErrAutoRollbackDisabled):
-			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
-		case errors.Is(err, service.ErrPublishFailed):
-			writePublishFailureEnvelope(w, r, err,
-				"rollback committed but worker notification failed; please retry")
-		default:
-			http.Error(w, `{"error": "auto-rollback failed"}`, http.StatusInternalServerError)
-		}
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
+func (s *stubAutoRollbacker) GetArtifact(_ context.Context, _, _, _ string) (io.ReadCloser, error) {
+	panic("stubAutoRollbacker.GetArtifact called from AutoRollback test — wrong code path exercised")
 }
 
 // newInternalAutoRollbackMux wires the route through a real
-// *http.ServeMux so r.PathValue("appName") is populated the same way
-// it is in production. The handler dispatch goes through
-// serveAutoRollbackWithStub (see comment on that helper for why we
-// don't call InternalHandler.AutoRollback directly).
+// *http.ServeMux AND the production InternalHandler. r.PathValue is
+// populated the same way as production. No parallel stub handler
+// to drift out of sync.
 //
 // This test bypasses the auth middleware that wraps /api/internal/
 // in production (cmd/api/main.go applies middleware.WorkerAuth,
 // which today is a no-op because the JWT signing path is dead code
 // — see the comment in cmd/api/main.go). We assert handler-level
 // contracts, not middleware behavior.
-func newInternalAutoRollbackMux(svc *autoRollbackSvc) *http.ServeMux {
+func newInternalAutoRollbackMux(svc *stubAutoRollbacker) *http.ServeMux {
+	h := &InternalHandler{deploymentSvc: svc}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", func(w http.ResponseWriter, r *http.Request) {
-		serveAutoRollbackWithStub(w, r, svc)
-	})
+	mux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", h.AutoRollback)
 	return mux
 }
 
@@ -117,7 +72,7 @@ func newInternalAutoRollbackMux(svc *autoRollbackSvc) *http.ServeMux {
 // ---------------------------------------------------------------------------
 
 func TestInternalAutoRollback_HappyPath_Returns200WithDeploymentID(t *testing.T) {
-	svc := &autoRollbackSvc{resp: "d_prev"}
+	svc := &stubAutoRollbacker{resp: "d_prev"}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp","current_deployment_id":"d_broken","restart_count":5}`)
@@ -154,7 +109,7 @@ func TestInternalAutoRollback_HappyPath_Returns200WithDeploymentID(t *testing.T)
 // ---------------------------------------------------------------------------
 
 func TestInternalAutoRollback_NoLastGood_Returns409(t *testing.T) {
-	svc := &autoRollbackSvc{err: service.ErrNoLastGood}
+	svc := &stubAutoRollbacker{err: service.ErrNoLastGood}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)
@@ -178,7 +133,7 @@ func TestInternalAutoRollback_NoLastGood_Returns409(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInternalAutoRollback_NoActiveDeployment_Returns404(t *testing.T) {
-	svc := &autoRollbackSvc{err: service.ErrNoActiveDeployment}
+	svc := &stubAutoRollbacker{err: service.ErrNoActiveDeployment}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"missing"}`)
@@ -203,7 +158,7 @@ func TestInternalAutoRollback_Disabled_Returns412(t *testing.T) {
 	// ErrAutoRollbackDisabled re-export. The handler distinguishes
 	// this from ErrNoLastGood so the worker can tell a config issue
 	// apart from a "nothing to roll back to" issue.
-	svc := &autoRollbackSvc{err: service.ErrAutoRollbackDisabled}
+	svc := &stubAutoRollbacker{err: service.ErrAutoRollbackDisabled}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)
@@ -228,7 +183,7 @@ func TestInternalAutoRollback_PublishFailed_Returns502(t *testing.T) {
 	// emit. Handler must distinguish from a 500 because the DB row may
 	// already be swapped — a retry on 500 would re-swap or 409.
 	wrapped := fmt.Errorf("%w: %w", service.ErrPublishFailed, errors.New("nats unreachable"))
-	svc := &autoRollbackSvc{err: wrapped}
+	svc := &stubAutoRollbacker{err: wrapped}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)
@@ -268,7 +223,7 @@ func TestInternalAutoRollback_PublishFailed_Returns502(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInternalAutoRollback_BadBody_Returns400(t *testing.T) {
-	svc := &autoRollbackSvc{}
+	svc := &stubAutoRollbacker{}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`not json`)
@@ -285,7 +240,7 @@ func TestInternalAutoRollback_BadBody_Returns400(t *testing.T) {
 }
 
 func TestInternalAutoRollback_MissingTenant_Returns400(t *testing.T) {
-	svc := &autoRollbackSvc{}
+	svc := &stubAutoRollbacker{}
 	mux := newInternalAutoRollbackMux(svc)
 
 	// app_name missing — handler must reject before calling the service.
@@ -303,7 +258,7 @@ func TestInternalAutoRollback_MissingTenant_Returns400(t *testing.T) {
 }
 
 func TestInternalAutoRollback_PathBodyMismatch_Returns400(t *testing.T) {
-	svc := &autoRollbackSvc{}
+	svc := &stubAutoRollbacker{}
 	mux := newInternalAutoRollbackMux(svc)
 
 	// URL says "foo" but body says "bar" — must reject to avoid
@@ -326,7 +281,7 @@ func TestInternalAutoRollback_PathBodyMismatch_Returns400(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInternalAutoRollback_ServiceError_Returns500(t *testing.T) {
-	svc := &autoRollbackSvc{err: errors.New("db unreachable")}
+	svc := &stubAutoRollbacker{err: errors.New("db unreachable")}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)

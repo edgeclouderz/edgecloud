@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,13 +16,32 @@ import (
 )
 
 // InternalHandler handles internal worker-facing endpoints.
+//
+// deploymentSvc is held as the narrow autoRollbacker interface so tests
+// can stub AutoRollback without standing up the full *service.DeploymentService
+// (DB + NATS + publisher + artifact store). Download uses two methods
+// of the same underlying service (GetDeployment, GetArtifact); these
+// also live on the interface so the production code path is unchanged.
+// The concrete *service.DeploymentService satisfies it, so the
+// existing caller in cmd/api/main.go compiles unchanged.
 type InternalHandler struct {
-	deploymentSvc *service.DeploymentService
+	deploymentSvc autoRollbacker
 	workerSvc     *service.WorkerService
 	logEntryRepo  logEntryRepo
 }
 
-func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService, logEntryRepo logEntryRepo) *InternalHandler {
+// autoRollbacker is the narrow contract InternalHandler's endpoints
+// need. Combines AutoRollback's RollbackDeployment with Download's
+// GetDeployment + GetArtifact so the production code path doesn't need
+// to switch field accessors. Mirrors the pattern in DeploymentHandler
+// (deploymentRollbacker in deployment.go).
+type autoRollbacker interface {
+	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
+	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
+}
+
+func NewInternalHandler(deploymentSvc autoRollbacker, workerSvc *service.WorkerService, logEntryRepo logEntryRepo) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
