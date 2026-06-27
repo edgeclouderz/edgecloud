@@ -441,3 +441,53 @@ func TestRemoteArtifactStore_PullFailureCleansStaging(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoteArtifactStore_PullFromPeer_RejectsOversizedResponse covers
+// the on-disk cap guard: a peer that returns more than MaxArtifactSize
+// bytes must surface ErrArtifactTooLarge from Open, must NOT leave a
+// canonical cache file behind (the rename never happens), and must NOT
+// leave a .staging file behind (the existing defer cleans up on any
+// non-success path).
+//
+// Mirrors TestS3ArtifactStore_Open_CapEnforcedDuringRead at s3_test.go
+// (the peer streams oversize, the caller surfaces ErrArtifactTooLarge).
+// Distinguishing assertion here is the post-failure FS state.
+func TestRemoteArtifactStore_PullFromPeer_RejectsOversizedResponse(t *testing.T) {
+	oversize := MaxArtifactSize + 4096
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/wasm")
+		w.WriteHeader(http.StatusOK)
+		// One big Write is the worst case for an uncapped reader — it
+		// puts all the bytes into the staging file before we get a
+		// chance to interrupt the read. The post-copy Stat at the
+		// LimitReader overflow point must still detect the oversize.
+		_, _ = w.Write(make([]byte, oversize))
+	})
+	cacheDir := t.TempDir()
+	s := mustNewRemote(t, peer, "tok", cacheDir)
+
+	_, err := s.Open(t.Context(), "t_x", "a", "d_z")
+	if err == nil {
+		t.Fatal("Open returned nil on oversize peer response; want ErrArtifactTooLarge")
+	}
+	if !errors.Is(err, ErrArtifactTooLarge) {
+		t.Errorf("err = %v, want errors.Is(..., ErrArtifactTooLarge) == true", err)
+	}
+
+	// Canonical cache file must NOT exist — the rename never happens
+	// because we returned before reaching it.
+	cacheFile := filepath.Join(cacheDir, "t_x", "a", "d_z.wasm")
+	if _, statErr := os.Stat(cacheFile); !os.IsNotExist(statErr) {
+		t.Errorf("canonical cache file should not exist on oversize pull: stat err=%v", statErr)
+	}
+
+	// .staging must NOT contain leftovers — the defer removes the
+	// partial staging file on every non-success exit.
+	stagingDir := filepath.Join(cacheDir, ".staging")
+	entries, _ := os.ReadDir(stagingDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			t.Errorf("leftover staging file after oversize pull: %s", e.Name())
+		}
+	}
+}
