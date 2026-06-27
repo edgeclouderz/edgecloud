@@ -147,4 +147,42 @@ mod tests {
         let next = pool.acquire().unwrap();
         assert_eq!(port, next);
     }
+
+    /// When every reachable port is in cooldown, `acquire` must return `None`
+    /// rather than block or panic. The sequential fallback caps at 1000
+    /// iterations and returns `None` when every checked port is cooling
+    /// down.
+    ///
+    /// To exercise this, we pick `starting_port = u16::MAX - 100` so the
+    /// sequential search wraps within its 1000-iteration budget: the
+    /// pre-populated 100-port range becomes the only range the fallback
+    /// can ever check. Drain those 100 ports and release them — they
+    /// enter cooldown with the 60s default — then a fresh acquire must
+    /// return `None`.
+    #[test]
+    fn acquire_returns_none_after_exhaustion() {
+        const START: u16 = u16::MAX - 100; // 65435
+        let mut pool = PortPool::new(START, 60);
+
+        // Drain the 100 pre-populated ports (range START..START+100).
+        let mut drained: Vec<u16> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            drained.push(
+                pool.acquire()
+                    .expect("pre-populated ports should drain cleanly"),
+            );
+        }
+        // Release them all → each enters cooldown.
+        for port in &drained {
+            pool.release(*port);
+        }
+
+        // Now `available` is empty, and the sequential fallback's entire
+        // 1000-iteration budget lands on ports in cooldown (the pre-populated
+        // range + the wrap to itself). acquire must return None.
+        assert!(
+            pool.acquire().is_none(),
+            "pool should be exhausted once every reachable port is in cooldown"
+        );
+    }
 }

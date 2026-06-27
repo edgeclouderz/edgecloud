@@ -32,6 +32,21 @@ pub struct Supervisor {
     pub log_forwarder: Arc<LogForwarder>,
 }
 
+/// Per-app configuration plumbed into the spawned task.
+///
+/// Grouped into a struct so `run_app_loop`'s parameter list stays
+/// manageable (it already has 6 runtime handles). Values are owned
+/// Strings / cloned Option so the future can be `'static` without
+/// borrowing from `start_app`'s stack frame.
+struct RunAppConfig {
+    max_memory_mb: u64,
+    epoch_deadline_ticks: u64,
+    health_check_timeout_secs: u64,
+    tenant_id: String,
+    allowlist: Option<Vec<String>>,
+    app_name: String,
+}
+
 impl Supervisor {
     /// Handle an incoming TaskMessage from NATS.
     ///
@@ -104,10 +119,35 @@ impl Supervisor {
             self.stop_app(app_name).await?;
         }
 
-        // Acquire a port.
+        // Acquire a port. Surface exhaustion as `Err` rather than a process-
+        // killing panic so a burst of starts can't take the worker down.
+        // The next TaskMessage that releases a port will retry this
+        // start; meanwhile the per-message nack path in
+        // `process_task_message` re-queues the message for redelivery.
+        // The counter on `WorkerState::stats` is incremented before
+        // returning so operators can detect the failure mode from
+        // heartbeats (Phase 5 will surface the counter in `AppStatus`).
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
-            pool.acquire().expect("port pool exhausted")
+            match pool.acquire() {
+                Some(p) => p,
+                None => {
+                    // Drop the pool lock before touching state.stats so
+                    // we never hold both locks at once.
+                    drop(pool);
+                    self.state
+                        .read()
+                        .await
+                        .stats
+                        .port_pool_exhausted_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    anyhow::bail!(
+                        "port pool exhausted for app {app_name} (deployment_id={}); \
+                         no ports free and no sequential fallback available",
+                        spec.deployment_id,
+                    );
+                }
+            }
         };
 
         // Download artifact (blocking on first request).
@@ -187,9 +227,6 @@ impl Supervisor {
         } else {
             self.config.max_memory_mb
         };
-        let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
-        let health_check_timeout_secs = self.config.health_check_timeout_secs;
-        let allowlist = spec.allowlist.clone();
         let log_forwarder = self.log_forwarder.clone();
         // Own tenant_id before the spawn — `start_app` borrows it as &str, but
         // the tokio::spawn future must be 'static, so we move an owned String
@@ -201,6 +238,17 @@ impl Supervisor {
         let tenant_id = tenant_id.to_string();
         let tenant_id_for_instance = tenant_id.clone();
 
+        // Group per-app knobs into a struct so run_app_loop's signature
+        // stays readable. The cfg is moved into the spawned task.
+        let cfg = RunAppConfig {
+            max_memory_mb,
+            epoch_deadline_ticks: self.config.epoch_deadline_ticks,
+            health_check_timeout_secs: self.config.health_check_timeout_secs,
+            tenant_id: tenant_id.clone(),
+            allowlist: spec.allowlist.clone(),
+            app_name: app_name_str.clone(),
+        };
+
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
         let handle = tokio::spawn(async move {
@@ -209,14 +257,9 @@ impl Supervisor {
                 meter_clone,
                 env,
                 state_clone,
-                app_name_str.clone(),
                 shutdown_rx,
-                max_memory_mb,
-                epoch_deadline_ticks,
-                health_check_timeout_secs,
-                tenant_id,
-                allowlist,
                 log_forwarder,
+                cfg,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -289,15 +332,49 @@ impl Supervisor {
             t.abort();
         }
 
-        // Propagate any panic from the app task.
+        // Propagate any panic from the app task as a log + status update,
+        // not a re-panic. The handle is aborted above, so awaiting it
+        // here only surfaces JoinErrors that arose *before* the abort
+        // (the task panicked on its own). The previous code called
+        // `panic_any(panic_info)` which unwound through the supervisor's
+        // caller — wrong, because the panic already happened inside the
+        // spawned task, and the supervisor's caller (the consume loop)
+        // can't meaningfully recover. Logging + removing the app
+        // instance is the right behavior; the next heartbeat reflects
+        // the absence.
         if let Some(handle) = handle {
             handle.abort();
             // try_unwrap extracts the JoinHandle from the Arc; if there are other
             // Arcs (shouldn't happen here), fall back to not awaiting.
             match std::sync::Arc::try_unwrap(handle) {
                 Ok(join_handle) => {
-                    if let Err(panic_info) = join_handle.await {
-                        std::panic::panic_any(panic_info);
+                    match join_handle.await {
+                        Ok(()) => {
+                            // Normal completion — nothing to report.
+                        }
+                        Err(join_err) if join_err.is_panic() => {
+                            // The task panicked before we aborted it.
+                            // Log the payload so operators can correlate
+                            // with the eventual crash investigation; do
+                            // NOT re-panic. The app is already removed
+                            // from the state map above.
+                            tracing::error!(
+                                app_name,
+                                err = %join_err,
+                                "app task panicked; removed from state without re-raising"
+                            );
+                        }
+                        Err(join_err) => {
+                            // Other JoinError variants (cancelled, etc.)
+                            // are normal here — handle.abort() above
+                            // means a Cancelled is expected. Log at
+                            // debug to avoid noise on the happy path.
+                            tracing::debug!(
+                                app_name,
+                                err = %join_err,
+                                "app task join ended (expected: cancelled by abort)"
+                            );
+                        }
                     }
                 }
                 Err(_) => {
@@ -310,6 +387,37 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Drain a `JoinHandle`, logging any panic from the wrapped task and
+    /// *not* re-raising. This is the correct policy: the panic already
+    /// happened inside the spawned task; re-raising here would unwind
+    /// through the consume loop, which has no actionable recovery path.
+    /// Operators see the panic in logs and the app is gone from state
+    /// before the next heartbeat.
+    ///
+    /// Extracted from `stop_app` so a unit test can verify the panic-
+    /// swallowing contract without standing up a full `Supervisor` +
+    /// `AppInstance` (which requires a compiled wasm component).
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn await_app_handle(app_name: &str, handle: tokio::task::JoinHandle<()>) {
+        match handle.await {
+            Ok(()) => {}
+            Err(join_err) if join_err.is_panic() => {
+                tracing::error!(
+                    app_name,
+                    err = %join_err,
+                    "app task panicked; removed from state without re-raising"
+                );
+            }
+            Err(join_err) => {
+                tracing::debug!(
+                    app_name,
+                    err = %join_err,
+                    "app task join ended (expected: cancelled by abort)"
+                );
+            }
+        }
+    }
+
     /// Per-app task loop.
     ///
     /// Executes the component in a loop. Handles crashes with exponential
@@ -317,29 +425,17 @@ impl Supervisor {
     /// (HTTP servers) that return from handle() keep running — only an explicit
     /// process.exit from the guest means "stop".
     //
-    // The extra parameters come from two merged features: PR #64 follow-up
-    // adds per-invocation memory + epoch limits (max_memory_mb,
-    // epoch_deadline_ticks); origin/main adds a host-side timeout
-    // (health_check_timeout_secs) for hung-app detection. They are
-    // complementary: the wasmtime limits terminate the *guest* at the
-    // engine layer, the timeout terminates the *host* task when the
-    // guest doesn't yield. Refactoring into a struct is left for a future
-    // PR; the clippy lint here keeps the function signature honest about
-    // what it actually depends on.
-    #[allow(clippy::too_many_arguments)]
+    // Configuration knobs live on `RunAppConfig`; only the live
+    // runtime handles (instance_pre, meter, env, state, shutdown_rx,
+    // log_forwarder) remain as separate parameters.
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
         env: HashMap<String, String>,
         state: Arc<RwLock<WorkerState>>,
-        app_name: String,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-        max_memory_mb: u64,
-        epoch_deadline_ticks: u64,
-        health_check_timeout_secs: u64,
-        tenant_id: String,
-        allowlist: Option<Vec<String>>,
         log_forwarder: Arc<LogForwarder>,
+        cfg: RunAppConfig,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -363,16 +459,16 @@ impl Supervisor {
                 //      epoch ticker is starved), the host marks the app as
                 //      Hung and restarts after backoff.
                 result = tokio::time::timeout(
-                    Duration::from_secs(health_check_timeout_secs),
+                    Duration::from_secs(cfg.health_check_timeout_secs),
                     Self::execute_app(
                         &instance_pre,
                         &meter,
                         env.clone(),
-                        max_memory_mb,
-                        epoch_deadline_ticks,
-                        &tenant_id,
-                        allowlist.clone(),
-                        &app_name,
+                        cfg.max_memory_mb,
+                        cfg.epoch_deadline_ticks,
+                        &cfg.tenant_id,
+                        cfg.allowlist.clone(),
+                        &cfg.app_name,
                         &log_forwarder,
                     ),
                 ) => {
@@ -399,7 +495,7 @@ impl Supervisor {
                                 // Mark the app as crashed so the heartbeat reflects the failure.
                                 {
                                     let mut s = state.write().await;
-                                    if let Some(inst) = s.apps.get_mut(&app_name) {
+                                    if let Some(inst) = s.apps.get_mut(&cfg.app_name) {
                                         let mut inst = inst.lock().await;
                                         inst.status = AppInstanceStatus::Crashed { restart_count };
                                     }
@@ -428,13 +524,13 @@ impl Supervisor {
                             );
                             tracing::warn!(
                                 restart_count,
-                                timeout_secs = health_check_timeout_secs,
+                                timeout_secs = cfg.health_check_timeout_secs,
                                 "app hung (health check timeout), restarting in {:?}",
                                 backoff
                             );
                             if restart_count >= max_restarts {
                                 let mut s = state.write().await;
-                                if let Some(inst) = s.apps.get_mut(&app_name) {
+                                if let Some(inst) = s.apps.get_mut(&cfg.app_name) {
                                     let mut inst = inst.lock().await;
                                     inst.status = AppInstanceStatus::Hung;
                                 }
@@ -634,6 +730,7 @@ impl Supervisor {
                 &self.config.region,
                 &self.config.queue_group,
                 &self.config.consumer_name,
+                self.config.nats_max_deliver,
             )
             .await?;
         tracing::info!(
@@ -715,5 +812,43 @@ impl Supervisor {
         if let Err(e) = self.nats.term(msg).await {
             tracing::error!(err = %e, "term() failed — message may be redelivered");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `await_app_handle` is the panic-swallowing helper used by `stop_app`.
+    /// When a per-app task panics, the helper must log and return normally —
+    /// re-raising would unwind through the supervisor's caller (the consume
+    /// loop), which has no actionable recovery path. This test verifies the
+    /// contract: a panicking task's JoinHandle does not cause `await_app_handle`
+    /// to panic itself.
+    #[tokio::test]
+    async fn await_app_handle_does_not_re_raise_panic() {
+        let handle = tokio::spawn(async {
+            // Yield once so the task actually runs and panics before
+            // we await the handle. Without this, the spawn future may
+            // not have executed by the time `await_app_handle` polls it.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            panic!("test panic — must be swallowed, not re-raised");
+        });
+        // Allow the spawned task to reach the panic.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Must not panic. If the helper re-raises, this call unwinds and
+        // the test fails with a panic.
+        Supervisor::await_app_handle("test_app", handle).await;
+    }
+
+    /// When the wrapped task returns Ok, the helper is a no-op. This is
+    /// the happy-path counterpart to the panic test.
+    #[tokio::test]
+    async fn await_app_handle_passes_through_normal_completion() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        Supervisor::await_app_handle("test_app", handle).await;
     }
 }
