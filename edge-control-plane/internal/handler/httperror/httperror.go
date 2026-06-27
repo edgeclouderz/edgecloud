@@ -127,3 +127,34 @@ func InternalError(w http.ResponseWriter) {
 func InternalErrorCtx(w http.ResponseWriter, r *http.Request) {
 	write(w, CodeInternalError, "internal error", http.StatusInternalServerError, requestIDFromContext(r.Context()))
 }
+
+// WriteCtx writes an error response with trace context using a custom
+// HTTP status code and ErrorCode. Used by middleware that needs a
+// status not covered by the named helpers above (e.g. 503 Service
+// Unavailable). The named helpers (BadRequest, Unauthorized, etc.)
+// are preferred where they apply; this is the escape hatch.
+func WriteCtx(w http.ResponseWriter, r *http.Request, httpStatus int, message string) {
+	// Map common HTTP statuses to their canonical ErrorCode. Anything
+	// outside this map gets a generic INTERNAL_ERROR code so the
+	// response shape stays consistent.
+	var code ErrorCode
+	switch httpStatus {
+	case http.StatusBadRequest:
+		code = CodeBadRequest
+	case http.StatusUnauthorized:
+		code = CodeUnauthorized
+	case http.StatusForbidden:
+		code = CodeForbidden
+	case http.StatusNotFound:
+		code = CodeNotFound
+	case http.StatusConflict:
+		code = CodeConflict
+	case http.StatusTooManyRequests:
+		code = CodeQuotaExceeded
+	case http.StatusServiceUnavailable:
+		code = "SERVICE_UNAVAILABLE"
+	default:
+		code = CodeInternalError
+	}
+	write(w, code, message, httpStatus, requestIDFromContext(r.Context()))
+}
