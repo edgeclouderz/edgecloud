@@ -434,7 +434,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)(downloadMux))
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
-	// Mint a long-lived service token for the edge-ingress poller
+// Mint a long-lived service token for the edge-ingress poller
 	// (issue #83). The token is written to a 0600 file (NOT logged
 	// in plaintext) so the operator can copy it into the ingress's
 	// INGRESS_SERVICE_TOKEN env var. Region is sourced from the
@@ -459,6 +459,26 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		log.Printf("INGRESS_SERVICE_TOKEN written to %s (region=%s, expires in 1y, mode 0600)", path, region)
 	} else {
 		log.Printf("APP_REGION not set; skipping ingress service token mint (default-only mode)")
+	}
+
+	// Bootstrap endpoint (Phase 4): PSK-authenticated JWT mint for
+	// fresh workers. Registered on the OUTER mux (NOT inside
+	// internalMux) so the PSKAuth middleware — not WorkerAuth —
+	// handles authentication. Go 1.22+ ServeMux matches the most
+	// specific pattern first, so this concrete `POST /api/internal/auth/token`
+	// wins over the `/api/internal/` prefix despite living on the
+	// same mux. The bootstrap path is opt-in: when BOOTSTRAP_PSK
+	// is unset, the middleware returns 503 on every request so
+	// misconfigured workers see the difference between
+	// "wrong-PSK" (401) and "server-side disabled" (503).
+	workerJWTMinter := service.NewWorkerJWTMinter(cfg.JWT)
+	bootstrapHandler := handler.NewBootstrapHandler(workerJWTMinter)
+	if bootstrapHandler != nil {
+		bootstrapCfg := middleware.BootstrapAuthConfig{
+			PSK: []byte(cfg.JWT.BootstrapPSK),
+		}
+		mux.Handle("POST /api/internal/auth/token",
+			middleware.PSKAuth(bootstrapCfg)(http.HandlerFunc(bootstrapHandler.MintToken)))
 	}
 
 	// Start server with graceful shutdown
