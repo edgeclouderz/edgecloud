@@ -1,10 +1,4 @@
-[default]
-extend-ignore-re = [
-    # Ignore hex/hash strings, tokens, and lockfiles if typos flags them
-]
-
 [default.extend-words]
-# Add project-specific terms here to ignore false positive typos
 edgecloud = "edgecloud"
 edgeclouderz = "edgeclouderz"
 wasmtime = "wasmtime"
@@ -17,3 +11,6 @@ errcheck = "errcheck"
 govet = "govet"
 ineffassign = "ineffassign"
 typecheck = "typecheck"
+unparseable = "unparseable"
+ture = "ture"
+inser = "inser"
