@@ -169,13 +169,8 @@ fn signup(_name: &str, _plan: &str, _key_name: &str, _force: bool) -> Result<()>
 
 /// `edge auth login [--key <KEY>] [--no-echo]`
 ///
-/// Saves a key to the local config file. Reads from stdin if `--key` is
-/// not provided. `--no-echo` switches the read path to `/dev/tty` with
-/// terminal echo disabled so the pasted bytes do not land in scrollback
-/// or TTY captures; it requires a controlling TTY (incompatible with
-/// `<<<` and pipe stdin). After saving, attempts to call `whoami` to
-/// confirm the key works. If the server is unreachable, still succeeds
-/// on the local write (the user may be working offline).
+/// After saving, calls `GET /api/v1/auth/whoami` to verify. Exits 1 if
+/// the server rejects the saved key; warns but succeeds if unreachable.
 fn login(key: Option<&str>, no_echo: bool) -> Result<()> {
     let key_value = match key {
         Some(k) => k.trim().to_string(),
@@ -189,10 +184,7 @@ fn login(key: Option<&str>, no_echo: bool) -> Result<()> {
             .trim()
             .to_string(),
         None => {
-            eprintln!(
-                "Paste your API key (input is read from stdin, Ctrl-D to cancel; \
-                 pass --no-echo to suppress terminal echo):"
-            );
+            eprintln!("Paste your API key (input is read from stdin, Ctrl-D to cancel):");
             let mut buf = String::new();
             std::io::stdin()
                 .lock()
