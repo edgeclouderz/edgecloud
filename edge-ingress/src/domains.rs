@@ -505,6 +505,66 @@ mod tests {
         }
     }
 
+    /// Shared-Notify wiring test (PR #133 review finding #1).
+    /// Spawns the poller with a shared `Arc<Notify>` and a listener
+    /// task that consumes one permit from it. If the wiring regresses
+    /// (e.g. main.rs creates a fresh Notify that only the poller
+    /// knows about) this listener never wakes and the test times
+    /// out. Without it, the regression only surfaces at runtime as
+    /// "FQDN routes never reach Caddy on cold start."
+    #[tokio::test]
+    async fn run_signals_shared_notify_on_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/domains"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "d_1", "tenant_id": "t_a", "app_name": "api", "fqdn": "api.acme.com"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg_with_poll_interval(server.uri(), Duration::from_millis(50));
+        let table = std::sync::Arc::new(RoutingTable::new());
+        let notify = std::sync::Arc::new(Notify::new());
+        let wakeups = std::sync::Arc::new(AtomicUsize::new(0));
+        let wakeups_clone = wakeups.clone();
+
+        // Listener: wait for the shared Notify to fire. The
+        // AtomicUsize lets us assert *that* it fired (vs. timing
+        // out) regardless of debounce/render logic downstream.
+        let notify_for_listener = notify.clone();
+        let listener = tokio::spawn(async move {
+            notify_for_listener.notified().await;
+            wakeups_clone.store(1, Ordering::SeqCst);
+        });
+
+        // Poller: spawn run() so it loops on its own interval.
+        let notify_for_poller = notify.clone();
+        let _run_handle = tokio::spawn(async move {
+            let _ = run(cfg, table, notify_for_poller).await;
+        });
+
+        // Bound the wait — if the Notify never fires, the listener
+        // task is still alive and we surface a clear failure.
+        let result = tokio::time::timeout(Duration::from_secs(2), listener).await;
+        assert!(
+            result.is_ok(),
+            "shared Notify was never signalled — the poller's notify_one() \
+             did not reach the renderer-side listener. This is the cold-start \
+             FQDN-routes-never-reach-Caddy bug from PR #133 review finding #1."
+        );
+        result.unwrap().expect("listener task panicked");
+
+        assert_eq!(
+            wakeups.load(Ordering::SeqCst),
+            1,
+            "listener must observe exactly one wakeup from the poller's notify_one()"
+        );
+    }
+
     /// Build a minimal Config for the run() tests. Filled in with
     /// dummy file paths and a short poll interval.
     fn test_cfg_with_poll_interval(control_plane_url: String, poll: Duration) -> Config {

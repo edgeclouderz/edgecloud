@@ -30,15 +30,24 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Returns when the subscription ends (e.g., NATS disconnect). The caller
 /// is expected to re-invoke this in a loop with backoff, mirroring the
 /// worker's main loop.
-pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>) -> Result<()> {
+///
+/// `render_notify` is the shared `Notify` that the Caddy renderer awaits.
+/// It is passed in (rather than created here) so the domain poller in
+/// `main.rs` can signal the same channel — see PR #133 review finding #1.
+pub async fn run(
+    cfg: Config,
+    table: Arc<RoutingTable>,
+    caddy: Arc<CaddyClient>,
+    render_notify: Arc<Notify>,
+) -> Result<()> {
     let client = async_nats::connect(&cfg.nats_url)
         .await
         .with_context(|| format!("connecting to NATS at {}", cfg.nats_url))?;
     info!(url = %cfg.nats_url, region = %cfg.region, "connected to NATS");
 
-    // Spawn the renderer + the periodic pruner. Both share a `Notify` flag
-    // so we collapse bursts of heartbeats into a single Caddy reload.
-    let render_notify = Arc::new(Notify::new());
+// Spawn the renderer + the periodic pruner. Both share the same
+    // `Notify` flag (passed in by the caller) so we collapse bursts of
+    // heartbeats into a single Caddy reload.
 
     // Traffic-split cache shared between the fetcher and the renderer.
     let traffic_cache: SharedCache = Default::default();

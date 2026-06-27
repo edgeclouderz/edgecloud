@@ -69,6 +69,15 @@ async fn main() -> ExitCode {
         }
     };
 
+    // One shared `Notify` drives the Caddy renderer. Both the domain
+    // poller (FQDN routes) and the heartbeat path (upstream routes)
+    // signal on this same Notify so a Caddy reload fires regardless
+    // of which side of the system observed the change. Two separate
+    // Notifies would mean the poller's signal is dropped on the
+    // floor — the renderer only awaits the one passed via
+    // `heartbeats::run`. See PR #133 review finding #1.
+    let render_notify = Arc::new(Notify::new());
+
     // Custom-domain poller (issue #83). Spawned as a fire-and-forget
     // task; if the control plane rejects our token repeatedly
     // (rotated JWT secret, revoked ingest token) the poller returns
@@ -77,7 +86,7 @@ async fn main() -> ExitCode {
     if !cfg.control_plane_url.is_empty() {
         let dom_cfg = cfg.clone();
         let dom_table = table.clone();
-        let dom_notify = Arc::new(Notify::new());
+        let dom_notify = render_notify.clone();
         tokio::spawn(async move {
             if let Err(e) = domains::run(dom_cfg, dom_table, dom_notify).await {
                 tracing::error!(err = %e, "domain poller exited; restarting process");
@@ -91,7 +100,14 @@ async fn main() -> ExitCode {
     // The heartbeat subscription can drop on NATS reconnect; mirror the
     // worker's pattern of re-subscribing with backoff.
     loop {
-        match heartbeats::run(cfg.clone(), table.clone(), caddy.clone()).await {
+        match heartbeats::run(
+            cfg.clone(),
+            table.clone(),
+            caddy.clone(),
+            render_notify.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::warn!("heartbeats::run returned cleanly; re-running in 1s");
             }
