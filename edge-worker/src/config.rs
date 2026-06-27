@@ -3,6 +3,18 @@
 use anyhow::Context;
 use std::path::PathBuf;
 
+/// Minimum acceptable length of `WORKER_BOOTSTRAP_PSK`. Matches the
+/// control plane's server-side floor (`internal/config/config.go`
+/// rejects `BootstrapPSK < 32 bytes` at startup). Workers that
+/// boot with a shorter PSK will sign with it successfully and then
+/// see every bootstrap POST return 401, leaving operators to
+/// debug the worker config without a clear error message.
+///
+/// **Finding A4:** emit a startup warning when the PSK is below this
+/// floor so operators see the misconfiguration locally rather than
+/// chasing a 401 from the server.
+const MIN_BOOTSTRAP_PSK_BYTES: usize = 32;
+
 // `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
 // env vars and consumed by the supervisor (PR #64 follow-up). They plumb
 // per-app wasmtime limits: StoreLimits for memory, and an epoch ticker +
@@ -211,7 +223,7 @@ impl Config {
                 .unwrap_or_else(|_| "edgecloud".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
-            worker_bootstrap_psk: parse_env_string("WORKER_BOOTSTRAP_PSK"),
+            worker_bootstrap_psk: parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK"),
             // Absolute default matches the cache_dir / spool_dir
             // policy: a relative default in a container silently
             // writes to the image root and disappears on restart,
@@ -283,6 +295,42 @@ fn parse_env_u64(name: &str, default: u64) -> anyhow::Result<u64> {
 /// specific use case; validation lives at the call site.
 fn parse_env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+/// Parse `WORKER_BOOTSTRAP_PSK` and emit a startup warning if the
+/// value is shorter than `MIN_BOOTSTRAP_PSK_BYTES` (finding A4).
+/// The control plane rejects a PSK shorter than 32 bytes at startup;
+/// without this warning a worker with a too-short PSK boots cleanly
+/// and every bootstrap POST returns 401, leaving the operator to
+/// chase the server's reject log to find the cause.
+///
+/// We don't fail-fast on boot because an operator with a
+/// misconfigured test environment wants to see the worker start
+/// and log a clear failure rather than have it refuse to boot.
+fn parse_env_string_with_psk_check(name: &str) -> Option<String> {
+    let value = parse_env_string(name);
+    if let Some(psk) = &value {
+        let psk_len = psk.len();
+        if psk_len < MIN_BOOTSTRAP_PSK_BYTES {
+            // Bind the field values to locals so the format-string
+            // interpolation can reference them. `tracing::warn!` is
+            // happy with named local variables in the format string as
+            // long as a matching field is supplied — we do both for
+            // structured-log consumers.
+            let min_bytes = MIN_BOOTSTRAP_PSK_BYTES;
+            let env_var = name;
+            tracing::warn!(
+                bytes = psk_len,
+                min_bytes,
+                env_var,
+                "WORKER_BOOTSTRAP_PSK is shorter than the server-side \
+                 minimum ({min_bytes} bytes); every bootstrap POST will \
+                 return 401. Set {env_var} to a value of at least \
+                 {min_bytes} bytes.",
+            );
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -700,6 +748,166 @@ mod tests {
             cfg.jwt_cache_path.is_absolute(),
             "default jwt_cache_path must be absolute; got {:?}",
             cfg.jwt_cache_path
+        );
+    }
+
+    // ----- PSK length warning (finding A4) ---------------------------
+    //
+    // The server-side control plane rejects PSKs shorter than
+    // `MIN_BOOTSTRAP_PSK_BYTES` (32) at startup. Without a local warning,
+    // a worker with a too-short PSK boots cleanly and every bootstrap
+    // POST returns 401 — operators then have to chase the server's
+    // reject log to figure out the cause. The tests below pin both
+    // branches of `parse_env_string_with_psk_check` so a future refactor
+    // can't silently drop the warning.
+
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    /// Minimal `tracing::Layer` that records the last warn-level event
+    /// it observed on this thread. Used by the PSK-length tests to assert
+    /// that `parse_env_string_with_psk_check` emits (or does not emit)
+    /// the warn. Held inside an `Arc<StdMutex<...>>` so the layer can
+    /// publish into a shared buffer while `tracing_subscriber::with_default`
+    /// owns the layer.
+    #[derive(Default, Clone)]
+    struct CapturedWarn {
+        last_message: Option<String>,
+        last_level: Option<tracing::Level>,
+        last_target: Option<String>,
+        last_bytes: Option<i64>,
+    }
+
+    struct CaptureLayer {
+        sink: Arc<StdMutex<CapturedWarn>>,
+    }
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer<S>
+        for CaptureLayer
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            // Visit the event fields to pull out the structured fields
+            // we attach in `parse_env_string_with_psk_check`: a plain
+            // string message + `bytes` integer. We don't care about the
+            // other fields — `env_var`, `min_bytes` — they're human
+            // context for the operator.
+            struct FieldVisit<'a> {
+                sink: &'a mut CapturedWarn,
+            }
+            impl<'a> Visit for FieldVisit<'a> {
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    if field.name() == "message" {
+                        self.sink.last_message = Some(value.to_string());
+                    }
+                }
+                fn record_i64(&mut self, field: &Field, value: i64) {
+                    if field.name() == "bytes" {
+                        self.sink.last_bytes = Some(value);
+                    }
+                }
+                fn record_u64(&mut self, field: &Field, value: u64) {
+                    // `usize` from `psk.len()` dispatches here on
+                    // 64-bit targets. Cast for comparison with the
+                    // expected i64 value.
+                    if field.name() == "bytes" {
+                        self.sink.last_bytes = Some(value as i64);
+                    }
+                }
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    // tracing's `record_debug` covers the `&str` form of
+                    // the message field for the default formatter; the
+                    // `record_str` branch above catches the explicit
+                    // `tracing::warn!(message = "...")` shape. Both
+                    // paths land here for `Display`-only fields.
+                    if field.name() == "message" && self.sink.last_message.is_none() {
+                        self.sink.last_message = Some(format!("{:?}", value));
+                    }
+                }
+            }
+            let mut sink = self.sink.lock().unwrap();
+            sink.last_level = Some(*event.metadata().level());
+            sink.last_target = Some(event.metadata().target().to_string());
+            let mut visitor = FieldVisit { sink: &mut sink };
+            event.record(&mut visitor);
+        }
+    }
+
+    /// `WORKER_BOOTSTRAP_PSK=abc` (3 bytes, below the 32-byte server
+    /// floor) must produce a `tracing::warn!` so operators see the
+    /// misconfiguration locally rather than chasing 401s from the
+    /// server. We install a thread-local subscriber that captures the
+    /// warn event, run the helper, and assert the captured event
+    /// describes a too-short PSK.
+    #[test]
+    fn worker_bootstrap_psk_too_short_warns() {
+        let _env = EnvGuard::set("WORKER_BOOTSTRAP_PSK", "abc");
+        let sink = Arc::new(StdMutex::new(CapturedWarn::default()));
+        let layer = CaptureLayer {
+            sink: Arc::clone(&sink),
+        };
+        let subscriber = Registry::default().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK")
+        });
+        // The helper must still return the value — operators want to see
+        // the worker start and log the failure, not refuse to boot.
+        assert_eq!(result.as_deref(), Some("abc"));
+        let captured = sink.lock().unwrap().clone();
+        assert_eq!(
+            captured.last_level,
+            Some(tracing::Level::WARN),
+            "expected a WARN-level event; got {:?}",
+            captured.last_level
+        );
+        let target = captured.last_target.as_deref().unwrap_or("<unknown>");
+        assert!(
+            target.starts_with("edge_worker::config"),
+            "warn target should be edge_worker::config; got {target}"
+        );
+        let bytes = captured
+            .last_bytes
+            .expect("warn event should carry the `bytes` field");
+        assert_eq!(
+            bytes, 3,
+            "warn should report the actual byte length (3); got {bytes}"
+        );
+        let msg = captured.last_message.unwrap_or_default();
+        assert!(
+            msg.contains("WORKER_BOOTSTRAP_PSK") || msg.contains("32 bytes"),
+            "warn message should mention the env var or the threshold; got {:?}",
+            msg
+        );
+    }
+
+    /// A PSK at exactly the 32-byte floor must NOT trigger the warn.
+    /// Pinning the boundary catches off-by-one regressions in the
+    /// threshold check (`<` vs `<=`).
+    #[test]
+    fn worker_bootstrap_psk_at_least_32_bytes_ok() {
+        let _env = EnvGuard::set(
+            "WORKER_BOOTSTRAP_PSK",
+            "0123456789abcdef0123456789abcdef", // exactly 32 bytes
+        );
+        let sink = Arc::new(StdMutex::new(CapturedWarn::default()));
+        let layer = CaptureLayer {
+            sink: Arc::clone(&sink),
+        };
+        let subscriber = Registry::default().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK")
+        });
+        assert_eq!(result.as_deref(), Some("0123456789abcdef0123456789abcdef"));
+        let captured = sink.lock().unwrap().clone();
+        assert!(
+            captured.last_level.is_none(),
+            "32-byte PSK must NOT produce a warn event; got {:?}",
+            captured.last_level
         );
     }
 }
