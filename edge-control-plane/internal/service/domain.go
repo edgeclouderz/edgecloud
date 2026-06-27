@@ -34,10 +34,36 @@ const edgecloudDevSuffix = ".edgecloud.dev"
 // reject wildcards (`*`) because v1 only does single-FQDN HTTP-01 ACME;
 // wildcard support requires DNS-01 and is deferred to v2.
 //
+// Final-label constraint (PR #133 review finding #5): the rightmost
+// label must contain at least one alphabetic character and be ≥2
+// chars long. This rejects IP literals (e.g. `127.0.0.1` — every
+// label is pure digits, including the rightmost) and single-char
+// TLDs (e.g. `a.b` — rightmost label is one character). Caddy
+// would otherwise issue a route for these, Let's Encrypt would
+// reject the ACME challenge (no public DNS for an IP, no public
+// registry for a 1-char TLD), and the route would silently fail
+// to serve TLS.
+//
 // The regex is intentionally NOT anchored to a max total length — that's
 // a separate length check below so the error message can name the
 // offending value.
-var fqdnPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+//
+// Regex shape, in plain English:
+//   - First label: `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?` — 1-63 chars,
+//     no leading/trailing hyphen.
+//   - Zero or more intermediate labels (same shape, each preceded
+//     by a `.`).
+//   - Final label: `.` then `[a-z][a-z0-9-]*[a-z0-9]` — must start
+//     with a letter (excludes IP literals), end with an alphanumeric
+//     (no trailing hyphen), and be ≥2 chars long (excludes
+//     single-char TLDs like `a.b`). The whole regex requires at
+//     least one `.` separator, so single-label inputs (e.g. `foo`,
+//     `x`) are rejected at the regex layer — they have no public
+//     suffix to anchor a real FQDN.
+var fqdnPattern = regexp.MustCompile(
+	`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*` +
+		`\.[a-z][a-z0-9-]*[a-z0-9]$`,
+)
 
 // IsValidFQDN returns true if the FQDN shape is acceptable. Rejects:
 //   - empty strings,
@@ -46,6 +72,12 @@ var fqdnPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z
 //     `..`, leading/trailing dot, etc.),
 //   - labels starting or ending with a hyphen,
 //   - labels longer than 63 chars (DNS hard limit),
+//   - IP literals (e.g. `127.0.0.1`, `192.168.1.1`) — the rightmost
+//     label must contain at least one alphabetic character; otherwise
+//     Caddy issues a route, Let's Encrypt rejects the ACME challenge,
+//     and the route silently fails to serve TLS,
+//   - single-char TLDs (e.g. `a.b`) — the rightmost label must be
+//     ≥2 chars long; otherwise the same silent-failure path,
 //   - FQDNs ending in `.edgecloud.dev` (platform-managed host).
 //
 // Modeled on `IsValidAppName` / `IsValidRegion`. The service layer

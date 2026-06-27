@@ -142,11 +142,23 @@ func TestIsValidFQDN(t *testing.T) {
 		why  string
 	}{
 		{"api.acme.com", true, "standard FQDN"},
-		{"a.b.c.d.e.f", true, "many short labels"},
-		{"single", true, "single-label FQDN"},
-		{"x", true, "single character"},
+		// PR #133 review finding #5: the rightmost label must be ≥2
+		// chars and contain at least one alphabetic character. This
+		// rejects IP literals and single-char TLDs at the regex
+		// layer; the cost is that "many short labels" inputs (e.g.
+		// `a.b.c.d.e.f`) are now also rejected — but those aren't
+		// publicly resolvable anyway (no public registry for `.f`),
+		// so Caddy/ACME would also fail on them.
+		{"a.b.c.d.e.f", false, "final label too short (PR #133 finding #5)"},
+		// Single-label inputs (`x`, `single`) are also rejected by
+		// the tightened regex — they have no `.` so the final-label
+		// ≥2-char rule never gets a chance to fire, but neither do
+		// they qualify as FQDNs (no public suffix). The OLD regex
+		// accepted these; the new one doesn't.
+		{"single", false, "single-label rejected (PR #133 finding #5)"},
+		{"x", false, "single character rejected (PR #133 finding #5)"},
 		{"api-v1.acme.com", true, "hyphens in labels"},
-		{"123.example.com", true, "leading digit label"},
+		{"123.example.com", true, "leading digit label accepted when final is normal"},
 		{"UPPER.example.com", false, "uppercase rejected (DNS is case-insensitive, ops want consistency)"},
 		{"-leading.example.com", false, "leading hyphen rejected"},
 		{"trailing-.example.com", false, "trailing hyphen rejected"},
@@ -165,6 +177,17 @@ func TestIsValidFQDN(t *testing.T) {
 		{"api/example.com", false, "slash rejected"},
 		{"", false, "empty rejected"},
 		{"foo bar.com", false, "whitespace rejected"},
+		// PR #133 review finding #5: IP literals and single-char TLDs
+		// must be rejected — Caddy would render a route, Let's Encrypt
+		// would reject the ACME challenge (no public DNS for an IP, no
+		// public registry for a 1-char TLD), and the route would
+		// silently fail to serve TLS.
+		{"127.0.0.1", false, "IP literal rejected (PR #133 finding #5)"},
+		{"192.168.1.1", false, "private IP literal rejected (PR #133 finding #5)"},
+		{"0.0.0.0", false, "wildcard IP literal rejected (PR #133 finding #5)"},
+		{"a.b", false, "single-char TLD rejected (PR #133 finding #5)"},
+		{"x.y", false, "single-char TLD with single-char subdomain rejected (PR #133 finding #5)"},
+		{"api-v1.acme.co", true, "2-char TLD accepted (PR #133 finding #5)"},
 	}
 	for _, c := range cases {
 		t.Run(c.fqdn, func(t *testing.T) {
