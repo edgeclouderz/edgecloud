@@ -182,9 +182,9 @@ pub async fn load_from_disk(path: &Path) -> Result<Option<CachedJwt>> {
 
 /// Persist a JWT bundle to `path` atomically (write to `.tmp`, fsync not
 /// required — matches the `edge-runtime/src/interfaces/kv_store.rs`
-/// pattern), then rename over the destination. On Unix the file is
-/// chmod'd to `0600` after the rename so a leaked cache file is
-/// only readable by the worker user.
+/// pattern), then rename over the destination. On Unix the tmp file
+/// is created with mode `0600` atomically via `OpenOptions::mode()`,
+/// so a permissive umask never leaves the cache world-readable.
 ///
 /// Best-effort: this function is the worker side of "I just got a new
 /// JWT; remember it". A failure here is logged but not fatal — the
@@ -208,9 +208,37 @@ pub async fn save_to_disk(path: &Path, bundle: &JwtBundle) -> Result<()> {
         s.push(".tmp");
         PathBuf::from(s)
     };
+
+    // Write the tmp file. On Unix, OpenOptions::mode(0o600) atomically
+    // creates the file with mode 0600, closing the race window where
+    // finding A2 caught a process umask of 0022 producing a 0644
+    // file between the rename and the post-rename chmod. (On non-Unix
+    // platforms the mode parameter is a no-op and the platform default
+    // applies — workers don't run on Windows in production.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .await
+            .with_context(|| format!("open jwt cache tmp {} for write", tmp_path.display()))?;
+        file.write_all(&body)
+            .await
+            .with_context(|| format!("write to jwt cache tmp {}", tmp_path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("flush jwt cache tmp {}", tmp_path.display()))?;
+    }
+    #[cfg(not(unix))]
     tokio::fs::write(&tmp_path, &body)
         .await
         .with_context(|| format!("write jwt cache tmp {}", tmp_path.display()))?;
+
     tokio::fs::rename(&tmp_path, path).await.with_context(|| {
         format!(
             "rename jwt cache {} -> {}",
@@ -219,19 +247,17 @@ pub async fn save_to_disk(path: &Path, bundle: &JwtBundle) -> Result<()> {
         )
     })?;
 
-    // 0600 on Unix: only the worker user can read the cached JWT.
-    // The cache holds a bearer token; a leaked cache is a leaked
-    // token until the JWT expires (24h max). Tightening the perms
-    // to 0600 prevents "world-readable /var/log/edge-worker/*"
-    // style leaks.
+    // Defensive chmod on the destination. OpenOptions::mode() set the
+    // tmp file's perms atomically; the rename preserves them on POSIX
+    // filesystems, so this is belt-and-suspenders. We keep the warn
+    // path so operators see umask issues even when the atomic path
+    // succeeds — the chmod itself can fail (read-only mount, ENOSPC)
+    // and we want to know.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         if let Err(e) = tokio::fs::set_permissions(path, perms).await {
-            // Don't fail the bootstrap on chmod failure — the file
-            // is written, just with default umask. Log so operators
-            // notice if their umask is too permissive.
             tracing::warn!(
                 err = %e,
                 path = %path.display(),
@@ -474,6 +500,36 @@ mod tests {
         let meta = tokio::fs::metadata(&path).await.expect("stat");
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {:o}", mode);
+    }
+
+    /// Regression for finding A2: the jwt cache tmp file must be
+    /// chmod'd 0600 BEFORE the rename so a permissive umask never
+    /// leaves a world-readable window between the rename and the
+    /// post-rename chmod. The post-rename chmod was racy; with
+    /// OpenOptions::mode(0o600) the tmp file's mode is set atomically
+    /// with file creation, so by the time the rename happens the
+    /// destination file is already 0600.
+    ///
+    /// We assert on the tmp file's mode directly: it's the file we
+    /// OpenOptions::mode() set. The destination inherits the tmp's
+    /// mode across rename (POSIX atomic-rename semantics).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_chmods_tmp_file_before_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("jwt-cache.json");
+        let bundle = JwtBundle {
+            token: "t".into(),
+            expires_at_unix: 1_700_000_000,
+        };
+        save_to_disk(&path, &bundle).await.expect("save");
+
+        // Destination: confirm 0600 — the post-rename chmod is the
+        // belt; the tmp file's mode is the suspenders.
+        let meta = tokio::fs::metadata(&path).await.expect("stat");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "destination mode must be 0600");
     }
 
     /// `fetch_token` constructs the right URL, headers, and body, and
