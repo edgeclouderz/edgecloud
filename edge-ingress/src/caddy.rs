@@ -673,8 +673,7 @@ mod tests {
             .unwrap();
         // routes[0] is the default synthetic host, routes[1] is the FQDN.
         let fqdn_route = &routes[1];
-        let active = &fqdn_route["handle"][0]["routes"][0]["handle"][0]["health_checks"]
-            ["active"];
+        let active = &fqdn_route["handle"][0]["routes"][0]["handle"][0]["health_checks"]["active"];
         assert_eq!(
             active["uri"], "/",
             "FQDN route must probe uri=/ (matches the synthetic-host route shape)"

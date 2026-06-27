@@ -552,11 +552,32 @@ mod tests {
 
         // Seed: {a, b, c, d}
         t.apply_poll_snapshot(vec![
-            Domain { id: "d_a".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "a.acme.com".into() },
-            Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
-            Domain { id: "d_c".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "c.acme.com".into() },
-            Domain { id: "d_d".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "d.acme.com".into() },
-        ]).await;
+            Domain {
+                id: "d_a".into(),
+                tenant_id: "t_a".into(),
+                app_name: "api".into(),
+                fqdn: "a.acme.com".into(),
+            },
+            Domain {
+                id: "d_b".into(),
+                tenant_id: "t_a".into(),
+                app_name: "api".into(),
+                fqdn: "b.acme.com".into(),
+            },
+            Domain {
+                id: "d_c".into(),
+                tenant_id: "t_a".into(),
+                app_name: "api".into(),
+                fqdn: "c.acme.com".into(),
+            },
+            Domain {
+                id: "d_d".into(),
+                tenant_id: "t_a".into(),
+                app_name: "api".into(),
+                fqdn: "d.acme.com".into(),
+            },
+        ])
+        .await;
 
         let snap_before: HashSet<String> = t
             .fqdn_snapshot()
@@ -579,8 +600,18 @@ mod tests {
         let t_a = t.clone();
         let poll_a = tokio::spawn(async move {
             t_a.apply_poll_snapshot(vec![
-                Domain { id: "d_a".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "a.acme.com".into() },
-                Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
+                Domain {
+                    id: "d_a".into(),
+                    tenant_id: "t_a".into(),
+                    app_name: "api".into(),
+                    fqdn: "a.acme.com".into(),
+                },
+                Domain {
+                    id: "d_b".into(),
+                    tenant_id: "t_a".into(),
+                    app_name: "api".into(),
+                    fqdn: "b.acme.com".into(),
+                },
             ])
             .await
         });
@@ -589,8 +620,18 @@ mod tests {
         let t_b = t.clone();
         let poll_b = tokio::spawn(async move {
             t_b.apply_poll_snapshot(vec![
-                Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
-                Domain { id: "d_c".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "c.acme.com".into() },
+                Domain {
+                    id: "d_b".into(),
+                    tenant_id: "t_a".into(),
+                    app_name: "api".into(),
+                    fqdn: "b.acme.com".into(),
+                },
+                Domain {
+                    id: "d_c".into(),
+                    tenant_id: "t_a".into(),
+                    app_name: "api".into(),
+                    fqdn: "c.acme.com".into(),
+                },
             ])
             .await
         });
@@ -609,17 +650,9 @@ mod tests {
             .into_iter()
             .map(|b| b.fqdn)
             .collect();
-        let valid_a_then_b = HashSet::from([
-            "b.acme.com".to_string(),
-            "c.acme.com".to_string(),
-        ]);
-        let valid_b_then_a = HashSet::from([
-            "a.acme.com".to_string(),
-            "b.acme.com".to_string(),
-        ]);
-        let lost_update = HashSet::from([
-            "b.acme.com".to_string(),
-        ]);
+        let valid_a_then_b = HashSet::from(["b.acme.com".to_string(), "c.acme.com".to_string()]);
+        let valid_b_then_a = HashSet::from(["a.acme.com".to_string(), "b.acme.com".to_string()]);
+        let lost_update = HashSet::from(["b.acme.com".to_string()]);
         assert_ne!(
             snap_after, lost_update,
             "concurrent polls lost entries that one of them intended to keep \
