@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -8,13 +10,40 @@ import (
 	"strings"
 )
 
-// ArtifactStore handles Wasm artifact storage on the filesystem.
-type ArtifactStore struct {
+// ArtifactStore persists tenant WASM artifacts. The interface is the
+// contract between the service layer and any backend implementation;
+// production code depends on this type, not on a concrete struct.
+//
+// Three backends implement this interface (see factory.go):
+//   - FSArtifactStore (current filesystem implementation; default)
+//   - S3ArtifactStore (PUT/GET/DELETE against an S3-compatible bucket)
+//   - RemoteArtifactStore (pull-through cache backed by a peer CP over HTTPS)
+//
+// `ctx` is included on every method so S3 / HTTP backends can honor
+// request timeouts. The FS backend ignores it — `os.*` does not take
+// a context. This keeps every call site identical regardless of the
+// backend selected at startup.
+type ArtifactStore interface {
+	Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error
+	Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
+	Delete(ctx context.Context, tenantID, appName, deploymentID string) error
+}
+
+// FSArtifactStore is the filesystem-backed implementation of
+// ArtifactStore. The artifact is written to:
+//
+//	<basePath>/<tenantID>/<appName>/<deploymentID>.wasm
+//
+// All path components are validated for traversal safety before any
+// filesystem operation; a malicious caller passing ".." or "/" in
+// any component gets a 400-equivalent error from the storage layer.
+type FSArtifactStore struct {
 	basePath string
 }
 
-func NewArtifactStore(basePath string) *ArtifactStore {
-	return &ArtifactStore{basePath: basePath}
+// NewFSArtifactStore constructs an FSArtifactStore rooted at basePath.
+func NewFSArtifactStore(basePath string) *FSArtifactStore {
+	return &FSArtifactStore{basePath: basePath}
 }
 
 // validatePathComponent checks that a path component doesn't contain traversal
@@ -34,7 +63,11 @@ func validatePathComponent(name, value string) error {
 
 // Path returns the filesystem path for a deployment artifact.
 // Returns an error if any component is invalid.
-func (s *ArtifactStore) Path(tenantID, appName, deploymentID string) (string, error) {
+//
+// Path is intentionally NOT on the ArtifactStore interface — it is a
+// filesystem leak. Tests use it for assertions; production code uses
+// Save/Open/Delete only.
+func (s *FSArtifactStore) Path(tenantID, appName, deploymentID string) (string, error) {
 	if err := validatePathComponent("tenantID", tenantID); err != nil {
 		return "", err
 	}
@@ -54,8 +87,9 @@ func (s *ArtifactStore) Path(tenantID, appName, deploymentID string) (string, er
 	return path, nil
 }
 
-// Save writes a Wasm artifact to disk.
-func (s *ArtifactStore) Save(tenantID, appName, deploymentID string, r io.Reader) error {
+// Save writes a Wasm artifact to disk. ctx is ignored — `os.Create`
+// and `io.Copy` do not take a context.
+func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {
 		return fmt.Errorf("invalid artifact path: %w", err)
@@ -76,8 +110,9 @@ func (s *ArtifactStore) Save(tenantID, appName, deploymentID string, r io.Reader
 	return nil
 }
 
-// Open reads a Wasm artifact from disk.
-func (s *ArtifactStore) Open(tenantID, appName, deploymentID string) (io.ReadCloser, error) {
+// Open reads a Wasm artifact from disk. ctx is ignored — `os.Open`
+// does not take a context.
+func (s *FSArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid artifact path: %w", err)
@@ -85,11 +120,23 @@ func (s *ArtifactStore) Open(tenantID, appName, deploymentID string) (io.ReadClo
 	return os.Open(path)
 }
 
-// Delete removes a Wasm artifact from disk.
-func (s *ArtifactStore) Delete(tenantID, appName, deploymentID string) error {
+// Delete removes a Wasm artifact from disk. ctx is ignored —
+// `os.Remove` does not take a context.
+//
+// Idempotent: removing a file that doesn't exist returns nil.
+// AppService.Delete (internal/service/app.go) loops over the list
+// of deployments and calls Delete on each — a concurrent delete
+// racing the loop would otherwise surface a spurious error. The
+// pre-interface code documented the same intent ("os.Remove is
+// idempotent") but didn't actually swallow os.ErrNotExist; this
+// fix makes the behavior match the documentation.
+func (s *FSArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {
 		return fmt.Errorf("invalid artifact path: %w", err)
 	}
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }

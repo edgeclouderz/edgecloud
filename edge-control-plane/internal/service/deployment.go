@@ -135,7 +135,7 @@ type DeploymentService struct {
 	appEnvRepo     *repository.AppEnvRepository
 	quotaRepo      *repository.QuotaRepository
 	tenantRepo     *repository.TenantRepository
-	artifactStore  *storage.ArtifactStore
+	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
 	// defaultRegion is this control plane's own region. Used as the
@@ -155,7 +155,7 @@ func NewDeploymentService(
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
 	tenantRepo *repository.TenantRepository,
-	artifactStore *storage.ArtifactStore,
+	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
 ) *DeploymentService {
@@ -293,7 +293,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	}
 
 	// Save artifact
-	if err := s.artifactStore.Save(tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
+	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
 
@@ -728,5 +728,5 @@ func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, 
 	if deployment.TenantID != tenantID || deployment.AppName != appName {
 		return nil, fmt.Errorf("deployment not found")
 	}
-	return s.artifactStore.Open(tenantID, appName, deploymentID)
+	return s.artifactStore.Open(ctx, tenantID, appName, deploymentID)
 }

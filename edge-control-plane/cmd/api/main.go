@@ -104,8 +104,19 @@ func main() {
 		log.Fatalf("Failed to ensure NATS stream: %v", err)
 	}
 
-	// Initialize artifact storage
-	artifactStore := storage.NewArtifactStore(cfg.Storage.ArtifactPath)
+	// Initialize artifact storage via the backend factory. An empty
+	// ArtifactBackend selects the filesystem implementation so existing
+	// deployments need no config change. cfg.Storage.ArtifactPath stays
+	// the canonical cache dir for FS and Remote backends; S3 ignores it.
+	//
+	// Step 4 adds the per-backend fields (S3*, Peer*) to
+	// config.StorageConfig and wires them here.
+	artifactStore, err := storage.New(context.Background(), storage.BackendConfig{
+		ArtifactPath: cfg.Storage.ArtifactPath,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize artifact storage: %v", err)
+	}
 
 	// Initialize services
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
