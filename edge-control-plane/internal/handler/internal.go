@@ -183,7 +183,8 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, service.ErrAutoRollbackDisabled):
 			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
 		case errors.Is(err, service.ErrPublishFailed):
-			http.Error(w, `{"error": "rollback committed but worker notification failed; please retry"}`, http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 		default:
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)

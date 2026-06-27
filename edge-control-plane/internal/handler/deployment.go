@@ -254,6 +254,39 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// writePublishFailureEnvelope writes the 502 Bad Gateway response for
+// a partially-failed Activate / Rollback / AutoRollback publish. The
+// body carries the per-region breakdown so the operator can see
+// exactly which regions got the message and which are pending retry.
+//
+// Used by all three 502 sites in this file + handler/internal.go.
+// If err is not a *service.PublishError (e.g. a future regression
+// that bypasses the typed wrapper), the body falls back to an
+// empty arrays + the static error message — the 502 contract
+// holds regardless. errors.Is(err, service.ErrPublishFailed) is
+// still matched by the caller before this helper is reached, so
+// callers don't need to repeat the sentinel check.
+func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	body := map[string]any{"error": staticMessage}
+	var pubErr *service.PublishError
+	if errors.As(err, &pubErr) {
+		body["regions_published"] = pubErr.Published
+		body["regions_failed"] = pubErr.Failed
+	} else {
+		// Defense-in-depth: a non-PublishError reaching this path
+		// would have bypassed the typed wrapper. Still emit the
+		// arrays as empty so the JSON shape stays stable for
+		// clients (the 502 contract is "always have these two keys").
+		body["regions_published"] = []string{}
+		body["regions_failed"] = []string{}
+	}
+	if encErr := json.NewEncoder(w).Encode(body); encErr != nil {
+		log.Printf("internal error: encoding publish failure envelope: %v", encErr)
+	}
+}
+
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
 //
 // Status codes:
@@ -304,9 +337,8 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 			if errors.Is(err, service.ErrPublishFailed) {
-				http.Error(w,
-					`{"error": "activation committed but worker notification failed; please retry"}`,
-					http.StatusBadGateway)
+				writePublishFailureEnvelope(w, r, err,
+					"activation committed but worker notification failed; please retry")
 				return
 			}
 			log.Printf("internal error: %v", err)
@@ -385,9 +417,8 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, service.ErrPublishFailed) {
-			http.Error(w,
-				`{"error": "rollback committed but worker notification failed; please retry"}`,
-				http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 			return
 		}
 		log.Printf("internal error: %v", err)
