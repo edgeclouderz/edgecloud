@@ -78,6 +78,7 @@ func InternalAuth(expectedToken string) func(http.Handler) http.Handler {
 // can be looked up.
 func InternalOrWorkerAuth(workerCfg WorkerJWTConfig, expectedToken string) func(http.Handler) http.Handler {
 	workerGate := WorkerAuth(workerCfg)
+	tokenGate := InternalAuth(expectedToken)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Lane 1: worker JWT. If the request has an Authorization
@@ -89,22 +90,10 @@ func InternalOrWorkerAuth(workerCfg WorkerJWTConfig, expectedToken string) func(
 				workerGate(next).ServeHTTP(w, r)
 				return
 			}
-			// Lane 2: shared-secret internal token. Disabled when
-			// expectedToken is empty (fail-closed).
-			if expectedToken == "" {
-				httperror.UnauthorizedCtx(w, r, "internal token not configured on this control plane")
-				return
-			}
-			got := r.Header.Get("X-Internal-Token")
-			if got == "" {
-				httperror.UnauthorizedCtx(w, r, "missing credentials (need worker JWT or X-Internal-Token)")
-				return
-			}
-			if subtle.ConstantTimeCompare([]byte(got), []byte(expectedToken)) != 1 {
-				httperror.UnauthorizedCtx(w, r, "invalid internal token")
-				return
-			}
-			next.ServeHTTP(w, r)
+			// Lane 2: shared-secret internal token. Delegated entirely
+			// to InternalAuth, which already fail-closes on empty
+			// expectedToken and does the constant-time compare.
+			tokenGate(next).ServeHTTP(w, r)
 		})
 	}
 }
