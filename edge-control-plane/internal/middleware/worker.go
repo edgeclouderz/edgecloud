@@ -8,17 +8,16 @@ import (
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/workerclaims"
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// WorkerClaims are the JWT claims issued to workers.
-type WorkerClaims struct {
-	jwt.RegisteredClaims
-	WorkerID string   `json:"worker_id"`
-	TenantID string   `json:"tenant_id"`
-	Region   string   `json:"region"`
-	Apps     []string `json:"apps"`
-}
+// WorkerClaims is re-exported from `workerclaims` so existing
+// callers (handler/internal.go, the test files) don't need to
+// switch imports. The type itself lives in the neutral package to
+// break the import cycle that would otherwise form between
+// `middleware` and `service` (mint and verify both need the type).
+type WorkerClaims = workerclaims.WorkerClaims
 
 // WorkerJWTConfig holds the HMAC secret and expected issuer.
 type WorkerJWTConfig struct {
