@@ -210,7 +210,7 @@ mod tests {
     /// Look up the first match for `pat` in `matches`. Pulled into a
     /// helper to avoid the temporary-lifetime borrow errors that
     /// surface when chaining `.analyze(...)` into `find_one` directly.
-    fn first<'a>(matches: &'a [PatternMatch], pat: RustPattern) -> &'a PatternMatch {
+    fn first(matches: &[PatternMatch], pat: RustPattern) -> &PatternMatch {
         matches
             .iter()
             .find(|m| m.pattern == PatternKind::Rust(pat))
@@ -326,7 +326,7 @@ fn main() {
 "#;
         let matches = a.analyze(src);
         let m = first(&matches, RustPattern::TcpAccept);
-        assert_eq!(m.transformability, Transformability::BestEffort);
+        assert_eq!(m.transformability, Transformability::NotTransformable);
     }
 
     #[test]

@@ -220,18 +220,15 @@ impl CAnalyzer {
                     if m.original_start_byte <= source.len() {
                         if let Some(head) = snippet_head_token(&m.snippet) {
                             if !source[m.original_start_byte..].starts_with(head) {
-                                if let Some(found) = find_snippet_in_source(
-                                    source,
-                                    head,
-                                    m.original_start_byte,
-                                ) {
+                                if let Some(found) =
+                                    find_snippet_in_source(source, head, m.original_start_byte)
+                                {
                                     let found = found
                                         .min(m.original_start_byte + SEARCH_BUDGET)
                                         .min(source.len());
                                     let len = m.end_byte.saturating_sub(m.start_byte);
                                     m.original_start_byte = found;
-                                    m.original_end_byte =
-                                        (found + len).min(source.len());
+                                    m.original_end_byte = (found + len).min(source.len());
                                 }
                             }
                         }
@@ -254,8 +251,7 @@ impl CAnalyzer {
                         }
                         if let Some(&(exp_end, orig_end)) = byte_map.get(expanded_row) {
                             if orig_end != u32::MAX {
-                                let col_end =
-                                    bv.decl_end_byte.saturating_sub(exp_end as usize);
+                                let col_end = bv.decl_end_byte.saturating_sub(exp_end as usize);
                                 bv.original_decl_end_byte = orig_end as usize + col_end;
                             }
                         }
@@ -316,9 +312,7 @@ impl CAnalyzer {
                             // would over-slice into the next statement
                             // for macro-expanded calls).
                             let needle = format!("{} = ", bv.name);
-                            if !source[bv.original_decl_start_byte..]
-                                .starts_with(needle.as_str())
-                            {
+                            if !source[bv.original_decl_start_byte..].starts_with(needle.as_str()) {
                                 if let Some(name_pos) = find_snippet_in_source(
                                     source,
                                     &needle,
@@ -578,9 +572,7 @@ fn find_decl_start(source: &str, name_pos: usize) -> usize {
             // non-whitespace character of the declaration (the
             // type token: `int`, `long`, `static int`, etc.).
             let mut start = pos;
-            while start < bytes.len()
-                && (bytes[start] == b' ' || bytes[start] == b'\t')
-            {
+            while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
                 start += 1;
             }
             return start;
@@ -590,9 +582,7 @@ fn find_decl_start(source: &str, name_pos: usize) -> usize {
     // At the start of the file. Skip leading whitespace so the slice
     // starts at the first non-whitespace character.
     let mut start = 0;
-    while start < bytes.len()
-        && (bytes[start] == b' ' || bytes[start] == b'\t')
-    {
+    while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
         start += 1;
     }
     start
@@ -1037,8 +1027,7 @@ int main(void) {
                 // refine to the type prefix and statement end.
                 let decl_slice =
                     &source_bytes[bv.original_decl_start_byte..bv.original_decl_end_byte];
-                let decl_str = std::str::from_utf8(decl_slice)
-                    .expect("decl slice is valid UTF-8");
+                let decl_str = std::str::from_utf8(decl_slice).expect("decl slice is valid UTF-8");
                 assert!(
                     decl_str.starts_with("int fd = "),
                     "remapped decl range should start at the type prefix `int fd = `; got: {:?}",
@@ -1151,8 +1140,7 @@ int main(void) {
         // must detect this and flip the match to NotTransformable
         // so it lands in manual_review.
         let mut analyzer = CAnalyzer::new();
-        let source =
-            "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let source = "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
         let matches = analyzer.analyze(source);
         let socket_match = matches
             .iter()
