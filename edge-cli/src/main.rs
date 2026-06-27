@@ -67,6 +67,25 @@ impl From<DomainsCommand> for commands::domains::DomainsAction {
     }
 }
 
+/// `edge cluster <status|events>` — operator cluster-admin
+/// subcommands (issue #85). Both routes require the `owner` role;
+/// the control plane rejects other roles with 403.
+#[derive(Subcommand)]
+enum ClusterCommand {
+    /// Print a per-region, per-worker snapshot of the cluster.
+    Status,
+    /// List recent autoscaler events (newest first).
+    Events {
+        /// Restrict to one region (e.g. `fra`). Omit for all regions.
+        #[arg(long)]
+        region: Option<String>,
+        /// Maximum events to return. Server clamps to [1, 500].
+        /// Default: 50.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Scaffold a new project.
@@ -241,6 +260,11 @@ enum Command {
     /// Manage custom FQDNs bound to a deployment (issue #83).
     #[command(subcommand)]
     Domains(DomainsCommand),
+
+    /// Cluster-admin subcommands (issue #85). Owner-only — the
+    /// control plane rejects other roles with 403.
+    #[command(subcommand)]
+    Cluster(ClusterCommand),
 }
 
 #[derive(Subcommand)]
@@ -320,6 +344,12 @@ fn main() -> Result<()> {
             let action: commands::domains::DomainsAction = cmd.into();
             action.run(&cli.path)
         }
+        Command::Cluster(cmd) => match cmd {
+            ClusterCommand::Status => commands::cluster::status(&cli.path),
+            ClusterCommand::Events { region, limit } => {
+                commands::cluster::events(&cli.path, region.as_deref(), limit)
+            }
+        },
     }
 }
 

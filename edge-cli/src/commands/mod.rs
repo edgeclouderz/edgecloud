@@ -3,6 +3,7 @@
 pub mod activate;
 pub mod auth;
 pub mod build;
+pub mod cluster;
 pub mod deploy;
 pub mod deployments;
 pub mod dev;
