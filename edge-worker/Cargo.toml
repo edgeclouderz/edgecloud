@@ -24,8 +24,11 @@ bytes = "1.0"
 futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
+edge-spool = { path = "../edge-spool" }
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
 
@@ -42,3 +45,8 @@ tempfile = "3"
 # function the NATS subscriber loop drives) without standing up the full
 # ingress binary.
 edge-ingress = { path = "../edge-ingress" }
+# Shared integration-test helpers (NATS container, skip-predicate,
+# Supervisor wiring). Phase 2 extracted the byte-identical
+# `should_skip_integration_tests` + `nats_container` and the supervisor
+# construction logic into this crate. The crate is `publish = false`.
+edge-test-helpers = { path = "../edge-test-helpers" }
