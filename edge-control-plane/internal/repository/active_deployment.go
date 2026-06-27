@@ -260,6 +260,7 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 	return ads, err
 }
 
+<<<<<<< HEAD
 // AppendRegionsPublished atomically merges `regions` into the
 // `regions_published` array on the (tenant, app) active row, AND
 // removes them from `regions_failed` (a region that succeeds on
@@ -323,4 +324,16 @@ func (r *ActiveDeploymentRepository) AppendRegionsFailed(ctx context.Context, te
 	regionsArr := domain.StringArrayFrom(regions)
 	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr, ts, attemptID)
 	return err
+}
+
+// Count returns the fleet-wide count of active_deployments rows.
+// The autoscaler (issue #85) uses this to compute its target
+// headroom — every region sizes its own fleet against the same
+// DesiredApps value because the deployment table is global
+// (region lives on workers, not on deployments). Multi-region
+// partitioning is a separate concern.
+func (r *ActiveDeploymentRepository) Count(ctx context.Context) (int, error) {
+	var count int
+	err := r.db.GetContext(ctx, &count, `SELECT COUNT(*) FROM active_deployments`)
+	return count, err
 }

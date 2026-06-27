@@ -16,6 +16,11 @@ type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	JWT       JWTConfig       `yaml:"jwt"`
 	Migration MigrationConfig `yaml:"migration"`
+	// Autoscale configures the cluster autoscaler (issue #85).
+	// Disabled by default — operators flip `enabled: true` once the
+	// fleet has multiple workers and the cloud-provider integration
+	// (NoopCloudProvider today; Hetzner in a follow-up) is ready.
+	Autoscale AutoscaleConfig `yaml:"autoscale"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
 	// multi-region — preserves today's "publish one TaskMessage to a
@@ -218,6 +223,62 @@ func Load(path string) (*Config, error) {
 		cfg.Migration.RustcPath = v
 	}
 
+	// Override with autoscale config env vars (issue #85). Each value
+	// has a yaml-set default; env vars override on top so operators
+	// can flip a single knob without editing config.yaml.
+	if v := os.Getenv("AUTOSCALE_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_ENABLED must be a valid boolean: %w", err)
+		}
+		cfg.Autoscale.Enabled = enabled
+	}
+	if v := os.Getenv("AUTOSCALE_MIN_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_MIN_WORKERS must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.MinWorkers = n
+	}
+	if v := os.Getenv("AUTOSCALE_MAX_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_MAX_WORKERS must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.MaxWorkers = n
+	}
+	if v := os.Getenv("AUTOSCALE_TARGET_HEADROOM_PCT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_TARGET_HEADROOM_PCT must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.TargetHeadroomPct = n
+	}
+	if v := os.Getenv("AUTOSCALE_SCALE_UP_COOLDOWN_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_SCALE_UP_COOLDOWN_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.ScaleUpCooldownS = n
+	}
+	if v := os.Getenv("AUTOSCALE_SCALE_DOWN_COOLDOWN_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_SCALE_DOWN_COOLDOWN_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.ScaleDownCooldownS = n
+	}
+	if v := os.Getenv("AUTOSCALE_DECISION_INTERVAL_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_DECISION_INTERVAL_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.DecisionIntervalS = n
+	}
+	if v := os.Getenv("AUTOSCALE_PROVIDER_KIND"); v != "" {
+		cfg.Autoscale.ProviderKind = v
+	}
+
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
 		cfg.JWT.Issuer = "edgecloud"
@@ -250,6 +311,13 @@ func Load(path string) (*Config, error) {
 	// env var that names a backend whose required fields are missing from
 	// the YAML still fails startup with a clear message.
 	if err := validateStorageConfig(&cfg.Storage); err != nil {
+		return nil, err
+	}
+
+	// Validate autoscale config when enabled (issue #85). Catches the
+	// common operator mistake of `max_workers: 2, min_workers: 50` —
+	// which would mean the autoscaler constantly fights itself.
+	if err := cfg.Autoscale.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -366,4 +434,81 @@ type MigrationConfig struct {
 	// language == "rust" to compile the transformed source into a
 	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
 	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
+}
+
+// AutoscaleConfig configures the cluster autoscaler (issue #85).
+// Defaults match the values the issue calls out: 2-50 workers, 20%
+// target headroom, 60s/300s cooldowns, 30s decision tick, noop
+// provider. `enabled: false` by default so a fresh dev single-worker
+// setup doesn't try to provision workers out of the box.
+type AutoscaleConfig struct {
+	// Enabled is the master switch. When false, the autoscaler service
+	// is constructed but never subscribes to heartbeats (cmd/api/main.go
+	// short-circuits). Operators flip this on once the cluster has
+	// multiple workers AND a real cloud-provider is wired in
+	// (NoopCloudProvider is fine for dev).
+	Enabled bool `yaml:"enabled"`
+	// MinWorkers is the floor on the fleet size. If the autoscaler
+	// observes fewer than this, it scale_ups to MinWorkers regardless
+	// of headroom. Default 2 so a single-worker crash doesn't strand
+	// tenants.
+	MinWorkers int `yaml:"min_workers"`
+	// MaxWorkers is the ceiling. The autoscaler will never request
+	// more than this many workers per region. Default 50 — high enough
+	// for ~5,000 apps at 100/worker.
+	MaxWorkers int `yaml:"max_workers"`
+	// TargetHeadroomPct is the extra capacity the autoscaler maintains
+	// above the active-deployment count. 20% means once the cluster
+	// has 100 active deployments, the autoscaler scales until free
+	// slots >= 120. Default 20.
+	TargetHeadroomPct int `yaml:"target_headroom_pct"`
+	// ScaleUpCooldownS gates back-to-back scale-up events. Issue #85
+	// specifies ≤1 scale-up per 60s; we default to exactly 60s.
+	ScaleUpCooldownS int `yaml:"scale_up_cooldown_s"`
+	// ScaleDownCooldownS gates back-to-back scale-down events. Higher
+	// than scale-up so a transient dip doesn't kill a worker that
+	// would be needed again 30s later. Default 300s (5 minutes).
+	ScaleDownCooldownS int `yaml:"scale_down_cooldown_s"`
+	// DecisionIntervalS controls how often the autoscaler re-evaluates
+	// the fleet. Should be ≥ heartbeat cadence (30s) so a heartbeat
+	// batch produces at most one decision. Default 30. Tests override
+	// this to 1s for fast feedback.
+	DecisionIntervalS int `yaml:"decision_interval_s"`
+	// ProviderKind selects the CloudProvider implementation:
+	//   - "noop"  — logs only; default for dev.
+	//   - "mock"  — function-field mock; tests.
+	//   - "hetzner" / "aws" / "gcp" — separate follow-up PRs.
+	ProviderKind string `yaml:"provider_kind"`
+}
+
+// Validate checks invariants that would silently produce nonsense
+// decisions if violated. Returns a sentinel-shape error so callers can
+// fail startup loudly via `cmd/api/main.go`. Specifically:
+//   - Enabled=true requires MinWorkers > 0 and MaxWorkers >= MinWorkers
+//   - TargetHeadroomPct must be in [0, 1000] (a 1000% buffer is silly but valid)
+//   - Both cooldowns must be ≥ 0
+//   - DecisionIntervalS must be ≥ 1s
+func (a AutoscaleConfig) Validate() error {
+	if !a.Enabled {
+		return nil
+	}
+	if a.MinWorkers <= 0 {
+		return fmt.Errorf("autoscale.min_workers must be > 0 when enabled (got %d)", a.MinWorkers)
+	}
+	if a.MaxWorkers < a.MinWorkers {
+		return fmt.Errorf("autoscale.max_workers (%d) must be >= min_workers (%d)", a.MaxWorkers, a.MinWorkers)
+	}
+	if a.TargetHeadroomPct < 0 || a.TargetHeadroomPct > 1000 {
+		return fmt.Errorf("autoscale.target_headroom_pct must be in [0, 1000] (got %d)", a.TargetHeadroomPct)
+	}
+	if a.ScaleUpCooldownS < 0 {
+		return fmt.Errorf("autoscale.scale_up_cooldown_s must be >= 0 (got %d)", a.ScaleUpCooldownS)
+	}
+	if a.ScaleDownCooldownS < 0 {
+		return fmt.Errorf("autoscale.scale_down_cooldown_s must be >= 0 (got %d)", a.ScaleDownCooldownS)
+	}
+	if a.DecisionIntervalS < 1 {
+		return fmt.Errorf("autoscale.decision_interval_s must be >= 1 (got %d)", a.DecisionIntervalS)
+	}
+	return nil
 }
