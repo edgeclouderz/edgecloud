@@ -11,6 +11,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
 // InternalHandler handles internal worker-facing endpoints.
@@ -42,6 +43,10 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID)
 	if err != nil {
+		if errors.Is(err, storage.ErrArtifactTooLarge) {
+			httperror.PayloadTooLargeCtx(w, r, "artifact exceeds maximum size")
+			return
+		}
 		httperror.NotFoundCtx(w, r, "artifact not found")
 		return
 	}

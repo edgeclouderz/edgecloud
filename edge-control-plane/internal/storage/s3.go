@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 )
 
 // S3ArtifactStore persists WASM artifacts in an S3-compatible object
@@ -58,7 +60,7 @@ var osGetenv = os.Getenv
 // constructs the store. Returns an error if S3Bucket or S3Region is
 // empty — the operator's config is incomplete and we'd rather fail at
 // startup than on the first deploy.
-func NewS3ArtifactStore(ctx context.Context, cfg BackendConfig) (*S3ArtifactStore, error) {
+func NewS3ArtifactStore(ctx context.Context, cfg config.StorageConfig) (*S3ArtifactStore, error) {
 	if cfg.S3Bucket == "" {
 		return nil, fmt.Errorf("S3ArtifactStore: S3Bucket is required")
 	}
@@ -117,8 +119,12 @@ func (s *S3ArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 // handler surfaces a clean 404 without having to special-case
 // S3ArtifactStore.
 //
-// The returned ReadCloser wraps resp.Body — callers MUST Close to
-// release the underlying connection.
+// The returned ReadCloser wraps resp.Body with a MaxArtifactSize cap
+// (see limitReadCloser in storage.go). This stops a hostile or
+// misconfigured S3 response from OOM-ing the worker when streamed
+// into io.Copy — once the cap is hit, Read returns ErrArtifactTooLarge
+// and the handler maps it to HTTP 413. Callers MUST Close to release
+// the underlying connection.
 func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
 	key, err := s.key(tenantID, appName, deploymentID)
 	if err != nil {
@@ -141,7 +147,7 @@ func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymen
 		resp.Body.Close()
 		return nil, fmt.Errorf("S3ArtifactStore.Open: GET %s: status %d", key, resp.StatusCode)
 	}
-	return resp.Body, nil
+	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
 }
 
 // Delete DELETEs the artifact bytes from S3. Idempotent: a 404 (key

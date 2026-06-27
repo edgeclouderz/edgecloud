@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -405,6 +406,66 @@ func TestS3ArtifactStore_KeyPrefix(t *testing.T) {
 	}
 	if got != "tenants/t/a/d.wasm" {
 		t.Errorf("key = %q, want tenants/t/a/d.wasm", got)
+	}
+}
+
+// TestS3ArtifactStore_Open_CapEnforcedDuringRead covers the size cap
+// introduced for issue #127 follow-ups: an S3 GET response larger
+// than MaxArtifactSize must surface ErrArtifactTooLarge from Open so
+// the worker download handler maps it to HTTP 413 instead of
+// streaming the full body into memory.
+//
+// The test server streams a payload larger than the cap; the wrapper
+// stops reading at exactly MaxArtifactSize bytes and the next read
+// returns ErrArtifactTooLarge. Total bytes received by the caller
+// must be bounded by MaxArtifactSize.
+func TestS3ArtifactStore_Open_CapEnforcedDuringRead(t *testing.T) {
+	oversize := MaxArtifactSize + 4096 // 4 KiB past the cap is enough
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/wasm")
+		w.WriteHeader(http.StatusOK)
+		// Stream oversize bytes; the limitReadCloser wrapper should
+		// stop the consumer well before we exhaust this.
+		_, _ = w.Write(make([]byte, oversize))
+	})
+	rc, err := ts.store.Open(t.Context(), "t", "a", "d")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if !errors.Is(err, ErrArtifactTooLarge) {
+		t.Errorf("ReadAll: want ErrArtifactTooLarge, got %v (got %d bytes)", err, len(got))
+	}
+	if int64(len(got)) > MaxArtifactSize {
+		t.Errorf("ReadAll received %d bytes past the cap (max %d)", len(got), MaxArtifactSize)
+	}
+}
+
+// TestS3ArtifactStore_Open_UnderCapRoundTrip pins that a response at
+// or under MaxArtifactSize streams through cleanly with no error.
+// Complements TestS3ArtifactStore_Open_CapEnforcedDuringRead.
+func TestS3ArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/wasm")
+		w.Write(payload)
+	})
+	rc, err := ts.store.Open(t.Context(), "t", "a", "d")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload mismatch: got %d bytes, want %d", len(got), len(payload))
 	}
 }
 

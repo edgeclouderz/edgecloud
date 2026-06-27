@@ -146,3 +146,75 @@ func TestFSArtifactStore_Path_BuildsUnderBasePath(t *testing.T) {
 		t.Errorf("Path basename = %q, want d_1.wasm", filepath.Base(got))
 	}
 }
+
+// TestFSArtifactStore_Open_RejectsOversizedFile covers the size cap
+// introduced for issue #127 follow-ups: a file larger than
+// MaxArtifactSize must surface ErrArtifactTooLarge at Open time so
+// the download handler can map it to HTTP 413 instead of streaming
+// the full file into memory.
+//
+// We use a sparse file (just an info.Size() > MaxArtifactSize layout)
+// rather than writing a 100+ MiB buffer into the test — the cap is
+// checked from Stat before any read.
+func TestFSArtifactStore_Open_RejectsOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFSArtifactStore(dir)
+
+	// Build a sparse file whose reported size is one byte past the cap.
+	path, err := s.Path("t_1", "hello", "d_1")
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := f.Truncate(MaxArtifactSize + 1); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	f.Close()
+
+	_, err = s.Open(context.Background(), "t_1", "hello", "d_1")
+	if !errors.Is(err, ErrArtifactTooLarge) {
+		t.Errorf("Open oversized: want ErrArtifactTooLarge, got %v", err)
+	}
+}
+
+// TestFSArtifactStore_Open_CapEnforcedDuringRead covers the second
+// layer of the cap: a file exactly at the cap returns all bytes
+// successfully, but a file whose size is reported as under cap yet
+// returns more bytes than the cap on read (simulated by a hand-rolled
+// reader) also surfaces ErrArtifactTooLarge.
+//
+// This test exercises the limitReadCloser wrapper directly because
+// synthesizing a "Stat says under cap but Read overshoots" file is
+// not portable across filesystems.
+func TestFSArtifactStore_Open_CapEnforcedDuringRead(t *testing.T) {
+	// Under cap.
+	underRC := io.NopCloser(bytes.NewReader(make([]byte, 100)))
+	wrapped := newLimitReadCloser(underRC, 100)
+	got, err := io.ReadAll(wrapped)
+	if err != nil {
+		t.Fatalf("under-cap ReadAll: %v", err)
+	}
+	if len(got) != 100 {
+		t.Errorf("under-cap: got %d bytes, want 100", len(got))
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Errorf("under-cap Close: %v", err)
+	}
+
+	// Reader claims under-cap size but returns more bytes than budget.
+	overRC := io.NopCloser(bytes.NewReader(make([]byte, 500)))
+	wrapped2 := newLimitReadCloser(overRC, 100)
+	got2, err := io.ReadAll(wrapped2)
+	if !errors.Is(err, ErrArtifactTooLarge) {
+		t.Errorf("over-cap: want ErrArtifactTooLarge, got %v (got %d bytes)", err, len(got2))
+	}
+	if len(got2) > 100 {
+		t.Errorf("over-cap: %d bytes leaked past cap", len(got2))
+	}
+}

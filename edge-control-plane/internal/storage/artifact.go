@@ -120,12 +120,28 @@ func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 
 // Open reads a Wasm artifact from disk. ctx is ignored — `os.Open`
 // does not take a context.
+//
+// Defense-in-depth: a Stat pre-check rejects files larger than
+// MaxArtifactSize before opening (cheaper than reading), and the
+// returned ReadCloser is wrapped in a limitReadCloser so a concurrent
+// writer cannot inflate the file past the cap between Stat and Open.
 func (s *FSArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid artifact path: %w", err)
 	}
-	return os.Open(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > MaxArtifactSize {
+		return nil, fmt.Errorf("%w: file is %d bytes", ErrArtifactTooLarge, info.Size())
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return newLimitReadCloser(f, MaxArtifactSize), nil
 }
 
 // Delete removes a Wasm artifact from disk. ctx is ignored —
