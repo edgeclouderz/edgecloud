@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 )
 
 // RemoteArtifactStore is a pull-through cache: a local FS cache in
@@ -42,13 +44,19 @@ import (
 //     the request's headers) doesn't leak them upward.
 //
 // Cold-cache race (issue #127 Risk 3 mitigation): two concurrent
-// pull-throughs for the same key both write to the same deterministic
-// staging path (`cacheDir/.staging/{deploymentID}.tmp`). The second
-// writer's `os.Create` truncates the first stream; the second
-// `os.Rename` overwrites the first. The end state is consistent
-// regardless of which writer wins — the file is the same content
-// either way. Cheaper than singleflight.Group and survives process
+// pull-throughs for the same key both create their own staging file
+// via `os.CreateTemp` (per-process + random suffix, no truncation).
+// The on-disk footprint briefly doubles while both writers stream,
+// but the rename target is the canonical path — `os.Rename` is atomic
+// on POSIX, so the final file is byte-identical regardless of which
+// process wins. Cheaper than singleflight.Group and survives process
 // restarts.
+//
+// Orphan janitor: on construction we sweep `.staging/` and remove
+// any leftover `.tmp` files older than `stagingJanitorThreshold`.
+// A live pull completes in seconds; anything older than 24 h is
+// unambiguously orphaned (the prior process died holding it, or it
+// pre-dates a deploy that included the janitor).
 type RemoteArtifactStore struct {
 	cache     *FSArtifactStore
 	peerURL   string
@@ -57,12 +65,22 @@ type RemoteArtifactStore struct {
 	httpClient *http.Client
 }
 
+// stagingJanitorThreshold is the minimum age for a leftover staging
+// file to be considered orphaned. A live pull completes in seconds;
+// 24 h is a generous bound so a legitimate in-flight pull is never
+// swept out from under its writer.
+const stagingJanitorThreshold = 24 * time.Hour
+
 // NewRemoteArtifactStore validates the required peer config fields
 // (URL + token + cache dir) and constructs the store. Fail-closed:
 // empty peerURL, empty peerToken, or http:// peerURL returns an error
 // so a misconfigured peer can't silently fall back to an
 // unauthenticated GET or leak the token in transit.
-func NewRemoteArtifactStore(cfg BackendConfig) (*RemoteArtifactStore, error) {
+//
+// On success the constructor sweeps any orphaned staging files
+// (see sweepStagingDir) so a long-broken deployment doesn't
+// accumulate `.tmp` debris indefinitely.
+func NewRemoteArtifactStore(cfg config.StorageConfig) (*RemoteArtifactStore, error) {
 	if cfg.PeerControlPlaneURL == "" {
 		return nil, fmt.Errorf("RemoteArtifactStore: PeerControlPlaneURL is required")
 	}
@@ -82,14 +100,42 @@ func NewRemoteArtifactStore(cfg BackendConfig) (*RemoteArtifactStore, error) {
 			cfg.PeerControlPlaneURL,
 		)
 	}
-	return &RemoteArtifactStore{
+	s := &RemoteArtifactStore{
 		cache:     NewFSArtifactStore(cfg.ArtifactPath),
 		peerURL:   strings.TrimRight(cfg.PeerControlPlaneURL, "/"),
 		peerToken: cfg.PeerControlPlaneInternalToken,
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second, // large enough for the biggest artifact (100 MiB cap)
 		},
-	}, nil
+	}
+	s.sweepStagingDir()
+	return s, nil
+}
+
+// sweepStagingDir removes any leftover staging files older than
+// stagingJanitorThreshold. Called once from NewRemoteArtifactStore.
+// Best-effort: errors reading the dir or stat'ing a file are
+// silently ignored (we don't want a transient FS hiccup to fail
+// startup — the next sweep or the next janitor pass will catch it).
+func (s *RemoteArtifactStore) sweepStagingDir() {
+	stagingDir := filepath.Join(s.cache.BasePath(), ".staging")
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		return // first run, dir doesn't exist yet
+	}
+	cutoff := time.Now().Add(-stagingJanitorThreshold)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(stagingDir, e.Name()))
+		}
+	}
 }
 
 // Save writes only to the local cache (v1). Pre-warming peers is a
@@ -101,8 +147,9 @@ func (s *RemoteArtifactStore) Save(ctx context.Context, tenantID, appName, deplo
 // Open checks the local cache and falls back to a peer CP GET.
 // On cache hit, the FSArtifactStore's ReadCloser is returned directly.
 // On cache miss, the artifact is fetched from the peer, streamed to a
-// staging file, atomically renamed into the cache, and re-opened for
-// the caller.
+// staging file, atomically renamed into the cache, and opened for
+// the caller via os.Open on the canonical path (no second
+// cache.Open round-trip).
 //
 // Returns os.ErrNotExist (via fs.PathError) if BOTH the local cache and
 // the peer return 404 — the existing `httperror.NotFoundCtx` path in
@@ -120,7 +167,14 @@ func (s *RemoteArtifactStore) Open(ctx context.Context, tenantID, appName, deplo
 	if err := s.pullFromPeer(ctx, tenantID, appName, deploymentID); err != nil {
 		return nil, err
 	}
-	return s.cache.Open(ctx, tenantID, appName, deploymentID)
+	// pullFromPeer just renamed the canonical file into place; open
+	// it directly rather than round-tripping through cache.Open
+	// (which would re-Stat the same path we already validated).
+	finalPath, err := s.cache.Path(tenantID, appName, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("RemoteArtifactStore.Open: cache path: %w", err)
+	}
+	return os.Open(finalPath)
 }
 
 // Delete removes the local cache entry only. Cross-CP GC is a
@@ -168,17 +222,14 @@ func (s *RemoteArtifactStore) pullFromPeer(ctx context.Context, tenantID, appNam
 	}
 
 	// Stream the body into a staging file, then atomic-rename into
-	// the cache. The staging path is per-deploymentID (not per-tenant
-	// + per-app) because the rename target uniquely identifies the
-	// artifact and we only need uniqueness during the single download
-	// in flight. Two concurrent downloads for the same deploymentID
-	// race on the staging file by design (Risk 3 — last writer wins,
-	// and the result is identical bytes either way).
+	// the cache. The staging file uses os.CreateTemp so two concurrent
+	// downloads for the same deploymentID no longer truncate each
+	// other (Risk 3 — both streams write to separate fds; the final
+	// rename target is canonical and atomic).
 	stagingDir := filepath.Join(s.cache.BasePath(), ".staging")
 	if err := os.MkdirAll(stagingDir, 0755); err != nil {
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: mkdir staging: %w", err)
 	}
-	stagingPath := filepath.Join(stagingDir, deploymentID+".tmp")
 	finalPath, err := s.cache.Path(tenantID, appName, deploymentID)
 	if err != nil {
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: invalid cache path: %w", err)
@@ -187,27 +238,36 @@ func (s *RemoteArtifactStore) pullFromPeer(ctx context.Context, tenantID, appNam
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: mkdir cache dir: %w", err)
 	}
 
-	f, err := os.Create(stagingPath)
+	// os.CreateTemp gives us a per-process random suffix so we don't
+	// truncate an in-flight stream from another downloader. The
+	// rename below still publishes the same canonical finalPath.
+	stagingFile, err := os.CreateTemp(stagingDir, deploymentID+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: create staging: %w", err)
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		os.Remove(stagingPath)
+	stagingPath := stagingFile.Name()
+	// Best-effort cleanup on any non-success path. The successful
+	// rename below removes stagingPath from stagingDir; this defer
+	// catches every other exit (including panics).
+	defer func() {
+		if _, statErr := os.Stat(stagingPath); statErr == nil {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+
+	if _, err := io.Copy(stagingFile, resp.Body); err != nil {
+		stagingFile.Close()
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: write staging: %w", err)
 	}
 	// fsync so the bytes are durable before we publish the rename.
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(stagingPath)
+	if err := stagingFile.Sync(); err != nil {
+		stagingFile.Close()
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: fsync staging: %w", err)
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(stagingPath)
+	if err := stagingFile.Close(); err != nil {
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: close staging: %w", err)
 	}
 	if err := os.Rename(stagingPath, finalPath); err != nil {
-		os.Remove(stagingPath)
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: rename to cache: %w", err)
 	}
 	return nil

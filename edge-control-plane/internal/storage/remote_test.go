@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 )
 
 // TestRemoteArtifactStore_ColdCachePullsFromPeer pins the basic
@@ -189,7 +191,7 @@ func TestNewRemoteArtifactStore_RejectsInsecureURL(t *testing.T) {
 	}
 	for _, u := range cases {
 		t.Run(u, func(t *testing.T) {
-			_, err := NewRemoteArtifactStore(BackendConfig{
+			_, err := NewRemoteArtifactStore(config.StorageConfig{
 				ArtifactPath:                  t.TempDir(),
 				PeerControlPlaneURL:           u,
 				PeerControlPlaneInternalToken: "tok",
@@ -206,7 +208,7 @@ func TestNewRemoteArtifactStore_RejectsInsecureURL(t *testing.T) {
 func TestNewRemoteArtifactStore_HTTPS_ConstructsOK(t *testing.T) {
 	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer peer.Close()
-	if _, err := NewRemoteArtifactStore(BackendConfig{
+	if _, err := NewRemoteArtifactStore(config.StorageConfig{
 		ArtifactPath:                  t.TempDir(),
 		PeerControlPlaneURL:           peer.URL, // https://
 		PeerControlPlaneInternalToken: "tok",
@@ -220,19 +222,19 @@ func TestNewRemoteArtifactStore_HTTPS_ConstructsOK(t *testing.T) {
 func TestNewRemoteArtifactStore_RequiresAllFields(t *testing.T) {
 	cases := []struct {
 		name string
-		cfg  BackendConfig
+		cfg  config.StorageConfig
 	}{
 		{
 			"missingURL",
-			BackendConfig{ArtifactPath: "/tmp", PeerControlPlaneInternalToken: "tok"},
+			config.StorageConfig{ArtifactPath: "/tmp", PeerControlPlaneInternalToken: "tok"},
 		},
 		{
 			"missingToken",
-			BackendConfig{ArtifactPath: "/tmp", PeerControlPlaneURL: "https://peer"},
+			config.StorageConfig{ArtifactPath: "/tmp", PeerControlPlaneURL: "https://peer"},
 		},
 		{
 			"missingCacheDir",
-			BackendConfig{PeerControlPlaneURL: "https://peer", PeerControlPlaneInternalToken: "tok"},
+			config.StorageConfig{PeerControlPlaneURL: "https://peer", PeerControlPlaneInternalToken: "tok"},
 		},
 	}
 	for _, c := range cases {
@@ -310,7 +312,7 @@ func TestRemoteArtifactStore_Open_OnPeerErrorDoesNotCorruptCache(t *testing.T) {
 func TestRemoteArtifactStore_TimeoutHonored(t *testing.T) {
 	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer peer.Close()
-	s, err := NewRemoteArtifactStore(BackendConfig{
+	s, err := NewRemoteArtifactStore(config.StorageConfig{
 		ArtifactPath:                  t.TempDir(),
 		PeerControlPlaneURL:           peer.URL,
 		PeerControlPlaneInternalToken: "tok",
@@ -344,7 +346,7 @@ func newTLSPeer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 // Client() so it trusts the test server's self-signed cert.
 func mustNewRemote(t *testing.T, peer *httptest.Server, token, cacheDir string) *RemoteArtifactStore {
 	t.Helper()
-	cfg := BackendConfig{
+	cfg := config.StorageConfig{
 		ArtifactPath:                  cacheDir,
 		PeerControlPlaneURL:           peer.URL,
 		PeerControlPlaneInternalToken: token,
@@ -355,4 +357,87 @@ func mustNewRemote(t *testing.T, peer *httptest.Server, token, cacheDir string) 
 	}
 	s.httpClient = peer.Client()
 	return s
+}
+
+// TestRemoteArtifactStore_StartupSweepsOrphanedStaging covers the
+// janitor introduced for issue #127 follow-ups: a leftover `.tmp`
+// file in the staging dir whose mtime is older than
+// stagingJanitorThreshold must be removed at construction time so a
+// long-broken deployment doesn't accumulate `.tmp` debris forever.
+func TestRemoteArtifactStore_StartupSweepsOrphanedStaging(t *testing.T) {
+	cacheDir := t.TempDir()
+	stagingDir := filepath.Join(cacheDir, ".staging")
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		t.Fatalf("MkdirAll staging: %v", err)
+	}
+	old := filepath.Join(stagingDir, "d_olddep.123456.tmp")
+	if err := os.WriteFile(old, []byte("orphan"), 0644); err != nil {
+		t.Fatalf("WriteFile orphan: %v", err)
+	}
+	// Backdate the mtime past the janitor threshold.
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// A no-op peer is enough — the janitor runs regardless of peer
+	// activity.
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("janitor triggered a peer call: %s %s", r.Method, r.URL.Path)
+	})
+	_ = mustNewRemote(t, peer, "tok", cacheDir)
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("orphan should be swept: stat err=%v", err)
+	}
+}
+
+// TestRemoteArtifactStore_StartupKeepsRecentStaging covers the
+// inverse: a fresh `.tmp` file (mtime within the threshold) must NOT
+// be swept, because it could belong to a real in-flight pull.
+func TestRemoteArtifactStore_StartupKeepsRecentStaging(t *testing.T) {
+	cacheDir := t.TempDir()
+	stagingDir := filepath.Join(cacheDir, ".staging")
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		t.Fatalf("MkdirAll staging: %v", err)
+	}
+	fresh := filepath.Join(stagingDir, "d_freshdep.654321.tmp")
+	if err := os.WriteFile(fresh, []byte("in-flight?"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// mtime is "now" — well within the 24h threshold.
+
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("janitor triggered a peer call: %s %s", r.Method, r.URL.Path)
+	})
+	_ = mustNewRemote(t, peer, "tok", cacheDir)
+
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("recent staging file should be preserved: %v", err)
+	}
+}
+
+// TestRemoteArtifactStore_PullFailureCleansStaging covers the defer
+// that catches every non-success path: a peer 500 mid-handshake
+// must leave no `.tmp` files in the staging directory.
+func TestRemoteArtifactStore_PullFailureCleansStaging(t *testing.T) {
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	cacheDir := t.TempDir()
+	s := mustNewRemote(t, peer, "tok", cacheDir)
+	if _, err := s.Open(t.Context(), "t_x", "a", "d_z"); err == nil {
+		t.Fatal("Open returned nil on peer 500")
+	}
+
+	stagingDir := filepath.Join(cacheDir, ".staging")
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadDir staging: %v", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			t.Errorf("leftover staging file after pull failure: %s", e.Name())
+		}
+	}
 }
