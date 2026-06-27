@@ -47,7 +47,7 @@ jobs:
           key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run rustfmt
-        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml
+        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml --all
 
   # ============================================================
   # CLIPPY — clippy on all crates
