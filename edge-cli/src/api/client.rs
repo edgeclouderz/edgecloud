@@ -712,6 +712,14 @@ impl ApiClient {
     pub fn domains(&self) -> crate::api::domains::DomainClient<'_> {
         crate::api::domains::DomainClient { client: self }
     }
+
+    /// Accessor for the cluster-admin endpoints (issue #85).
+    /// `cluster status` and `cluster events` route through this.
+    /// Both require the owner role; the control plane rejects other
+    /// roles with 403.
+    pub fn cluster(&self) -> crate::api::cluster::ClusterClient<'_> {
+        crate::api::cluster::ClusterClient { client: self }
+    }
 }
 
 /// Tenant-management endpoints. Borrows the parent [`ApiClient`] so
