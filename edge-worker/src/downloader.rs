@@ -174,7 +174,7 @@ impl Downloader {
         // PR #98 for the broader JWT middleware rollout): the control
         // plane's WorkerAuth middleware will reject any unsigned
         // /api/internal/* request with 401.
-        let token = self.jwt_signer.sign();
+        let token = self.jwt_signer.sign()?;
         let response = self
             .client
             .post(&url)

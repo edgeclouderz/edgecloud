@@ -857,6 +857,7 @@ impl Supervisor {
                 &self.config.region,
                 &self.config.queue_group,
                 &self.config.consumer_name,
+                self.config.nats_max_deliver,
             )
             .await?;
         tracing::info!(
