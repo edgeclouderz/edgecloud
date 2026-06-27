@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{
-    AppSpec, AppStatus, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
+    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
 };
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
@@ -836,6 +836,21 @@ impl Supervisor {
             self.config.region.clone(),
             self.config.worker_addr.clone(),
         );
+
+        // Capacity headroom for the autoscaler (issue #85). Read the
+        // PortPool first so we can release the lock before walking
+        // `state.apps` — the latter holds the larger RwLock and the
+        // Pool lock must not be held across it (lock-ordering: Pool
+        // before state, never the reverse).
+        let app_slots = {
+            let mut pool = self.port_pool.lock().await;
+            pool.capacity_remaining()
+        };
+        msg.cluster_headroom = Some(ClusterHeadroom {
+            cpu_pct: None,
+            mem_pct: None,
+            app_slots,
+        });
 
         let state = self.state.read().await;
         for (key, inst) in &state.apps {

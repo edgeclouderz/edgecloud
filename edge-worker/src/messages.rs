@@ -110,6 +110,35 @@ pub struct HeartbeatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_addr: Option<String>,
     pub apps: HashMap<String, AppStatus>,
+    /// Capacity headroom reported by this worker. Optional on the wire so
+    /// pre-#85 workers deserialize cleanly on a new control plane (the field
+    /// is `#[serde(default)]` → `None`), and a new worker talking to an
+    /// old control plane has the field silently dropped by Go's
+    /// `encoding/json` partial unmarshal — both directions safe.
+    ///
+    /// `app_slots` is always populated when the worker supports the field;
+    /// `cpu_pct` / `mem_pct` are `None` until the worker adds system
+    /// introspection (issue #85 follow-up — see plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_headroom: Option<ClusterHeadroom>,
+}
+
+/// ClusterHeadroom: capacity headroom reported by a worker. Consumed by
+/// the control-plane autoscaler (issue #85) to decide whether to add or
+/// remove workers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusterHeadroom {
+    /// Fraction of CPU cores idle in `[0.0, 1.0]`. None on platforms
+    /// where system introspection isn't available yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    /// Fraction of physical memory idle, same range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_pct: Option<f64>,
+    /// Number of additional app instances this worker can host right now.
+    /// Computed from `PortPool` (`capacity - in_use - cooling_down`).
+    /// Always present when the worker reports headroom.
+    pub app_slots: u32,
 }
 
 /// AppStatus: status of a single app within a heartbeat.
@@ -166,7 +195,9 @@ pub struct MetricSample {
 }
 
 impl HeartbeatMessage {
-    /// Create a new heartbeat with the current timestamp.
+    /// Create a new heartbeat with the current timestamp. `cluster_headroom`
+    /// is left `None`; callers that want to report it should set the field
+    /// after construction (`build_heartbeat` does this from the PortPool).
     pub fn new(worker_id: String, region: String, worker_addr: String) -> Self {
         Self {
             msg_type: "heartbeat".to_string(),
@@ -175,6 +206,7 @@ impl HeartbeatMessage {
             region,
             worker_addr: Some(worker_addr),
             apps: HashMap::new(),
+            cluster_headroom: None,
         }
     }
 }
@@ -231,6 +263,7 @@ mod tests {
             region: "fra".to_string(),
             worker_addr: None,
             apps: HashMap::new(),
+            cluster_headroom: None,
         };
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(
@@ -353,6 +386,95 @@ mod tests {
             json.contains(r#""outbound_bytes":512"#),
             "outbound_bytes must always appear in serialized AppStatus; got: {json}"
         );
+    }
+
+    // ── cluster_headroom rolling-upgrade contract (issue #85) ─────────────
+
+    /// `cluster_headroom: None` must be omitted from the wire. An old worker
+    /// (or a new worker before it computes headroom) emits no field, and the
+    /// new control plane must not see a stray `"cluster_headroom": null`.
+    #[test]
+    fn cluster_headroom_absent_is_omitted_from_wire() {
+        let hb = HeartbeatMessage::new("w_fra_abc".into(), "fra".into(), "".into());
+        let json = serde_json::to_string(&hb).expect("serialize");
+        assert!(
+            !json.contains("cluster_headroom"),
+            "None cluster_headroom must be omitted from the wire; got: {json}"
+        );
+    }
+
+    /// Old workers (no `cluster_headroom` field) must still deserialize on a
+    /// new control plane without error. This is the backward-compat pin for
+    /// the rolling upgrade — workers running pre-#85 binaries keep working
+    /// alongside a control plane that knows about the field.
+    #[test]
+    fn cluster_headroom_absent_deserializes_to_none() {
+        // Exactly the wire shape a pre-#85 worker emits.
+        let legacy_json = r#"{
+            "type": "heartbeat",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "worker_id": "w_legacy",
+            "region": "fra",
+            "apps": {}
+        }"#;
+        let hb: HeartbeatMessage =
+            serde_json::from_str(legacy_json).expect("legacy heartbeat must parse");
+        assert!(hb.cluster_headroom.is_none());
+        assert_eq!(hb.worker_id, "w_legacy");
+    }
+
+    /// Full round-trip with `cluster_headroom` populated. The autoscaler
+    /// reads `app_slots` from this struct; if the field ever stops
+    /// serializing, the autoscaler silently treats every worker as zero-headroom.
+    #[test]
+    fn cluster_headroom_round_trips_with_app_slots() {
+        let hb = HeartbeatMessage {
+            msg_type: "heartbeat".to_string(),
+            timestamp: "2026-06-19T00:00:00Z".to_string(),
+            worker_id: "w_fra_abc".to_string(),
+            region: "fra".to_string(),
+            worker_addr: None,
+            apps: HashMap::new(),
+            cluster_headroom: Some(ClusterHeadroom {
+                cpu_pct: None,
+                mem_pct: None,
+                app_slots: 42,
+            }),
+        };
+        let json = serde_json::to_string(&hb).expect("serialize");
+        assert!(
+            json.contains(r#""cluster_headroom":{"app_slots":42}"#),
+            "headroom must serialize with app_slots; got: {json}"
+        );
+        // cpu_pct / mem_pct are None → must NOT appear on the wire.
+        assert!(
+            !json.contains("cpu_pct") && !json.contains("mem_pct"),
+            "None cpu_pct/mem_pct must be omitted; got: {json}"
+        );
+        let parsed: HeartbeatMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.cluster_headroom,
+            Some(ClusterHeadroom {
+                cpu_pct: None,
+                mem_pct: None,
+                app_slots: 42,
+            })
+        );
+    }
+
+    /// When `cpu_pct` is populated, it must round-trip. Currently no worker
+    /// sets it (no sysinfo dep yet), but the wire shape must already accept it
+    /// so a future PR adding sysinfo doesn't need to revisit this file.
+    #[test]
+    fn cluster_headroom_with_cpu_mem_round_trips() {
+        let h = ClusterHeadroom {
+            cpu_pct: Some(0.42),
+            mem_pct: Some(0.65),
+            app_slots: 17,
+        };
+        let json = serde_json::to_string(&h).expect("serialize");
+        let parsed: ClusterHeadroom = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, h);
     }
 
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────
