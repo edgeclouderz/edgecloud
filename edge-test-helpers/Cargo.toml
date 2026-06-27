@@ -1,0 +1,21 @@
+[package]
+name = "edge-test-helpers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared integration-test helpers for edge-worker (and friends): NATS container startup, skip-predicate, supervisor wiring. Never published; consumed as a path dependency by edge-worker's [dev-dependencies]."
+
+[dependencies]
+edge-worker = { path = "../edge-worker" }
+edge-runtime = { path = "../edge-runtime" }
+edge-spool = { path = "../edge-spool" }
+anyhow = "1.0"
+async-nats = "0.49"
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["nats"] }
+tokio = { version = "1.45", features = ["full"] }
+
+[dev-dependencies]
+# Smoke tests verify should_skip_integration_tests and test_config without
+# standing up Docker. nats_container and build_supervisor are exercised by
+# every consumer's integration suite (no separate smoke needed).
