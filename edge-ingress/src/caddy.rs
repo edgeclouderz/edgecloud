@@ -275,6 +275,12 @@ pub fn render_routes(
                     "handle": [{
                         "handler": "reverse_proxy",
                         "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
+                        // Same liveness probe as the synthetic-host
+                        // route above: without it, Caddy only marks
+                        // the upstream unhealthy when an active
+                        // connection fails, so custom-domain traffic
+                        // gets routed to dead workers until the next
+                        // failure. See PR #133 review finding #3.
                         "health_checks": {
                             "active": {"uri": "/", "expect_status": 2}
                         }
@@ -646,6 +652,37 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(dial, "1.2.3.4:8081");
+    }
+
+    /// Regression test for PR #133 review finding #3: the FQDN route
+    /// emission must include the same `health_checks.active` block as
+    /// the synthetic-host route, otherwise Caddy only marks the
+    /// upstream unhealthy when an active connection fails — meaning
+    /// custom-domain traffic gets routed to dead workers until the
+    /// next failure. The synthetic-host route already has the block
+    /// (line 173); this test pins that the FQDN route carries the
+    /// same shape so the asymmetry can't regress silently.
+    #[test]
+    fn fqdn_route_includes_active_health_checks() {
+        let cfg = test_cfg();
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
+        let cfg_json = render_routes(&entries, &bindings, &cfg);
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        // routes[0] is the default synthetic host, routes[1] is the FQDN.
+        let fqdn_route = &routes[1];
+        let active = &fqdn_route["handle"][0]["routes"][0]["handle"][0]["health_checks"]
+            ["active"];
+        assert_eq!(
+            active["uri"], "/",
+            "FQDN route must probe uri=/ (matches the synthetic-host route shape)"
+        );
+        assert_eq!(
+            active["expect_status"], 2,
+            "FQDN route must accept 2xx (matches the synthetic-host route shape)"
+        );
     }
 
     /// FQDN whose underlying (tenant, app) has no upstream is silently
