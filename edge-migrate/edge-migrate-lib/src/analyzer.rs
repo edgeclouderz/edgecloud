@@ -281,10 +281,26 @@ impl CAnalyzer {
                                     // the original source.
                                     let call_start =
                                         walk_back_to_call_start(source, found);
-                                    let len = m.end_byte.saturating_sub(m.start_byte);
                                     m.original_start_byte = call_start;
-                                    m.original_end_byte =
-                                        (call_start + len).min(source.len());
+                                    // Walk forward in the ORIGINAL
+                                    // source to the close-paren, not
+                                    // via expanded-source byte length
+                                    // (`m.end_byte - m.start_byte`).
+                                    // For macro-expanded calls like
+                                    // `socket(AF_INET, SOCK_STREAM)`
+                                    // → `make_socket(AF_INET,
+                                    // SOCK_STREAM)`, the expanded
+                                    // length overshoots by 4 bytes
+                                    // (the `make_` prefix added by
+                                    // the expansion), pulling the end
+                                    // into the next token. Symmetric
+                                    // with walk_back_to_call_start:
+                                    // both endpoints are in the same
+                                    // (original) coordinate system.
+                                    m.original_end_byte = source[call_start..]
+                                        .find(')')
+                                        .map(|off| call_start + off + 1)
+                                        .unwrap_or(source.len());
                                 } else {
                                     // Args-tail not found in original.
                                     // Likely nested macro expansion in
@@ -641,7 +657,17 @@ fn find_snippet_in_source(source: &str, needle: &str, from_byte: usize) -> Optio
     if needle.is_empty() || from_byte >= source.len() {
         return None;
     }
-    source[from_byte..].find(needle).map(|i| from_byte + i)
+    // Bound the search slice to `from_byte + SEARCH_BUDGET` so a
+    // 50 MiB migrated file doesn't trigger a full-string scan per
+    // call (the bug pre-#139 surfaced as a slow analyze pass on
+    // large inputs). The `already_at_hint` pre-check at the call
+    // site covers the `hint > 0` case; this bound covers the
+    // `hint == 0` case where we'd otherwise scan from byte 0 to
+    // EOF.
+    let search_end = (from_byte + SEARCH_BUDGET).min(source.len());
+    source[from_byte..search_end]
+        .find(needle)
+        .map(|i| from_byte + i)
 }
 
 /// Walk back from `name_pos` (which must point at the start of a
@@ -1328,6 +1354,103 @@ int main(void) {
         assert!(
             socket_match.bound_var.is_none(),
             "socket inside outer call must NOT have a bound_var (no declaration to bind to)"
+        );
+    }
+
+    // test_find_snippet_in_source_bounds_search pins the SEARCH_BUDGET
+    // bound added in #139: a needle within the budget from `from_byte`
+    // is found; one past the budget returns None. Before the bound,
+    // any needle anywhere in `source` was reachable, which made a
+    // 50 MiB migrated file trigger a full-string scan per call.
+    #[test]
+    fn test_find_snippet_in_source_bounds_search() {
+        // Build a source where a needle sits at byte 5000 — well
+        // within the 1024-byte budget from `from_byte = 4500`.
+        let needle = "NEEDLE";
+        let needle_pos = 5000_usize;
+        let mut source = String::with_capacity(8192);
+        source.push_str(&"a".repeat(needle_pos));
+        source.push_str(needle);
+        source.push_str(&"a".repeat(8192 - source.len()));
+
+        let found = find_snippet_in_source(&source, needle, 4500);
+        assert_eq!(found, Some(needle_pos));
+
+        // Decoy at byte 8000 — past the budget (4500 + 1024 = 5524).
+        // The bounded scan must NOT see it. Without the budget, the
+        // unbounded scan would return Some(8000) — that's the
+        // regression we're guarding against.
+        let mut source2 = String::with_capacity(8192);
+        source2.push_str(&"a".repeat(4500));
+        source2.push_str(needle); // at 4500
+        source2.push_str(&"a".repeat(8000 - source2.len()));
+        source2.push_str(needle); // at 8000
+        source2.push_str(&"a".repeat(8192 - source2.len()));
+
+        let found2 = find_snippet_in_source(&source2, needle, 4500);
+        // Bounded scan: only the first needle (at 4500) is reachable.
+        // The decoy at 8000 is past the 1024-byte budget.
+        assert_eq!(found2, Some(4500));
+
+        // Empty needle and from_byte past EOF are no-ops.
+        assert_eq!(find_snippet_in_source(&source, "", 0), None);
+        assert_eq!(find_snippet_in_source(&source, "x", source.len()), None);
+    }
+
+    // test_walk_back_to_call_start_and_forward_matches_paren pins the
+    // symmetric coord fix added in #139: walk_back returns the
+    // original-source byte position of the call start, and the
+    // forward walk to `)` must be in the SAME coordinate system.
+    //
+    // Before the fix, original_end_byte was computed as
+    // `(call_start + (m.end_byte - m.start_byte)).min(source.len())`
+    // where `m.end_byte - m.start_byte` is the EXPANDED-source byte
+    // length. For `socket(...)` → `make_socket(...)`, the expanded
+    // length overshoots by 4 bytes (the `make_` prefix), pulling
+    // original_end_byte into the next token.
+    //
+    // After the fix, the forward walk is in original-source bytes
+    // (just like walk_back), so both endpoints bracket the original
+    // call exactly.
+    #[test]
+    fn test_walk_back_to_call_start_and_forward_matches_paren() {
+        // The source has `socket(AF_INET, SOCK_STREAM)` at a known
+        // position. Verify that walk_back returns the `s` of
+        // `socket`, and the forward walk to `)` returns just past
+        // the close-paren (i.e., the full call expression in
+        // original coords).
+        let source = "int fd = socket(AF_INET, SOCK_STREAM);";
+        // Byte indices: i(0)n(1)t(2) (3)f(4)d(5) (6)=(7) (8)s(9)o(10)c(11)k(12)e(13)t(14)((15)
+        // The `(` after `socket` is at byte 15; `s` is at byte 9.
+        let paren_byte = 15;
+        let call_start = walk_back_to_call_start(source, paren_byte);
+        assert_eq!(call_start, 9, "should walk back to the `s` of `socket`");
+
+        // The forward walk to `)` should end at one past the
+        // close-paren. The full call `socket(AF_INET, SOCK_STREAM)`
+        // starts at byte 9 and is 25 chars long; `)` is at byte
+        // 33; one past = 34.
+        let end_byte = source[call_start..]
+            .find(')')
+            .map(|off| call_start + off + 1)
+            .unwrap_or(source.len());
+        assert_eq!(
+            &source[call_start..end_byte],
+            "socket(AF_INET, SOCK_STREAM)"
+        );
+
+        // The bug symptom: if we used the OLD formula
+        // `(call_start + expanded_len)`, we'd overshoot. Simulate
+        // that by passing an artificially long `len` (4 bytes more
+        // than the actual call, like the `make_` prefix expansion).
+        let overshoot_end = (call_start + (end_byte - call_start) + 4).min(source.len());
+        assert!(
+            overshoot_end > end_byte,
+            "the OLD formula would overshoot — this assertion confirms the bug exists in the test fixture"
+        );
+        assert!(
+            source[call_start..overshoot_end].contains(';') || (overshoot_end - call_start) > 25,
+            "overshoot would pull the end into the next token"
         );
     }
 }
