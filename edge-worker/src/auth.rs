@@ -206,26 +206,41 @@ impl WorkerJwtSigner {
     /// Returns `Err` if the callback path fails (network error, server
     /// 401). Callers should propagate; the Downloader / LogForwarder
     /// path turns this into an HTTP error.
+    ///
+    /// **Concurrency (finding B1):** the cache `Mutex` is held across the
+    /// entire check-fetch-update sequence. Without this, two concurrent
+    /// callers that both observe a stale cache would each invoke the
+    /// bootstrap callback, producing two `POST /api/internal/auth/token`
+    /// requests and two server-minted JWTs — one cached, one wasted. By
+    /// serialising on the lock, the second caller waits for the first to
+    /// finish the fetch, then re-checks the cache inside the same critical
+    /// section and finds the just-written fresh token. The lock-hold
+    /// time is bounded by the HTTP RTT (worst case 5s); the
+    /// `std::sync::Mutex` choice keeps the critical section
+    /// `Send + Sync` and avoids carrying the lock across `.await` (which
+    /// `tokio::sync::Mutex` would require, with the send-across-task
+    /// foot-gun that brings).
     pub fn sign(&self) -> anyhow::Result<String> {
         let now = Instant::now();
 
-        // Fast path: cached token is still fresh (more than REFRESH_LEAD
-        // before expiry). Hold the lock only for the bool check.
         // `unwrap_or_else(|e| e.into_inner())` recovers from poisoning — if a
-        // previous holder panicked we still want to issue a token.
-        {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ct) = cache.as_ref() {
-                if ct.expires_at.saturating_duration_since(now) > REFRESH_LEAD {
-                    return Ok(ct.token.clone());
-                }
+        // previous holder panicked we still want to issue a token. The
+        // guard holds the lock for the full duration of the function.
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Fast path: cached token is still fresh (more than REFRESH_LEAD
+        // before expiry). Returns while holding the lock; the guard is
+        // dropped on return and the token is cloned out.
+        if let Some(ct) = cache.as_ref() {
+            if ct.expires_at.saturating_duration_since(now) > REFRESH_LEAD {
+                return Ok(ct.token.clone());
             }
         }
 
-        // Slow path: acquire a fresh token. Two sources:
-        //   - Static:  encode with the fixed secret (no I/O).
-        //   - Callback: invoke the closure, then store the bundle's
-        //     token + expiry. Errors propagate.
+        // Slow path: re-encode (Static) or re-bootstrap (Callback). The
+        // lock is held throughout — concurrent callers wait on the
+        // Mutex, then re-evaluate the fast path with the just-written
+        // cache. Errors propagate; the lock is dropped on `?`.
         let (token, expires_at) = match &self.source {
             TokenSource::Static(_secret) => {
                 let token = self.encode()?;
@@ -241,12 +256,10 @@ impl WorkerJwtSigner {
             }
         };
 
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some(CachedToken {
             token: token.clone(),
             expires_at,
         });
-        drop(cache);
         Ok(token)
     }
 
@@ -541,5 +554,117 @@ mod tests {
             "expired seed must not stick; callback must fire"
         );
         assert_eq!(t, "callback-token-1");
+    }
+
+    // ----- Concurrency (finding B1) -----------------------------------
+    //
+    // The check-fetch-update sequence inside `sign()` is guarded by the
+    // cache Mutex. Two scenarios prove this:
+    //
+    //   (1) Concurrent first-signs on a fresh signer all observe the
+    //       empty cache, all queue on the Mutex, and only the first one
+    //       actually invokes the callback. Without the lock-hold, every
+    //       concurrent caller would fire `fetch()`, minting N JWTs on
+    //       the server for a single worker.
+    //
+    //   (2) After `expire_cache_for_test`, concurrent callers all see
+    //       a stale cache at the same instant. Same invariant: only one
+    //       callback fires; the rest pick up the freshly-written token.
+    //
+    // We use `std::thread::spawn` rather than `tokio::task::spawn` so
+    // the test exercises the `std::sync::Mutex` directly — the same lock
+    // `sign()` acquires in production.
+
+    /// 10 concurrent first-signs must invoke the callback exactly once.
+    /// A barrier ensures all threads hit `sign()` at roughly the same
+    /// instant, maximising the chance of racing the old
+    /// check-then-fetch-then-update sequence.
+    #[test]
+    fn concurrent_first_sign_fires_callback_once() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let barrier = Arc::new(Barrier::new(10));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                let counter = Arc::clone(&counter);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let t = s.sign().expect("sign");
+                    (counter.load(Ordering::SeqCst), t)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // All 10 callers must observe the same token (the single minted
+        // JWT) — proves they all read from the cache, not from
+        // independent fetches.
+        let distinct_tokens: std::collections::HashSet<_> =
+            results.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(
+            distinct_tokens.len(),
+            1,
+            "all concurrent callers must see the same token; got {:?}",
+            distinct_tokens
+        );
+        // And the callback must have fired exactly once.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "callback must fire exactly once under contention; got {}",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Same scenario but triggered by cache expiry (simulates a worker
+    /// restart with stale cache that two callers race to refresh).
+    /// Invariant: exactly one re-bootstrap, even with 10 concurrent
+    /// callers.
+    #[test]
+    fn concurrent_sign_after_cache_expired_fires_callback_once() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        // Prime the cache so the first sign is free; the next batch
+        // races on the slow path.
+        let _ = s.sign().expect("priming sign");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        s.expire_cache_for_test();
+
+        let barrier = Arc::new(Barrier::new(10));
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    s.sign().expect("concurrent sign")
+                })
+            })
+            .collect();
+
+        let tokens: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let distinct: std::collections::HashSet<_> = tokens.iter().cloned().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "post-expiry concurrent callers must share one token; got {:?}",
+            distinct
+        );
+        // Counter started at 1 (priming) and must end at exactly 2.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "post-expiry concurrent calls must trigger exactly one extra callback; got {}",
+            counter.load(Ordering::SeqCst)
+        );
     }
 }
