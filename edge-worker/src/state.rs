@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use edge_runtime::{MetricsAccumulator, RequestMeter};
-use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
 
