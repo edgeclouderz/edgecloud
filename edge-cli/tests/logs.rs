@@ -9,6 +9,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -252,4 +253,252 @@ async fn logs_sends_bearer_auth_header() {
     cmd.arg("myapp");
 
     cmd.assert().success();
+}
+
+// ---------------------------------------------------------------------------
+// Crashed hint tests — issue #77 §5.
+//
+// The CLI fetches /api/v1/apps/{appName}/status before the first
+// logs() call. If the worker reports `crashed` with a fresh
+// heartbeat, the CLI prints a stderr hint pointing at
+// `edge rollback <app>`. The hint must never fail the command:
+// any error from the status endpoint is silently ignored.
+// ---------------------------------------------------------------------------
+
+/// Build an RFC3339 timestamp `now - offset_secs` (UTC, second
+/// precision, trailing `Z`). Mirrors the CLI's own formatter so
+/// the parse in `commands::logs::is_fresh` accepts the test value.
+fn rfc3339_now_minus(offset_secs: u64) -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(offset_secs);
+    format_rfc3339_utc(secs)
+}
+
+fn format_rfc3339_utc(secs: u64) -> String {
+    // Howard Hinnant's civil_from_days; copy of the helper in
+    // commands::logs.rs so the integration tests can produce a
+    // timestamp the CLI will parse. If the production helper
+    // drifts, this copy must drift too — but the format is
+    // simple enough (20 bytes, UTC, second precision) that a
+    // divergence would surface as a parse error in `is_fresh`
+    // and fail the test.
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = (secs % 86_400) as u32;
+    let hh = secs_of_day / 3600;
+    let mm = (secs_of_day % 3600) / 60;
+    let ss = secs_of_day % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{h:02}:{mm:02}:{ss:02}Z",
+        year = year,
+        month = m,
+        day = d,
+        h = hh,
+    )
+}
+
+#[tokio::test]
+async fn logs_prints_crashed_hint_when_worker_status_is_crashed() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    // Status endpoint reports `crashed` with a heartbeat 30s ago —
+    // well within the 5-minute freshness window.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "app_name": "myapp",
+            "status": "crashed",
+            "last_heartbeat": rfc3339_now_minus(30),
+            "region": "us-east-1",
+            "worker_id": "w_us-east-1_h01",
+            "exit_code": 137,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("crashed"))
+        .stdout(predicate::str::contains("edge rollback myapp"));
+}
+
+#[tokio::test]
+async fn logs_skips_hint_when_heartbeat_stale() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    // Heartbeat is 10 minutes old — beyond the 5-minute freshness
+    // threshold. The CLI must NOT show the hint, because the
+    // worker is dead and "crashed 10 minutes ago" is stale state,
+    // not an active crash.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "app_name": "myapp",
+            "status": "crashed",
+            "last_heartbeat": rfc3339_now_minus(10 * 60),
+            "region": "us-east-1",
+            "worker_id": "w_us-east-1_h01",
+            "exit_code": 137,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("crashed").not());
+}
+
+#[tokio::test]
+async fn logs_skips_hint_when_status_is_running() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "app_name": "myapp",
+            "status": "running",
+            "last_heartbeat": rfc3339_now_minus(5),
+            "region": "us-east-1",
+            "worker_id": "w_us-east-1_h01",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("crashed").not())
+        .stdout(predicate::str::contains("rollback").not());
+}
+
+#[tokio::test]
+async fn logs_silently_continues_when_status_endpoint_fails() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    // Status endpoint blows up. The CLI must NOT surface this to
+    // the user — the hint is a courtesy, not a hard dependency.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/status"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": {"code": "INTERNAL", "message": "boom"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+
+    // The log query is the primary purpose; the command must
+    // succeed even when the hint source is broken. No hint, no
+    // panic, exit 0.
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("crashed").not())
+        .stdout(predicate::str::contains("rollback").not());
 }
