@@ -48,11 +48,11 @@ func newTestHandler(t *testing.T) (http.Handler, *middleware.BootstrapAuthConfig
 
 func mintReq(t *testing.T, workerID, region, tenantID, pskStr string) *http.Request {
 	t.Helper()
-	// Recreate the signature the worker would send. We import
-	// the same crypto primitives here rather than exposing them
-	// from `service` (the worker's sign_with_psk is in Rust;
-	// the equivalent Go helper lives only in tests).
-	mac := hmac256(pskStr, workerID+":"+region)
+	// Recreate the signature the worker would send. The canonical
+	// payload is "{workerID}:{region}:{tenantID}" (finding A1) so a
+	// signature captured for one tenant cannot be replayed against
+	// another.
+	mac := hmac256(pskStr, workerID+":"+region+":"+tenantID)
 	body, _ := json.Marshal(map[string]string{
 		"worker_id": workerID,
 		"region":    region,
@@ -144,6 +144,29 @@ func TestBootstrapHandler_BodyMismatchRegion(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// Regression for finding A1: a signature captured for one tenant
+// cannot mint a JWT for another tenant. The signature header is
+// computed over tenant_id="t_alice"; the body claims
+// tenant_id="t_victim". PSKAuth reads the body first, then verifies
+// the signature over the body's tenant_id — mismatch → 401.
+func TestBootstrapHandler_BodyMismatchTenantID(t *testing.T) {
+	h, pskCfg := newTestHandler(t)
+	psk := string(pskCfg.PSK)
+	req := mintReq(t, "w_fra_abc", "fra", "t_alice", psk)
+	body, _ := json.Marshal(map[string]string{
+		"worker_id": "w_fra_abc",
+		"region":    "fra",
+		"tenant_id": "t_victim",
+	})
+	req.Body = nopCloser{bytes.NewReader(body)}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 (signature covers tenant_id, body disagrees), got %d body=%s",
+			rr.Code, rr.Body.String())
 	}
 }
 
