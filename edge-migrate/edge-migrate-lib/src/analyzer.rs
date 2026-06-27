@@ -251,12 +251,18 @@ impl CAnalyzer {
                         if let Some(args) = snippet_args_tail(&m.snippet) {
                             // Only refine when the args-tail is not
                             // already at or very near the byte_map
-                            // hint. Using `contains` would mask the
-                            // sparse-linemarker case where the hint
-                            // points at byte 0 but the actual call
-                            // site is elsewhere in the source.
+                            // hint. Skip the pre-check when `hint`
+                            // is 0 (the sparse-linemarker case
+                            // documented in `build_byte_map`): the
+                            // call site is rarely within the first
+                            // SEARCH_BUDGET bytes of the file, so
+                            // the `contains` scan would burn 1 KiB
+                            // and almost always return false before
+                            // falling through to find_snippet_in_source
+                            // anyway.
                             let hint = m.original_start_byte;
-                            let already_at_hint = hint + SEARCH_BUDGET <= source.len()
+                            let already_at_hint = hint > 0
+                                && hint + SEARCH_BUDGET <= source.len()
                                 && source[hint..hint + SEARCH_BUDGET].contains(args);
                             if !already_at_hint {
                                 if let Some(found) = find_snippet_in_source(
