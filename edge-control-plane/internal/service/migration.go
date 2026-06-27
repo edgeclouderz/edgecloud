@@ -421,7 +421,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
 			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
 		}
-		return nil, fmt.Errorf("saving wasm artifact: %w", err)
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed, err)
 	}
 
 	// Build success report from envelope's structured Report (HEAD),
@@ -906,8 +906,10 @@ func (s *MigrationService) MigrateTree(
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
+<<<<<<< HEAD
 // See the rollback comment in MigrationService.Migrate for why
-	// both the row and any partial blob are cleaned up here.
+	// See the rollback comment in MigrationService.Migrate for why
+	// the blob is cleaned up here.
 	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
 		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
@@ -915,7 +917,7 @@ func (s *MigrationService) MigrateTree(
 		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
 			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
 		}
-		return nil, fmt.Errorf("saving artifact: %w", err)
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed, err)
 	}
 
 	return &domain.TreeMigrationReport{

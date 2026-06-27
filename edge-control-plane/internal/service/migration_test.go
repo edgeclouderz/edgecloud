@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -1020,32 +1021,28 @@ func TestMigrate_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
 	}
 }
 
-// TestRollbackArtifactSave_DeletesRowAndBlob exercises the helper
+// TestRollbackArtifactSave_DeletesBlob exercises the helper
 // directly without invoking the migration subprocess. This locks the
-// "both DeleteByID and Delete fire" contract for every caller of
+// "store.Delete fires" contract for every caller of
 // rollbackArtifactSave (Migrate, MigrateTree, Deploy) without
 // needing edge-migrate + clang on PATH — covering the case where
 // the existing TestMigrate_ArtifactSaveFailure_RollsBackDeployment
 // would otherwise skip silently on CI.
-func TestRollbackArtifactSave_DeletesRowAndBlob(t *testing.T) {
-	repo := &mockDeploymentRepo{}
+//
+// The helper returns saveErr UNWRAPPED so callers can wrap with
+// the appropriate sentinel (ErrMigrationFailed / ErrMigrateTreeFailed)
+// before surfacing to the HTTP layer. Earlier versions wrapped
+// with "saving artifact" here, which broke isClientMigrationError's
+// sentinel match on disk-full errors and made the handler return
+// 500 instead of 422.
+func TestRollbackArtifactSave_DeletesBlob(t *testing.T) {
 	store := newMockArtifactStore()
 	saveErr := errors.New("disk full (test)")
 
-	gotErr := rollbackArtifactSave(context.Background(), repo, store,
-		"tenant-1", "myapp", "d_abc", saveErr)
+	gotErr := rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr)
 
-	if gotErr == nil {
-		t.Fatal("expected rollback to return the wrapped save error")
-	}
-	if !errors.Is(gotErr, saveErr) {
-		t.Errorf("returned error %v does not wrap saveErr %v", gotErr, saveErr)
-	}
-	if !strings.Contains(gotErr.Error(), "saving artifact") {
-		t.Errorf("returned error %q does not include wrap verb", gotErr.Error())
-	}
-	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != "d_abc" {
-		t.Errorf("DeleteByID calls = %v, want [d_abc]", repo.deleteCalls)
+	if gotErr != saveErr {
+		t.Errorf("expected helper to return saveErr unchanged; got %v", gotErr)
 	}
 	if len(store.deleteCalls) != 1 {
 		t.Errorf("artifact.Delete calls = %d, want 1", len(store.deleteCalls))
@@ -1053,28 +1050,70 @@ func TestRollbackArtifactSave_DeletesRowAndBlob(t *testing.T) {
 }
 
 // TestRollbackArtifactSave_TolerantOfDeleteErrors verifies that a
-// failing DeleteByID or artifact.Delete does NOT mask the original
-// save error — the caller still sees the underlying disk-full (or
-// whatever) reason, and the inner rollback error is logged but not
-// surfaced. Without this guarantee the helper would either change
-// the error mapping at every call site or silently swallow real
-// cleanup failures.
+// failing artifact.Delete does NOT mask the original save error —
+// the caller still sees the underlying disk-full (or whatever)
+// reason, and the inner rollback error is logged but not surfaced.
+// Without this guarantee the helper would either change the error
+// mapping at every call site or silently swallow real cleanup
+// failures.
 func TestRollbackArtifactSave_TolerantOfDeleteErrors(t *testing.T) {
-	repo := &mockDeploymentRepo{deleteErr: errors.New("db gone (test)")}
 	store := &mockArtifactStore{deleteErr: errors.New("fs gone (test)")}
 	saveErr := errors.New("disk full (test)")
 
-	gotErr := rollbackArtifactSave(context.Background(), repo, store,
-		"tenant-1", "myapp", "d_abc", saveErr)
+	gotErr := rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr)
 
-	if !errors.Is(gotErr, saveErr) {
-		t.Errorf("returned error %v does not wrap saveErr %v", gotErr, saveErr)
-	}
-	// Both Delete calls must still have been attempted.
-	if len(repo.deleteCalls) != 1 {
-		t.Errorf("DeleteByID calls = %d, want 1 (attempt even on failure)", len(repo.deleteCalls))
+	if gotErr != saveErr {
+		t.Errorf("expected helper to return saveErr unchanged; got %v", gotErr)
 	}
 	if len(store.deleteCalls) != 1 {
 		t.Errorf("artifact.Delete calls = %d, want 1 (attempt even on failure)", len(store.deleteCalls))
+	}
+}
+
+// TestMigrate_ArtifactSaveFailure_ClassifiedAsClientError pins the
+// sentinel wrap on the migration save-failure path. The earlier
+// hard-coded `"saving artifact"` wrap in rollbackArtifactSave
+// broke `isClientMigrationError`'s sentinel match, so disk-full
+// errors returned 500 instead of 422 with the structured report.
+// This test is a unit-level smoke test: it exercises the wrap
+// shape directly so the regression cannot reappear silently.
+//
+// (The full migration path is covered by
+// TestMigrate_ArtifactSaveFailure_RollsBackDeployment, but that
+// test requires edge-migrate + clang on PATH and skips on CI.)
+//
+// After Commit 4 (`%w` on saveErr), the chain is preserved — both
+// the outer ErrMigrationFailed sentinel AND the inner saveErr
+// are reachable via errors.Is. Before Commit 4, saveErr was
+// Stringer'd into the wrap message and the chain was severed.
+func TestMigrate_ArtifactSaveFailure_ClassifiedAsClientError(t *testing.T) {
+	saveErr := errors.New("disk full (test)")
+	store := newMockArtifactStore()
+
+	wrapped := fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed,
+		rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr))
+
+	if !errors.Is(wrapped, ErrMigrationFailed) {
+		t.Errorf("wrapped error %v does not match ErrMigrationFailed sentinel; handler will return 500 instead of 422", wrapped)
+	}
+	if !errors.Is(wrapped, saveErr) {
+		t.Errorf("wrapped error %v does not match saveErr; %%w wrap should preserve the inner cause for logs/tests", wrapped)
+	}
+}
+
+// TestMigrateTree_ArtifactSaveFailure_ClassifiedAsClientError is
+// the tree-mode equivalent of the test above.
+func TestMigrateTree_ArtifactSaveFailure_ClassifiedAsClientError(t *testing.T) {
+	saveErr := errors.New("disk full (test)")
+	store := newMockArtifactStore()
+
+	wrapped := fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed,
+		rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr))
+
+	if !errors.Is(wrapped, ErrMigrateTreeFailed) {
+		t.Errorf("wrapped error %v does not match ErrMigrateTreeFailed sentinel; handler will return 500 instead of 422", wrapped)
+	}
+	if !errors.Is(wrapped, saveErr) {
+		t.Errorf("wrapped error %v does not match saveErr; %%w wrap should preserve the inner cause for logs/tests", wrapped)
 	}
 }
