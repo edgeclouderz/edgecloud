@@ -263,6 +263,7 @@ mod tests {
             snippet: needle.to_string(),
             arg_nodes,
             transformability,
+            bound_var: None,
         }
     }
 
@@ -547,6 +548,7 @@ fn main() {
             snippet: "bind(...)".to_string(),
             arg_nodes: vec!["fd".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         let r = RustTransformer::new().transform(src, vec![m]);
         assert_eq!(r.errors.len(), 1);
