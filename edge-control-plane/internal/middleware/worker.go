@@ -30,10 +30,15 @@ type WorkerClaims struct {
 
 // Role constants for the Role claim.
 const (
-	// RoleWorker is the default for any worker-issued JWT.
+	// RoleWorker is the default for any worker-issued JWT. May run
+	// per-worker endpoints (e.g. /api/internal/download/*,
+	// /api/internal/workers/*) but NOT the cross-tenant domain
+	// endpoints.
 	RoleWorker = "worker"
 	// RoleIngest is for the long-lived ingress service token
-	// (cmd/api/mint.go).
+	// (cmd/api/mint.go). Allows access to the cross-tenant domain
+	// endpoints used by the FQDN poller and the v2 Caddy event
+	// hook (issue #83).
 	RoleIngest = "ingest"
 )
 
@@ -139,7 +144,9 @@ func GetWorkerRegion(ctx context.Context) string {
 	return ""
 }
 
-// GetWorkerRole extracts the role claim from context.
+// GetWorkerRole extracts the role claim from context. Returns "" if
+// the JWT predates the role field (backward compatibility — such
+// tokens are treated as RoleWorker by HasRole).
 func GetWorkerRole(ctx context.Context) string {
 	if r, ok := ctx.Value(WorkerRoleKey).(string); ok {
 		return r
@@ -148,6 +155,8 @@ func GetWorkerRole(ctx context.Context) string {
 }
 
 // HasRole reports whether the request's JWT carries the named role.
+// Empty role (legacy tokens without the claim) matches RoleWorker so
+// existing per-worker endpoints keep working.
 func HasRole(ctx context.Context, role string) bool {
 	got := GetWorkerRole(ctx)
 	if got == "" {
@@ -157,7 +166,9 @@ func HasRole(ctx context.Context, role string) bool {
 }
 
 // RequireWorkerRole returns a middleware that 403s any request whose
-// JWT does not carry the named role.
+// JWT does not carry the named role. Used to gate cross-tenant
+// internal endpoints (issue #83's domain poller feeds) to the
+// long-lived ingress token rather than per-worker JWTs.
 func RequireWorkerRole(role string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -144,7 +144,7 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -331,7 +331,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.Handle("/api/v1/", apiWithAuth)
 	mux.Handle("/api/v1/admin/", apiWithOwner)
 
-// Service-to-service read endpoint that the edge-ingress polls to
+	// Service-to-service read endpoint that the edge-ingress polls to
 	// apply Caddy weights for canary/blue-green traffic splits. Registered
 	// on the parent mux with a more specific pattern than the /api/v1/
 	// catch-all so Go 1.22's longest-match rule routes the request here
@@ -362,7 +362,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
-internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
+	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// Worker-driven auto-rollback: an edge-worker POSTs here when its
 	// supervisor exhausts the restart cap on a tenant app. The
 	// handler swaps the active deployment back to last_good and
