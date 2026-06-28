@@ -90,3 +90,62 @@ pub fn run(name: &str, api: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_edge_toml_header_substitution() {
+        let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        assert!(result.contains(r#"name = "myapp""#));
+        assert!(result.contains("version = \"0.1.0\""));
+        assert!(result.contains("wasm32-wasip2"));
+    }
+
+    #[test]
+    fn test_edge_toml_header_valid_toml() {
+        let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
+        assert_eq!(parsed["project"]["name"].as_str(), Some("myapp"));
+    }
+
+    #[test]
+    fn test_edge_toml_with_api_section() {
+        let mut result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        result.push_str(
+            &super::EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", "https://api.example.com"),
+        );
+        let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
+        assert_eq!(
+            parsed["deployment"]["api"].as_str(),
+            Some("https://api.example.com")
+        );
+    }
+
+    #[test]
+    fn test_cargo_toml_template_substitution() {
+        let result = super::CARGO_TOML_TEMPLATE.replace("{name}", "myapp");
+        assert!(result.contains("myapp"));
+        assert!(result.contains("0.1.0"));
+    }
+
+    #[test]
+    fn test_cargo_toml_template_valid_toml() {
+        let result = super::CARGO_TOML_TEMPLATE.replace("{name}", "myapp");
+        let _: toml::Value = toml::from_str(&result).expect("invalid Cargo.toml template");
+    }
+
+    #[test]
+    fn test_main_rs_template_substitution() {
+        let result = super::MAIN_RS_TEMPLATE.replace("{name}", "hello-world");
+        assert!(result.contains("hello-world"));
+    }
+
+    #[test]
+    fn test_gitignore_contains_expected_entries() {
+        let gi = super::GITIGNORE;
+        assert!(gi.contains("/target/"));
+        assert!(gi.contains(".edge/"));
+        assert!(gi.contains(".wasm/"));
+        assert!(gi.contains("*.wasm"));
+    }
+}
