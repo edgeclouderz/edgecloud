@@ -90,8 +90,13 @@ func newTestNATS(t *testing.T) *natsio.Conn {
 }
 
 // newServiceForRegression builds a Service wired for regression tests.
-// DecisionIntervalS=1s so the 90s budget has plenty of ticks. ScaleUpCooldownS=1s
-// so the cooldown test can observe a window without burning 60s of wall-clock.
+// DecisionIntervalS=1s so the 90s budget has plenty of ticks.
+// ScaleUpCooldownS=5s so the cooldown test's 2.5s observation window
+// sits comfortably inside the cooldown — without this margin, the
+// cooldown can expire mid-observation and the second tick would
+// (correctly) re-fire Provision. 5s is the smallest value that
+// keeps the test stable across CI runners that schedule ticks
+// slightly late.
 //
 // Returns the service, an event recorder (so the test can assert on what
 // was inserted), and a MockCloudProvider whose Provision counter
@@ -112,7 +117,7 @@ func newServiceForRegression(t *testing.T, nc *natsio.Conn) (
 			MinWorkers:         1,
 			MaxWorkers:         10,
 			TargetHeadroomPct:  20,
-			ScaleUpCooldownS:   1,
+			ScaleUpCooldownS:   5,
 			ScaleDownCooldownS: 60,
 			DecisionIntervalS:  1,
 		},
@@ -273,8 +278,9 @@ func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
 // TestRegression_CooldownSuppressesSecondScaleUp pins the cooldown
 // contract: after a successful scale_up, a second tick within
 // ScaleUpCooldownS must convert to a noop event and NOT call Provision
-// again. With ScaleUpCooldownS=1s in test config, the window is short
-// enough that we can wait it out without burning wall-clock.
+// again. With ScaleUpCooldownS=5s in test config, the cooldown window
+// comfortably covers the 2.5s observation period so a CI runner
+// scheduling ticks slightly late still observes suppression.
 func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 	if reason, ok := shouldSkipRegression(); ok {
 		t.Skipf("regression: %s", reason)
@@ -295,7 +301,7 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 	waitForProvision(t, cloud, 90*time.Second)
 	firstCount := cloud.ProvisionCalls()
 
-	// Burst more heartbeats well within the 1s cooldown window. The
+	// Burst more heartbeats well within the cooldown window. The
 	// next tick (within ~1s) must convert the resulting scale_up
 	// decision into a noop event and NOT call Provision again.
 	for i := 0; i < 5; i++ {
@@ -303,12 +309,9 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 	}
 
-	// Give the autoscaler enough ticks to consider a second scale_up.
-	// With DecisionIntervalS=1s and ScaleUpCooldownS=1s, the cooldown
-	// window expires after ~1s post-first-event. We sleep 2.5s — long
-	// enough for the cooldown to expire AND the next tick to fire,
-	// which would normally cause a second scale_up. The test asserts
-	// it does NOT.
+	// Observe for 2.5s — long enough for ~2 decision ticks to fire
+	// after the first scale_up. With ScaleUpCooldownS=5s, all of
+	// those ticks must be noops and Provision must NOT fire again.
 	time.Sleep(2500 * time.Millisecond)
 
 	secondCount := cloud.ProvisionCalls()

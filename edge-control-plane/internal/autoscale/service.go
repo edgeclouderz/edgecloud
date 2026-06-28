@@ -141,7 +141,7 @@ func (s *Service) Subscribe(ctx context.Context) error {
 }
 
 func (s *Service) run(ctx context.Context, sub *natsio.Subscription, ch <-chan *natsio.Msg) {
-	defer sub.Unsubscribe()
+	defer func() { _ = sub.Unsubscribe() }()
 
 	ticker := time.NewTicker(time.Duration(s.cfg.DecisionIntervalS) * time.Second)
 	defer ticker.Stop()

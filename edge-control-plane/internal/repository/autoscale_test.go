@@ -167,7 +167,7 @@ func TestAutoscaleRepository_ListRecent_AllRegions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRecent: %v", err)
 	}
-	if got != nil && len(got) != 0 {
+	if len(got) != 0 {
 		t.Errorf("len = %d, want 0", len(got))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
