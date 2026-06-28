@@ -561,7 +561,11 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
-	t.Cleanup(func() { sqlDB.Close() })
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			_ = err // sqlmock Close can return error if close is unexpected or other expectations are not fully met.
+		}
+	})
 	db := sqlx.NewDb(sqlDB, "postgres")
 
 	tenantID, appName := "t_atomic", "myapp"

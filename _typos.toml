@@ -1,0 +1,18 @@
+[default.extend-words]
+edgecloud = "edgecloud"
+edgeclouderz = "edgeclouderz"
+wasmtime = "wasmtime"
+wasi = "wasi"
+clippy = "clippy"
+gofmt = "gofmt"
+golangci = "golangci"
+staticcheck = "staticcheck"
+errcheck = "errcheck"
+govet = "govet"
+ineffassign = "ineffassign"
+typecheck = "typecheck"
+unparseable = "unparseable"
+ture = "ture"
+inser = "inser"
+alue = "alue"
+

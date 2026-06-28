@@ -26,7 +26,11 @@ func TestFSArtifactStore_SaveOpenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 
 	got, err := io.ReadAll(rc)
 	if err != nil {
@@ -175,7 +179,9 @@ func TestFSArtifactStore_Open_RejectsOversizedFile(t *testing.T) {
 	if err := f.Truncate(MaxArtifactSize + 1); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatalf("failed to close file: %v", err)
+	}
 
 	_, err = s.Open(context.Background(), "t_1", "hello", "d_1")
 	if !errors.Is(err, ErrArtifactTooLarge) {

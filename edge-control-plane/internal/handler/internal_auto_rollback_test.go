@@ -50,6 +50,7 @@ func (s *stubAutoRollbacker) GetArtifact(_ context.Context, _, _, _ string) (io.
 	panic("stubAutoRollbacker.GetArtifact called from AutoRollback test — wrong code path exercised")
 }
 
+
 // newInternalAutoRollbackMux wires the route through a real
 // *http.ServeMux AND the production InternalHandler. r.PathValue is
 // populated the same way as production. No parallel stub handler

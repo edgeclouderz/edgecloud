@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -104,7 +105,11 @@ func (s *S3ArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 	if err != nil {
 		return fmt.Errorf("S3ArtifactStore.Save: PUT %s: %w", key, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("S3.Save: failed to close response body: %v", err)
+		}
+	}()
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		return fmt.Errorf("S3ArtifactStore.Save: draining body: %w", err)
 	}
@@ -140,17 +145,21 @@ func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymen
 		return nil, fmt.Errorf("S3ArtifactStore.Open: GET %s: %w", key, err)
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Printf("S3.Open: failed to close response body: %v", closeErr)
+		}
 		return nil, &fs.PathError{Op: "open", Path: key, Err: os.ErrNotExist}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Printf("S3.Open: failed to close response body: %v", closeErr)
+		}
 		return nil, fmt.Errorf("S3ArtifactStore.Open: GET %s: status %d", key, resp.StatusCode)
 	}
 	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
 }
 
-// Delete DELETEs the artifact bytes from S3. Idempotent: a 404 (key
+// Delete removes the artifact bytes from S3. Idempotent: a 404 (key
 // already gone) is treated as success so concurrent deletes don't
 // surface spurious errors, matching the FSArtifactStore contract.
 func (s *S3ArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
@@ -167,7 +176,11 @@ func (s *S3ArtifactStore) Delete(ctx context.Context, tenantID, appName, deploym
 	if err != nil {
 		return fmt.Errorf("S3ArtifactStore.Delete: DELETE %s: %w", key, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("S3.Delete: failed to close response body: %v", err)
+		}
+	}()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil // idempotent
 	}

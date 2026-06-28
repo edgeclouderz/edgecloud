@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -217,7 +218,11 @@ func (s *RemoteArtifactStore) pullFromPeer(ctx context.Context, tenantID, appNam
 	if err != nil {
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: GET %s: %w", peerURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("pullFromPeer: failed to close response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		// Drain (limited) so the connection is reusable.
@@ -280,21 +285,29 @@ func (s *RemoteArtifactStore) pullFromPeer(ctx context.Context, tenantID, appNam
 	// existing defer (above) cleans the partial staging file.
 	limited := io.LimitReader(resp.Body, MaxArtifactSize+1)
 	if _, err := io.Copy(stagingFile, limited); err != nil {
-		stagingFile.Close()
+		if closeErr := stagingFile.Close(); closeErr != nil {
+			log.Printf("pullFromPeer: failed to close staging file: %v", closeErr)
+		}
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: write staging: %w", err)
 	}
 	info, err := stagingFile.Stat()
 	if err != nil {
-		stagingFile.Close()
+		if closeErr := stagingFile.Close(); closeErr != nil {
+			log.Printf("pullFromPeer: failed to close staging file: %v", closeErr)
+		}
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: stat staging: %w", err)
 	}
 	if info.Size() > MaxArtifactSize {
-		stagingFile.Close()
+		if closeErr := stagingFile.Close(); closeErr != nil {
+			log.Printf("pullFromPeer: failed to close staging file: %v", closeErr)
+		}
 		return fmt.Errorf("%w: peer response is %d bytes", ErrArtifactTooLarge, info.Size())
 	}
 	// fsync so the bytes are durable before we publish the rename.
 	if err := stagingFile.Sync(); err != nil {
-		stagingFile.Close()
+		if closeErr := stagingFile.Close(); closeErr != nil {
+			log.Printf("pullFromPeer: failed to close staging file: %v", closeErr)
+		}
 		return fmt.Errorf("RemoteArtifactStore.pullFromPeer: fsync staging: %w", err)
 	}
 	if err := stagingFile.Close(); err != nil {

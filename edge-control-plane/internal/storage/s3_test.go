@@ -71,7 +71,9 @@ func TestS3ArtifactStore_SaveOpenDeleteRoundTrip(t *testing.T) {
 				t.Errorf("GET path = %q, want ...", got)
 			}
 			w.Header().Set("Content-Type", "application/wasm")
-			w.Write(payload)
+			if _, err := w.Write(payload); err != nil {
+				t.Errorf("failed to write response: %v", err)
+			}
 		case http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -92,7 +94,11 @@ func TestS3ArtifactStore_SaveOpenDeleteRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
@@ -432,7 +438,11 @@ func TestS3ArtifactStore_Open_CapEnforcedDuringRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 
 	got, err := io.ReadAll(rc)
 	if !errors.Is(err, ErrArtifactTooLarge) {
@@ -453,13 +463,19 @@ func TestS3ArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
 	}
 	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/wasm")
-		w.Write(payload)
+		if _, err := w.Write(payload); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
 	})
 	rc, err := ts.store.Open(t.Context(), "t", "a", "d")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)

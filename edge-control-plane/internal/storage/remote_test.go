@@ -33,7 +33,9 @@ func TestRemoteArtifactStore_ColdCachePullsFromPeer(t *testing.T) {
 			t.Errorf("peer saw path=%q, want /api/internal/download/d_dep1", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/wasm")
-		w.Write(payload)
+		if _, err := w.Write(payload); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
 	})
 
 	cacheDir := t.TempDir()
@@ -45,7 +47,9 @@ func TestRemoteArtifactStore_ColdCachePullsFromPeer(t *testing.T) {
 		t.Fatalf("Open #1: %v", err)
 	}
 	got, err := io.ReadAll(rc)
-	rc.Close()
+	if err := rc.Close(); err != nil {
+		t.Errorf("failed to close read closer: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("ReadAll #1: %v", err)
 	}
@@ -62,7 +66,9 @@ func TestRemoteArtifactStore_ColdCachePullsFromPeer(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	got, _ = io.ReadAll(rc)
-	rc.Close()
+	if err := rc.Close(); err != nil {
+		t.Errorf("failed to close read closer: %v", err)
+	}
 	if !bytes.Equal(got, payload) {
 		t.Errorf("Open #2 bytes = %q, want %q", got, payload)
 	}
@@ -285,9 +291,12 @@ func TestRemoteArtifactStore_Open_OnPeerErrorDoesNotCorruptCache(t *testing.T) {
 			t.Errorf("Hijack: %v", err)
 			return
 		}
-		// Send a partial response then close.
-		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial"))
-		conn.Close()
+		if _, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")); err != nil {
+			t.Errorf("failed to write to hijacked conn: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Errorf("failed to close hijacked conn: %v", err)
+		}
 	})
 	s := mustNewRemote(t, peer, "tok", t.TempDir())
 	_, err := s.Open(t.Context(), "t_t", "a", "d_d")
@@ -522,7 +531,11 @@ func TestRemoteArtifactStore_Open_CapEnforcedOnCacheMissPostRename(t *testing.T)
 		}
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 
 	got, err := io.ReadAll(rc)
 	if !errors.Is(err, ErrArtifactTooLarge) {
@@ -541,7 +554,9 @@ func TestRemoteArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
 	payload := []byte("\x00asmremote-undercap-roundtrip")
 	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/wasm")
-		w.Write(payload)
+		if _, err := w.Write(payload); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
 	})
 	s := mustNewRemote(t, peer, "tok", t.TempDir())
 
@@ -549,7 +564,11 @@ func TestRemoteArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("failed to close read closer: %v", err)
+		}
+	}()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
