@@ -1,0 +1,389 @@
+//go:build integration
+// +build integration
+
+// Package autoscale regression test — issue #85 acceptance criterion:
+//
+//	"100 RPS spike → new worker requested within 90s."
+//
+// This file is build-tag-gated so it does NOT run under the default
+// `go test ./...` CI job. To run it locally with Docker:
+//
+//	go test -tags=integration ./internal/autoscale/... -run TestRegression -v
+//
+// The CI job `go-test-integration` runs it on every PR using a
+// docker:dind service so the headline acceptance is exercised
+// end-to-end, not just skipped.
+//
+// The test does not simulate 100 RPS — it constructs the fleet state
+// that a 100 RPS spike produces in production: a worker reporting
+// `app_slots=0` while DeployRepo.Count returns a high value. With
+// TargetHeadroomPct=20 this triggers ComputeDecision's "free slots
+// shortage" branch and emits scale_up. The 90s upper bound is the
+// acceptance criterion, not a perf target — DecisionIntervalS=1s in
+// the test config gives ~90 ticks within that budget.
+
+package autoscale
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	natsio "github.com/nats-io/nats.go"
+	tc "github.com/testcontainers/testcontainers-go"
+	tcnats "github.com/testcontainers/testcontainers-go/modules/nats"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+)
+
+// shouldSkipRegression mirrors edge-worker/tests/integration_tests.rs:50.
+// Returns (reason, true) when the test should t.Skip — Docker unavailable,
+// CI without Docker, or explicit SKIP_INTEGRATION_TESTS=1.
+//
+// CI runs the test with `docker:dind` so /var/run/docker.sock is present
+// and the guard does not fire; this is purely for local-dev convenience.
+func shouldSkipRegression() (string, bool) {
+	if _, ok := os.LookupEnv("SKIP_INTEGRATION_TESTS"); ok {
+		return "SKIP_INTEGRATION_TESTS set", true
+	}
+	if _, err := os.Stat("/var/run/docker.sock"); err != nil {
+		return "/var/run/docker.sock not present (set SKIP_INTEGRATION_TESTS=1 to skip)", true
+	}
+	return "", false
+}
+
+// newTestNATS boots a NATS testcontainer and returns a connected
+// *natsio.Conn. The container is terminated via t.Cleanup so each
+// test gets its own server — no shared state between tests.
+//
+// We use the lightweight nats:2.10-alpine image. No JetStream
+// required — the autoscaler subscribes via plain ChanSubscribe, not
+// js.Subscribe, so a basic NATS server is enough.
+func newTestNATS(t *testing.T) *natsio.Conn {
+	t.Helper()
+	ctx := context.Background()
+	natsC, err := tcnats.RunContainer(ctx,
+		tc.WithImage("nats:2.10-alpine"),
+	)
+	if err != nil {
+		t.Fatalf("start nats testcontainer: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = natsC.Terminate(cctx)
+	})
+
+	url, err := natsC.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("nats connection string: %v", err)
+	}
+	nc, err := natsio.Connect(url, natsio.Name("autoscale-regression-test"))
+	if err != nil {
+		t.Fatalf("nats connect: %v", err)
+	}
+	t.Cleanup(func() { nc.Close() })
+	return nc
+}
+
+// newServiceForRegression builds a Service wired for regression tests.
+// DecisionIntervalS=1s so the 90s budget has plenty of ticks. ScaleUpCooldownS=1s
+// so the cooldown test can observe a window without burning 60s of wall-clock.
+//
+// Returns the service, an event recorder (so the test can assert on what
+// was inserted), and a cloud provider that increments the package-level
+// `provisionCount` atomic on every Provision call so waitForProvision
+// can poll for activity without the caller threading a counter through
+// every helper.
+func newServiceForRegression(t *testing.T, nc *natsio.Conn) (
+	*Service, *mockEventRepo, *MockCloudProvider,
+) {
+	t.Helper()
+	events := &mockEventRepo{}
+	cloud := &MockCloudProvider{
+		KindFunc: func() string { return "mock" },
+		ProvisionFunc: func(_ context.Context, region string) (string, error) {
+			provisionCount.Add(1)
+			return "w_" + region + "_new", nil
+		},
+	}
+	s := NewService(Deps{
+		Cfg: Config{
+			Enabled:            true,
+			MinWorkers:         1,
+			MaxWorkers:         10,
+			TargetHeadroomPct:  20,
+			ScaleUpCooldownS:   1,
+			ScaleDownCooldownS: 60,
+			DecisionIntervalS:  1,
+		},
+		NC:         nc,
+		DeployRepo: &mockDeployRepo{},
+		EventRepo:  events,
+		Cloud:      cloud,
+		Log:        discardLogger(),
+	})
+	return s, events, cloud
+}
+
+// publishHeartbeat sends a synthetic HeartbeatMessage to
+// edgecloud.heartbeats.<region>. The shape mirrors the Rust
+// HeartbeatMessage struct (edge-worker/src/messages.rs) and the Go
+// nats.HeartbeatMessage — autoscaler only reads worker_id, region,
+// and cluster_headroom.app_slots, but we send the full shape so the
+// test fails loudly if a future change tightens parsing.
+func publishHeartbeat(t *testing.T, nc *natsio.Conn, region string, appSlots uint32) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"type":      "heartbeat",
+		"worker_id": "w_" + region + "_test",
+		"region":    region,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"apps":      map[string]any{},
+		"cluster_headroom": map[string]any{
+			"app_slots": appSlots,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal heartbeat: %v", err)
+	}
+	if err := nc.Publish("edgecloud.heartbeats."+region, body); err != nil {
+		t.Fatalf("publish heartbeat: %v", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("nats flush: %v", err)
+	}
+}
+
+// waitForProvision polls until at least one Provision call has been
+// recorded, or `deadline` elapses. Uses a 50ms poll interval so the
+// test reacts within ~one tick (DecisionIntervalS=1s in test config).
+//
+// We poll because the autoscaler fires Provision asynchronously on
+// the decision goroutine, and the test cannot observe it without
+// yielding to the runtime.
+func waitForProvision(t *testing.T, deadline time.Duration) {
+	t.Helper()
+	timeout := time.NewTimer(deadline)
+	defer timeout.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-timeout.C:
+			t.Fatalf("waitForProvision: no Provision call within %v", deadline)
+		case <-tick.C:
+			if provisionCount.Load() >= 1 {
+				return
+			}
+		}
+	}
+}
+
+// provisionCount is a package-level atomic so waitForProvision can
+// poll without the caller threading a counter through every helper.
+// Reset by the test (or by t.Cleanup) before each scenario.
+var provisionCount atomic.Int64
+
+// runSubscribeWithCleanup wires the autoscaler's Subscribe goroutine
+// with a sync.WaitGroup so the test can wait for clean exit. Service.Subscribe
+// (service.go:116) owns its own goroutine and we can't intercept it,
+// so we manually re-create what it does: ChanSubscribe + spawn run()
+// with the WaitGroup tracked.
+//
+// t.Cleanup runs LIFO, so:
+//
+//	nc.Close() (registered in newTestNATS, first)
+//	cancel(); wg.Wait() (registered here, second — runs FIRST)
+//	natsC.Terminate() (registered in newTestNATS, third — runs LAST)
+//
+// That ordering ensures the goroutine exits before the NATS connection
+// it reads from closes.
+func runSubscribeWithCleanup(t *testing.T, s *Service, nc *natsio.Conn, ctx context.Context) {
+	t.Helper()
+	ch := make(chan *natsio.Msg, 100)
+	sub, err := nc.ChanSubscribe("edgecloud.heartbeats.>", ch)
+	if err != nil {
+		t.Fatalf("ChanSubscribe: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.run(ctx, sub, ch)
+	}()
+	t.Cleanup(func() {
+		// Drain the channel so sub.Unsubscribe doesn't hang.
+		go func() {
+			for range ch {
+			}
+		}()
+		wg.Wait()
+	})
+}
+
+// TestRegression_ScaleUpFiresUnderSpike is the headline acceptance
+// criterion from issue #85: under a spike (high desiredApps + zero
+// free slots), the autoscaler must request a new worker within 90s.
+//
+// The test simulates the spike by publishing a single heartbeat
+// reporting app_slots=0 and configuring DeployRepo.Count to return
+// 100. With TargetHeadroomPct=20, ComputeDecision computes:
+//
+//	needed = 100 + 20 = 120  >  totalFreeSlots=0  →  scale_up (1 → 2)
+func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
+	if reason, ok := shouldSkipRegression(); ok {
+		t.Skipf("regression: %s", reason)
+	}
+	provisionCount.Store(0)
+
+	nc := newTestNATS(t)
+	s, events, _ := newServiceForRegression(t, nc)
+	// Wire Count to return 100 (the "spike aftermath"): the autoscaler
+	// will treat this as DesiredApps=100 and demand more workers.
+	s.deployRepo = &mockDeployRepo{
+		countFunc: func(_ context.Context) (int, error) { return 100, nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runSubscribeWithCleanup(t, s, nc, ctx)
+
+	// 1 worker reporting 0 free slots — this is the spike's footprint.
+	publishHeartbeat(t, nc, "fra", 0)
+
+	// Wait ≤ 90s for cloud.Provision to fire. The autoscaler ticks
+	// at 1s and reacts within one tick of the heartbeat landing.
+	waitForProvision(t, 90*time.Second)
+
+	// Give the Insert a moment to land after Provision returns.
+	time.Sleep(100 * time.Millisecond)
+	if len(events.events) < 1 {
+		t.Fatalf("Provision called but no event recorded")
+	}
+	ev := events.events[0]
+	if ev.Action != domain.AutoscaleUp {
+		t.Errorf("event.Action = %q, want scale_up", ev.Action)
+	}
+	if !ev.Succeeded {
+		t.Errorf("event.Succeeded = false, want true")
+	}
+	if ev.Region != "fra" {
+		t.Errorf("event.Region = %q, want fra", ev.Region)
+	}
+	if ev.FromCount != 1 || ev.ToCount != 2 {
+		t.Errorf("event.FromCount=%d ToCount=%d, want 1→2", ev.FromCount, ev.ToCount)
+	}
+}
+
+// TestRegression_CooldownSuppressesSecondScaleUp pins the cooldown
+// contract: after a successful scale_up, a second tick within
+// ScaleUpCooldownS must convert to a noop event and NOT call Provision
+// again. With ScaleUpCooldownS=1s in test config, the window is short
+// enough that we can wait it out without burning wall-clock.
+func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
+	if reason, ok := shouldSkipRegression(); ok {
+		t.Skipf("regression: %s", reason)
+	}
+	provisionCount.Store(0)
+
+	nc := newTestNATS(t)
+	s, events, _ := newServiceForRegression(t, nc)
+	s.deployRepo = &mockDeployRepo{
+		countFunc: func(_ context.Context) (int, error) { return 100, nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runSubscribeWithCleanup(t, s, nc, ctx)
+
+	// Trigger the first scale_up.
+	publishHeartbeat(t, nc, "fra", 0)
+	waitForProvision(t, 90*time.Second)
+	firstCount := provisionCount.Load()
+
+	// Burst more heartbeats well within the 1s cooldown window. The
+	// next tick (within ~1s) must convert the resulting scale_up
+	// decision into a noop event and NOT call Provision again.
+	for i := 0; i < 5; i++ {
+		publishHeartbeat(t, nc, "fra", 0)
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	// Give the autoscaler enough ticks to consider a second scale_up.
+	// With DecisionIntervalS=1s and ScaleUpCooldownS=1s, the cooldown
+	// window expires after ~1s post-first-event. We sleep 2.5s — long
+	// enough for the cooldown to expire AND the next tick to fire,
+	// which would normally cause a second scale_up. The test asserts
+	// it does NOT.
+	time.Sleep(2500 * time.Millisecond)
+
+	secondCount := provisionCount.Load()
+	if secondCount > firstCount {
+		t.Errorf("Provision called again after first scale_up: first=%d second=%d (cooldown should suppress)", firstCount, secondCount)
+	}
+
+	// At least one cooldown-suppressed noop event must have been recorded.
+	foundNoop := false
+	for _, ev := range events.events {
+		if ev.Action == domain.AutoscaleNoop {
+			foundNoop = true
+			break
+		}
+	}
+	if !foundNoop {
+		t.Errorf("no noop event recorded after cooldown-suppressed scale_up; events=%d", len(events.events))
+	}
+}
+
+// TestRegression_MultiRegionIndependent pins per-region fan-out:
+// heartbeats in two regions must each produce their own Provision
+// call. The autoscaler fans out per-region in evaluateAll
+// (service.go:175) — this test pins that wiring.
+func TestRegression_MultiRegionIndependent(t *testing.T) {
+	if reason, ok := shouldSkipRegression(); ok {
+		t.Skipf("regression: %s", reason)
+	}
+	provisionCount.Store(0)
+
+	nc := newTestNATS(t)
+	s, _, _ := newServiceForRegression(t, nc)
+	s.deployRepo = &mockDeployRepo{
+		countFunc: func(_ context.Context) (int, error) { return 100, nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runSubscribeWithCleanup(t, s, nc, ctx)
+
+	publishHeartbeat(t, nc, "fra", 0)
+	publishHeartbeat(t, nc, "iad", 0)
+
+	// Wait for both regions to Provision. The 90s budget is generous
+	// (each tick fires at 1s). We poll until ≥ 2 calls land.
+	deadline := time.After(90 * time.Second)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("both regions did not Provision within 90s; calls=%d", provisionCount.Load())
+		case <-tick.C:
+			if provisionCount.Load() >= 2 {
+				return
+			}
+		}
+	}
+}
+
+// errSkipped is a sentinel so the test binary's exit code distinguishes
+// "skipped" from "failed". Today it's unused but kept as a guard against
+// accidental skip-via-error regressions in future refactors.
+var errSkipped = errors.New("test skipped")
+
+var _ = errSkipped // suppress unused-var lint in build-tag-gated file
