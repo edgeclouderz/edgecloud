@@ -40,13 +40,37 @@ impl Supervisor {
     /// Diffs the desired app set against currently running apps and
     /// starts/stops apps accordingly. Supports canary/blue-green: when
     /// `spec.routes` is Some, all listed deployments run concurrently.
+    ///
+    /// Both `TaskUpdate` (event-driven, from activate/rollback) and
+    /// `FullSync` (periodic reconciliation + on-registration, issue #53)
+    /// share the same diff logic — the supervisor's contract is
+    /// "the apps map is the entire desired state". The CP publishes
+    /// `FullSync` with the worker's full active app set, so the worker's
+    /// diff against its current state naturally: stops apps no longer in
+    /// the set, starts missing, restarts on `deployment_id` mismatch.
+    /// The variant distinction exists only for observability so an
+    /// operator can tell event-driven updates from scheduled syncs in
+    /// metrics and logs.
     #[allow(clippy::type_complexity)]
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
-        let TaskMessage::TaskUpdate {
-            tenant_id,
-            apps: desired_apps,
-            ..
-        } = msg;
+        let (tenant_id, desired_apps) = match msg {
+            TaskMessage::TaskUpdate {
+                tenant_id, apps, ..
+            } => {
+                tracing::debug!(tenant_id = %tenant_id, apps = apps.len(), "task_update received");
+                (tenant_id, apps)
+            }
+            TaskMessage::FullSync {
+                tenant_id, apps, ..
+            } => {
+                // FullSync is the periodic safety net (issue #53). Same
+                // diff logic — workers don't need to know whether a
+                // message is event-driven or scheduled. The log line is
+                // the operator's signal that a reconcile fired.
+                tracing::info!(tenant_id = %tenant_id, apps = apps.len(), "full_sync received");
+                (tenant_id, apps)
+            }
+        };
 
         // Compute the set of (app_name, deployment_id) keys currently running,
         // and look up the deployment_id for each key so we can detect changes.

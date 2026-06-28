@@ -20,11 +20,35 @@ where
 }
 
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
+///
+/// Two variants share the same `apps` payload shape but carry different
+/// semantics:
+///
+/// * `task_update` — published when an app set changes (activate / rollback /
+///   env edit). Workers diff against current state.
+/// * `full_sync` — published periodically (every `RECONCILE_INTERVAL`,
+///   default 5 min) and on worker registration, listing the **complete**
+///   active app set for the tenant. Workers treat the message as
+///   authoritative: stop any app not in the set, start any missing, restart
+///   any whose `deployment_id` doesn't match. Closes the gap when a NATS
+///   `task_update` is lost (workqueue `WorkQueuePolicy` has no replay
+///   support — see issue #53).
+///
+/// Both variants use the same handler logic; the only difference is the
+/// observability hook (`reconcile_full_sync_total` counter) so an operator
+/// can distinguish a scheduled sync from an event-driven update in metrics.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum TaskMessage {
     #[serde(rename = "task_update")]
     TaskUpdate {
+        #[allow(dead_code)]
+        timestamp: String,
+        tenant_id: String,
+        apps: HashMap<String, AppSpec>,
+    },
+    #[serde(rename = "full_sync")]
+    FullSync {
         #[allow(dead_code)]
         timestamp: String,
         tenant_id: String,
@@ -391,5 +415,100 @@ mod tests {
                 "*.sendgrid.net".to_string()
             ])
         );
+    }
+
+    // ── TaskMessage::FullSync wire format (issue #53) ─────────────────────
+
+    /// `task_update` parses into the `TaskUpdate` variant (regression
+    /// guard for the existing path; included here so a future variant
+    /// rename doesn't silently break the old path).
+    #[test]
+    fn task_update_deserializes_to_task_update_variant() {
+        let json = r#"{
+            "type": "task_update",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {
+                "myapp": {
+                    "deployment_id": "d_1",
+                    "deployment_hash": "abc",
+                    "env": {},
+                    "max_memory_mb": 256
+                }
+            }
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize task_update");
+        match msg {
+            TaskMessage::TaskUpdate {
+                tenant_id, apps, ..
+            } => {
+                assert_eq!(tenant_id, "t_1");
+                assert_eq!(apps.len(), 1);
+                assert!(apps.contains_key("myapp"));
+            }
+            TaskMessage::FullSync { .. } => panic!("task_update parsed as FullSync"),
+        }
+    }
+
+    /// `full_sync` parses into the `FullSync` variant with the same `apps`
+    /// payload shape as `task_update`. Lock the wire so a future spec change
+    /// on either side fails fast here.
+    #[test]
+    fn full_sync_deserializes_to_full_sync_variant() {
+        let json = r#"{
+            "type": "full_sync",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {
+                "myapp": {
+                    "deployment_id": "d_1",
+                    "deployment_hash": "abc",
+                    "env": {"KEY": "value"},
+                    "max_memory_mb": 256,
+                    "allowlist": ["api.stripe.com"]
+                },
+                "other": {
+                    "deployment_id": "d_2",
+                    "deployment_hash": "def",
+                    "env": {},
+                    "max_memory_mb": 128
+                }
+            }
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize full_sync");
+        let (tenant_id, apps) = match msg {
+            TaskMessage::FullSync {
+                tenant_id, apps, ..
+            } => (tenant_id, apps),
+            TaskMessage::TaskUpdate { .. } => panic!("full_sync parsed as TaskUpdate"),
+        };
+        assert_eq!(tenant_id, "t_1");
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps["myapp"].deployment_id, "d_1");
+        assert_eq!(
+            apps["myapp"].env.get("KEY").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            apps["myapp"].allowlist,
+            Some(vec!["api.stripe.com".to_string()])
+        );
+        assert_eq!(apps["other"].deployment_hash, "def");
+        assert_eq!(apps["other"].max_memory_mb, 128);
+    }
+
+    /// Unknown `type` values must fail to deserialize rather than silently
+    /// fall through to a default variant. The CP and worker ship together,
+    /// so this guards against a divergent deployment.
+    #[test]
+    fn unknown_type_field_fails_to_deserialize() {
+        let json = r#"{
+            "type": "bogus",
+            "timestamp": "2026-06-19T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {}
+        }"#;
+        let res: Result<TaskMessage, _> = serde_json::from_str(json);
+        assert!(res.is_err(), "unknown type field must fail to parse");
     }
 }
