@@ -415,10 +415,10 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         downloader,
         port_pool,
         nats,
+        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
         log_forwarder,
         jwt_signer,
         http,
-        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
     });
 
     // Build and publish a heartbeat manually
