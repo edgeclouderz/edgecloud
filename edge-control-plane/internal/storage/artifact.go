@@ -33,10 +33,10 @@ type ArtifactStore interface {
 	// in a single io.Copy pass (no intermediate buffer). The hash and
 	// the file are written concurrently via io.MultiWriter; the final
 	// path either contains the full artifact (with a verified hash) or
-	// doesn't exist (atomic via temp-rename). ctx is ignored — os.* and
-	// hash.* don't take a context. Forward-ported here so commit
-	// 0e08a32 (Migrate/MigrateTree streaming) can call it before
-	// 26578b2 lands; the latter commit will be a no-op for this method.
+	// doesn't exist (atomic via temp-rename). ctx is ignored — `os.*`
+	// and `sha256` don't take a context. Used by Migrate/MigrateTree
+	// (commit 0e08a32) and Deploy (commit 26578b2) to avoid buffering
+	// a 100 MiB artifact in RAM.
 	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
 }
 
@@ -106,8 +106,16 @@ func (s *FSArtifactStore) Path(tenantID, appName, deploymentID string) (string, 
 	return path, nil
 }
 
-// Save writes a Wasm artifact to disk. ctx is ignored — `os.Create`
-// and `io.Copy` do not take a context.
+// Save writes a Wasm artifact to disk atomically. The write goes
+// to `<path>.tmp.<pid>` first; if the copy completes the file is
+// fsynced and renamed onto the final path. A crash or io.Copy
+// error mid-write leaves the temp file behind; a background
+// cleanup (or operator rm) can remove it. The final path either
+// contains the full artifact or does not exist — never a partial
+// write. `os.Rename` is atomic on POSIX filesystems; on Windows
+// it can fail if the destination is open, but the deployment runs
+// on Linux per the edge-worker architecture (CLAUDE.md), so this
+// is not a concern. ctx is ignored — `os.*` does not take a context.
 func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {
@@ -117,34 +125,50 @@ func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 		return fmt.Errorf("creating artifact dir: %w", err)
 	}
 
-	f, err := os.Create(path)
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	f, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("creating artifact file: %w", err)
+		return fmt.Errorf("creating artifact temp file: %w", err)
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			log.Printf("ArtifactStore.Save: failed to close file: %v", err)
-		}
-	}()
+cleanup := func() { _ = os.Remove(tmp) }
 
 	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		cleanup()
 		return fmt.Errorf("writing artifact: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("syncing artifact: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("closing artifact: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		cleanup()
+		return fmt.Errorf("renaming artifact: %w", err)
 	}
 	return nil
 }
 
 // SaveAndHash streams the artifact to disk and returns its SHA-256
-// in a single pass. The hash and the file are written concurrently
-// via io.MultiWriter; the final path either contains the full
-// artifact (with a verified hash) or doesn't exist (atomic via
-// temp-rename). ctx is ignored — `os.*` and `sha256` don't take a
-// context.
+// hash in a single pass. Bytes fan out to both the file and the
+// hasher via io.MultiWriter — the caller no longer needs to buffer
+// the artifact in memory just to hash it before saving.
 //
-// Equivalent to Save followed by sha256 over the resulting file, but
-// avoids the intermediate buffer: the artifact is read once from r,
-// written to disk AND folded into the hasher, in one io.Copy call.
-// Forward-ported here from commit 26578b2 so commit 0e08a32
-// (Migrate/MigrateTree streaming) can call it.
+// Atomicity matches Save: the write goes to `<path>.tmp.<pid>`
+// first, gets fsynced, then is renamed onto the final path. A
+// crash or io.Copy error mid-write leaves the temp file behind;
+// the final path either contains the full artifact or doesn't
+// exist — never a partial write. After rename, the hash returned
+// here is the hash of the bytes at the final path.
+//
+// For very large artifacts (100 MiB cap) the in-RAM cost drops
+// from ~3× the artifact size (handler ReadAll → service ReadAll →
+// io.Copy) to one streaming pass with a 32-byte hash state.
+// ctx is ignored — `os.*` and `sha256` don't take a context.
 func (s *FSArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
 	path, err := s.Path(tenantID, appName, deploymentID)
 	if err != nil {

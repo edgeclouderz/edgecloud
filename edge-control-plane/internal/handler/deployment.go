@@ -1,12 +1,10 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -105,30 +103,37 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap the body at MaxArtifactSize (the service layer's own
-	// io.LimitReader runs *after* the handler has already allocated
-	// the full body via io.ReadAll — too late to defend against a
-	// multi-GiB payload). http.MaxBytesReader returns a typed
-	// *http.MaxBytesError when the cap is exceeded, which we map to
-	// 413 below. The service-layer LimitReader stays as
-	// defense-in-depth for any non-HTTP caller (tests, future
-	// internal CLIs).
+	// Cap the body at MaxArtifactSize. http.MaxBytesReader returns a
+	// typed *http.MaxBytesError when the cap is exceeded, which we
+	// map to 413 below. The body is now streamed directly to the
+	// service via r.Body — no io.ReadAll here. The service peeks
+	// the wasm magic bytes inside its transaction callback and
+	// hands the remaining stream to ArtifactStore.SaveAndHash,
+	// which hashes and writes in a single io.Copy pass. This drops
+	// the prior ~3× RAM amplification (handler ReadAll → service
+	// ReadAll → io.Copy) for the 100 MiB artifact case.
+	//
+	// For requests with a Content-Length header (the common case),
+	// we pre-check the advertised size and reject oversize uploads
+	// before any I/O. For chunked uploads (ContentLength == -1),
+	// MaxBytesReader fires during streaming and the service
+	// surfaces the *http.MaxBytesError, which we map to 413 below.
+	if r.ContentLength > service.MaxArtifactSize {
+		http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
 
-	// Read artifact from multipart form or raw body
-	body, err := io.ReadAll(r.Body)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback)
 	if err != nil {
+		// *http.MaxBytesError surfaces from the service's streaming
+		// reads when the body exceeds the cap (chunked uploads
+		// without a Content-Length header). Map to 413.
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
 			return
 		}
-		httperror.BadRequestCtx(w, r, "failed to read body")
-		return
-	}
-
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions, autoRollback)
-	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
 			return
@@ -143,6 +148,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrTooManyRegions) {
 			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+		// ErrInvalidWasm is what the service returns when the
+		// 4-byte magic check inside the tx callback fails. Map to
+		// 400 (not 422 or 500) — the request body was syntactically
+		// valid but the content wasn't a wasm module.
+		if errors.Is(err, service.ErrInvalidWasm) {
+			http.Error(w, `{"error": "invalid wasm artifact: missing magic bytes"}`, http.StatusBadRequest)
 			return
 		}
 		log.Printf("internal error: %v", err)

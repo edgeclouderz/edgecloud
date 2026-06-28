@@ -388,6 +388,12 @@ func TestDeploy_OversizedBody_Returns413(t *testing.T) {
 	// cheap.
 	oversized := io.NopCloser(io.LimitReader(zeroReader{}, service.MaxArtifactSize+1))
 	req := httptest.NewRequest("POST", "/api/deploy/myapp", oversized)
+	// Set ContentLength explicitly so the handler's pre-check
+	// (Content-Length > MaxArtifactSize → 413) triggers before
+	// any service call. In the new streaming flow the service
+	// reads the body directly, so without this pre-check the
+	// service would be called and panic on a nil deploymentSvc.
+	req.ContentLength = service.MaxArtifactSize + 1
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)

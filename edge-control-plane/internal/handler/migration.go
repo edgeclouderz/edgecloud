@@ -26,6 +26,16 @@ const (
 	// (tree uploads). Larger bodies are rejected mid-stream by
 	// http.MaxBytesReader.
 	maxMigrateBodyBytes int64 = 50 << 20 // 50 MiB
+	// parseMultipartMaxMemory is the per-part threshold above which
+	// ParseMultipartForm spills a part to a temp file instead of
+	// pinning it in RAM. It MUST be strictly less than
+	// maxMigrateBodyBytes: if it equals the body cap, every accepted
+	// upload fits in RAM and the hint is a no-op. 10 MiB is a
+	// conservative default — single-file mode's `file` part is
+	// already capped at MaxArtifactSize (100 MiB) downstream, and
+	// tree mode's per-part cap is maxPartBytes (5 MiB), so spilling
+	// anything above 10 MiB to a temp file is always correct.
+	parseMultipartMaxMemory int64 = 10 << 20 // 10 MiB
 	// maxTreeFiles is the cap on the number of files in a single tree
 	// upload. Larger trees are rejected with 400.
 	maxTreeFiles = 256
@@ -89,13 +99,8 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	// underlying body read.
 	r.Body = http.MaxBytesReader(w, r.Body, maxMigrateBodyBytes)
 
-	if err := r.ParseMultipartForm(maxMigrateBodyBytes); err != nil {
-		// MaxBytesReader returns *http.MaxBytesError once the cap is
-		// hit. Detect via errors.As so we don't string-match the
-		// error message.
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+	if err := r.ParseMultipartForm(parseMultipartMaxMemory); err != nil {
+		if httperror.MaxBodyBytes(w, err, http.StatusRequestEntityTooLarge, "request body too large") {
 			return
 		}
 		httperror.BadRequestCtx(w, r, "failed to parse multipart form")
@@ -192,13 +197,8 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 	// a 10 GB upload mid-stream.
 	r.Body = http.MaxBytesReader(w, r.Body, maxMigrateBodyBytes)
 
-	if err := r.ParseMultipartForm(maxMigrateBodyBytes); err != nil {
-		// MaxBytesReader returns *http.MaxBytesError once the cap is
-		// hit. Detect via errors.As so we don't string-match the
-		// error message.
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+	if err := r.ParseMultipartForm(parseMultipartMaxMemory); err != nil {
+		if httperror.MaxBodyBytes(w, err, http.StatusRequestEntityTooLarge, "request body too large") {
 			return
 		}
 		http.Error(w, `{"error":"failed to parse multipart form"}`, http.StatusBadRequest)
