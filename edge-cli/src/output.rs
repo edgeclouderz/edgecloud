@@ -38,6 +38,35 @@ pub fn section(label: &str) {
     println!("\n{} {}", style("›").cyan(), style(label).bold());
 }
 
+/// Read a `y/N` confirmation. Returns true on "y" or "Y" (after
+/// trim); false on anything else (including EOF and empty input).
+/// Caller is responsible for the `is_terminal()` check.
+///
+/// On Unix we open `/dev/tty` directly so a piped stdin
+/// (`cmd < /dev/null`, `yes | cmd`, heredoc) cannot silently
+/// satisfy the prompt or trigger an immediate EOF that aborts
+/// the action. Same pattern as `rpassword::prompt_password` for
+/// `edge auth login --no-echo`. On non-Unix platforms we fall back
+/// to stdin; the caller's `is_terminal()` gate is the only safety
+/// on that path.
+#[cfg(unix)]
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader};
+    eprint!("{prompt}");
+    let tty = std::fs::File::open("/dev/tty")?;
+    let mut buf = String::new();
+    BufReader::new(tty).read_line(&mut buf)?;
+    Ok(matches!(buf.trim(), "y" | "Y"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+    eprint!("{prompt}");
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(matches!(buf.trim(), "y" | "Y"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -139,6 +139,18 @@ pub struct CreateAPIKeyResponse {
     pub token: String,
 }
 
+/// One API key as returned by `GET /api/v1/keys`. Mirrors the Go
+/// `domain.APIKey` field-for-field, minus `last_used` which the
+/// server deliberately omits from the response even though it is
+/// stored in the DB (see issue #106 design notes).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct APIKeySummary {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,
@@ -265,6 +277,17 @@ impl ApiClient {
 
     pub(crate) fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key.0)
+    }
+
+    /// The raw bearer token this client authenticates with. Exposed
+    /// for CLI-side UX checks (e.g. `keys revoke`'s post-revoke
+    /// warning) that need to compare against a candidate key id
+    /// without going through a network round-trip. The value is
+    /// the same string the server echoes back as `api_key_id` in
+    /// `whoami`, so this accessor is the local equivalent of
+    /// `client.auth().whoami().api_key_id`.
+    pub(crate) fn bearer(&self) -> &str {
+        &self.api_key.0
     }
 
     /// Returns the base URL this client targets. Useful for surfacing
@@ -696,6 +719,42 @@ impl<'a> Keys<'a> {
             ApiError::Transient { source } => source,
         })?;
         serde_json::from_str(&resp.text()?).map_err(Into::into)
+    }
+
+    /// GET `/api/v1/keys` — list all API keys for the caller's tenant.
+    /// Returns an inline array (no envelope); used by `edge auth keys list`.
+    pub fn list(&self) -> Result<Vec<APIKeySummary>> {
+        let url = format!("{}/api/v1/keys", self.client.base_url);
+        let resp = self
+            .client
+            .http
+            .get(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys list failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
+    }
+
+    /// DELETE `/api/v1/keys/{id}` — hard-delete the key with the given
+    /// id. Returns `Ok(())` on 204 No Content, `Err(ApiError::Rejected)`
+    /// on 4xx (caller can pattern-match for clean user-facing errors),
+    /// and `Err(ApiError::Transient)` on 5xx or network failure.
+    pub fn revoke(&self, id: &str) -> Result<(), ApiError> {
+        let url = format!("{}/api/v1/keys/{}", self.client.base_url, id);
+        let resp = self
+            .client
+            .http
+            .delete(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+        let _ = check_response(resp)?;
+        Ok(())
     }
 }
 
