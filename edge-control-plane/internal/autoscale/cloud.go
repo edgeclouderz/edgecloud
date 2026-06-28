@@ -100,8 +100,8 @@ type MockCloudProvider struct {
 	ProvisionFunc   func(ctx context.Context, region string) (string, error)
 	DeprovisionFunc func(ctx context.Context, region, workerID string) error
 
-	provisionCount     atomic.Int64
-	deprovisionCount   atomic.Int64
+	provisionCount   atomic.Int64
+	deprovisionCount atomic.Int64
 }
 
 func (m *MockCloudProvider) Kind() string {

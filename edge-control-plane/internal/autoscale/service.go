@@ -102,14 +102,14 @@ func NewService(d Deps) *Service {
 		d.Cfg.DecisionIntervalS = 30
 	}
 	return &Service{
-		cfg:                d.Cfg,
-		nc:                 d.NC,
-		deployRepo:         d.DeployRepo,
-		eventRepo:          d.EventRepo,
-		cloud:              d.Cloud,
-		log:                d.Log,
-		fleets:             make(map[string]map[string]WorkerHeadroom),
-		lastEventByRegion:  make(map[string]*domain.AutoscaleEvent),
+		cfg:               d.Cfg,
+		nc:                d.NC,
+		deployRepo:        d.DeployRepo,
+		eventRepo:         d.EventRepo,
+		cloud:             d.Cloud,
+		log:               d.Log,
+		fleets:            make(map[string]map[string]WorkerHeadroom),
+		lastEventByRegion: make(map[string]*domain.AutoscaleEvent),
 	}
 }
 
