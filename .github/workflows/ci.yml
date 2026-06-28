@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [edge-runtime, edge-cli, edge-worker]
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +28,8 @@ jobs:
           cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
 
       - name: Install rustfmt
         run: rustup component add rustfmt
@@ -45,7 +47,7 @@ jobs:
           key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run rustfmt
-        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml
+        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml --all
 
   # ============================================================
   # CLIPPY — clippy on all crates
@@ -55,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress]
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +66,8 @@ jobs:
           cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
 
       - name: Install clippy
         run: rustup component add clippy
@@ -97,7 +101,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress]
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
     steps:
       - uses: actions/checkout@v4
 
@@ -106,6 +110,8 @@ jobs:
           cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -143,7 +149,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress]
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config]
     steps:
       - uses: actions/checkout@v4
 
@@ -152,6 +158,8 @@ jobs:
           cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
           cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4

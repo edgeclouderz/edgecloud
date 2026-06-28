@@ -257,10 +257,13 @@ mod tests {
             column: Some(0),
             start_byte: start,
             end_byte: end,
+            original_start_byte: start,
+            original_end_byte: end,
             pattern: PatternKind::Rust(pattern),
             snippet: needle.to_string(),
             arg_nodes,
             transformability,
+            bound_var: None,
         }
     }
 
@@ -539,10 +542,13 @@ fn main() {
             column: Some(0),
             start_byte: 0,
             end_byte: src.len(),
+            original_start_byte: 0,
+            original_end_byte: src.len(),
             pattern: PatternKind::Posix(crate::patterns::PosixPattern::Bind),
             snippet: "bind(...)".to_string(),
             arg_nodes: vec!["fd".to_string()],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         };
         let r = RustTransformer::new().transform(src, vec![m]);
         assert_eq!(r.errors.len(), 1);

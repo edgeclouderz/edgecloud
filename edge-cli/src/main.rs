@@ -7,7 +7,7 @@ mod migrate;
 mod output;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -19,6 +19,52 @@ struct Cli {
     /// Path to project directory (default: current directory).
     #[arg(short, long, default_value = ".")]
     path: std::path::PathBuf,
+}
+
+/// `edge domains <add|list|check|remove>` — manage custom FQDNs bound
+/// to a deployment (issue #83). The full subcommand surface is
+/// defined here (clap derives the help text from it) and dispatched
+/// through `commands::domains::DomainsAction::run`. Adding a new
+/// subcommand means one variant here + one match arm.
+#[derive(Subcommand)]
+enum DomainsCommand {
+    /// Bind a custom FQDN (e.g. `api.acme.com`) to an app.
+    Add {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to bind.
+        fqdn: String,
+    },
+    /// List all custom FQDNs bound to an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Show a single FQDN's status (incl. any `last_error`).
+    Check {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to inspect.
+        fqdn: String,
+    },
+    /// Unbind a custom FQDN from an app.
+    Remove {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to unbind.
+        fqdn: String,
+    },
+}
+
+impl From<DomainsCommand> for commands::domains::DomainsAction {
+    fn from(cmd: DomainsCommand) -> Self {
+        match cmd {
+            DomainsCommand::Add { app, fqdn } => Self::Add { app, fqdn },
+            DomainsCommand::List { app } => Self::List { app },
+            DomainsCommand::Check { app, fqdn } => Self::Check { app, fqdn },
+            DomainsCommand::Remove { app, fqdn } => Self::Remove { app, fqdn },
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -76,8 +122,17 @@ enum Command {
         auto_rollback: bool,
     },
 
-    /// Get deployment status.
-    Status,
+    /// Inspect runtime and deployment status.
+    ///
+    /// `runtime` surfaces the worker-reported status (running /
+    /// starting / stopping / crashed / hung / unknown). `deployment`
+    /// (default for the no-arg form) is the legacy DB-row view.
+    /// The subcommand is optional so bare `edge status` keeps
+    /// working as a backward-compat alias for `edge status deployment`.
+    Status {
+        #[command(subcommand)]
+        action: Option<StatusAction>,
+    },
 
     /// Set an environment variable.
     EnvSet {
@@ -136,6 +191,42 @@ enum Command {
     /// List all deployments for the app.
     Deployments,
 
+    /// Read recent log entries for the app (issue #77).
+    ///
+    /// Calls `GET /api/v1/apps/{appName}/logs` and prints the most
+    /// recent entries, newest first. With `--follow`, polls every
+    /// 2s and prints new entries as they arrive. With no flags,
+    /// prints the last 5 minutes; use `--since 1h` for a longer
+    /// window. Pipe mode (`edge logs myapp | jq`) emits one JSON
+    /// object per line.
+    Logs {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+
+        /// Lower bound on the entry timestamp, expressed as a
+        /// relative duration. Accepts `<n>s`, `<n>m`, `<n>h`,
+        /// `<n>d` (e.g. `5m`, `1h`, `30s`). Default: 5m.
+        #[arg(long, default_value = "5m")]
+        since: String,
+
+        /// Minimum severity filter. `warn` returns `warn` + `error`.
+        /// Unknown values are rejected by the server with a 400.
+        #[arg(long)]
+        level: Option<String>,
+
+        /// Poll for new entries instead of printing once and
+        /// exiting. Stops on Ctrl-C, after 30 minutes, or when
+        /// the process is killed.
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Maximum entries to return per request. Server clamps
+        /// to [1, 1000]; default 100.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+
     /// Manage authentication (signup, login, whoami, logout).
     Auth {
         #[command(subcommand)]
@@ -145,20 +236,32 @@ enum Command {
     /// Get or set traffic splits for canary/blue-green deployments.
     Traffic {
         #[command(subcommand)]
-        action: TrafficAction,
+        action: commands::traffic::TrafficAction,
     },
+    /// Manage custom FQDNs bound to a deployment (issue #83).
+    #[command(subcommand)]
+    Domains(DomainsCommand),
 }
 
 #[derive(Subcommand)]
-enum TrafficAction {
-    /// Show current traffic splits.
-    Show,
-    /// Set traffic splits. Example: `edge traffic set d_v1=95 d_v2=5`
-    Set {
-        /// Deployment splits as `deployment_id=weight` pairs.
-        /// Weights must sum to 100.
-        splits: Vec<String>,
+enum StatusAction {
+    /// Show the worker-reported runtime status of an app.
+    ///
+    /// Surfaces `running` | `starting` | `stopping` | `crashed` |
+    /// `hung` | `unknown`, plus the region / worker_id /
+    /// `last_heartbeat` and (for `crashed`) the worker's exit code.
+    /// Hits `GET /api/v1/apps/{appName}/status`; no server-side
+    /// filtering of stale heartbeats — the `last_heartbeat` field
+    /// is surfaced verbatim so users can decide.
+    Runtime {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
     },
+    /// Show the deployment-row status (DB-side: deployed / active /
+    /// failed / migrated). Equivalent to the legacy `edge status`
+    /// form for backward compatibility.
+    Deployment,
 }
 
 fn main() -> Result<()> {
@@ -173,7 +276,10 @@ fn main() -> Result<()> {
             regions,
             auto_rollback,
         } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
-        Command::Status => commands::status::run(&cli.path),
+        Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
+            StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
+            StatusAction::Deployment => commands::status::run(&cli.path),
+        },
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
         Command::Activate {
@@ -185,10 +291,20 @@ fn main() -> Result<()> {
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Logs {
+            app,
+            since,
+            level,
+            follow,
+            limit,
+        } => {
+            let since_dur = parse_since(&since)?;
+            commands::logs::run(&cli.path, &app, since_dur, level.as_deref(), follow, limit)
+        }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
-            TrafficAction::Show => commands::traffic::get(&cli.path),
-            TrafficAction::Set { splits } => {
+            commands::traffic::TrafficAction::Show => commands::traffic::get(&cli.path),
+            commands::traffic::TrafficAction::Set { splits } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
                     .filter_map(|s| {
@@ -200,5 +316,40 @@ fn main() -> Result<()> {
                 commands::traffic::set(&cli.path, &parsed)
             }
         },
+        Command::Domains(cmd) => {
+            let action: commands::domains::DomainsAction = cmd.into();
+            action.run(&cli.path)
+        }
     }
+}
+
+/// Parse a relative duration like `30s`, `5m`, `1h`, `7d` into a
+/// [`std::time::Duration`]. The server accepts the result as a
+/// relative offset from "now" (computed locally before the request
+/// goes out), so the wire format ends up as an absolute RFC3339
+/// timestamp. Keeping the parser stdlib-only avoids adding a
+/// `humantime` dep for this one command.
+fn parse_since(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--since cannot be empty; pass e.g. 5m, 1h, 30s");
+    }
+    // Find the boundary between the digits and the unit suffix.
+    // Iterating bytes is fine: we only accept ASCII digits and a
+    // single ASCII suffix char.
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| anyhow::anyhow!("--since {s:?} is missing a unit (s/m/h/d)"))?;
+    let (n_str, unit) = s.split_at(split);
+    let n: u64 = n_str
+        .parse()
+        .with_context(|| format!("--since {s:?} has non-numeric magnitude {n_str:?}"))?;
+    let mult: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        other => anyhow::bail!("--since unit {other:?} not supported (use s/m/h/d)"),
+    };
+    Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }

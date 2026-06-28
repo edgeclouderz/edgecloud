@@ -316,6 +316,122 @@ components:
             target the rolled-back version.
 
     # -------------------------------------------------------------------------
+    # Logs (issue #77 — read side)
+    # -------------------------------------------------------------------------
+    LogEntry:
+      type: object
+      description: |
+        A single tenant log record. Populated by worker-side
+        `edge:observe.emit_log` calls and forwarded to the control
+        plane via `POST /api/internal/logs` (issue #76 / PR #98).
+        Read back to tenants via `GET /api/v1/apps/{appName}/logs`.
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 12345
+        tenant_id:
+          type: string
+          example: t_abc123
+        deployment_id:
+          type: string
+          example: d_xyz
+        app_name:
+          type: string
+          example: myapp
+        worker_id:
+          type: string
+          example: w_us-east-1_h01
+        region:
+          type: string
+          example: us-east-1
+        level:
+          type: string
+          enum: [trace, debug, info, warn, error]
+          example: info
+        message:
+          type: string
+          example: request handled in 12ms
+        labels:
+          type: object
+          additionalProperties: true
+          example: {"request_id": "req_42", "status": 200}
+        ts:
+          type: string
+          format: date-time
+          description: RFC3339 timestamp at which the log was recorded (server clock).
+          example: 2026-06-24T12:00:00.123456Z
+
+    LogListResponse:
+      type: object
+      description: |
+        Envelope returned by `GET /api/v1/apps/{appName}/logs`. Items
+        are ordered newest-first (by `ts` DESC). `limit` echoes the
+        effective ceiling the server applied (after clamping the
+        request to [1, 1000]); `since` echoes the cutoff timestamp
+        when one was supplied or applied as a default.
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogEntry'
+        limit:
+          type: integer
+          example: 100
+          description: Effective limit (clamped to [1, 1000]).
+        since:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 cutoff the server applied as the lower bound on
+            `ts`. Empty when no `since` was supplied AND no default
+            was applied (clients should not pin follow-on requests
+            to a specific ts in that case).
+          example: 2026-06-24T11:55:00Z
+
+    AppWorkerStatus:
+      type: object
+      description: |
+        Tenant-facing projection of the worker-reported status of one
+        app, returned by `GET /api/v1/apps/{appName}/status`. `status`
+        is the same string the worker publishes in NATS heartbeats
+        (one of `running`, `starting`, `stopping`, `crashed`, `hung`),
+        plus `unknown` when no worker has reported on this app yet.
+
+        `last_heartbeat` is null when no worker has ever reported on
+        the app. There is no server-side TTL on heartbeats — a dead
+        worker leaves its last-known status behind indefinitely. The
+        client should treat a heartbeat older than a few minutes
+        (the worker default is 30s) as stale.
+      properties:
+        app_name:
+          type: string
+          example: myapp
+        status:
+          type: string
+          enum: [running, starting, stopping, crashed, hung, unknown]
+          example: running
+        last_heartbeat:
+          type: string
+          format: date-time
+          nullable: true
+          example: 2026-06-24T12:00:00Z
+        region:
+          type: string
+          example: us-east-1
+        worker_id:
+          type: string
+          example: w_us-east-1_h01
+        exit_code:
+          type: integer
+          format: int32
+          nullable: true
+          description: |
+            Process exit code from the worker's last observation of
+            this app. Set on `crashed` statuses, absent otherwise.
+          example: 137
+
+    # -------------------------------------------------------------------------
     # Ingress
     # -------------------------------------------------------------------------
     IngressResponseReady:
@@ -377,6 +493,24 @@ components:
       example:
         LOG_LEVEL: debug
         NODE_ENV: production
+
+    # -------------------------------------------------------------------------
+    # Egress
+    # -------------------------------------------------------------------------
+    EgressAllowlist:
+      type: object
+      properties:
+        allowlist:
+          type: array
+          items:
+            type: string
+          description: >
+            Outbound hostname allowlist. Empty array means allow-all (no restriction).
+            Each entry is either an exact FQDN (`api.stripe.com`) or a single-level
+            wildcard pattern (`*.sendgrid.net`). Entries are stored lowercase.
+          example:
+            - api.stripe.com
+            - "*.sendgrid.net"
 
     # -------------------------------------------------------------------------
     # Quotas
@@ -675,6 +809,68 @@ components:
           description: Total requests handled by this app on this worker.
           example: 9821
 
+    # -------------------------------------------------------------------------
+    # Custom domains (issue #83)
+    # -------------------------------------------------------------------------
+    Domain:
+      type: object
+      description: |
+        A tenant-owned FQDN bound to a specific app. The status field is
+        server-driven: `pending` is the default, `active` is set by a v2
+        Caddy webhook on successful ACME issuance, `failed` is set on
+        permanent ACME failure. Tenants cannot mutate status directly.
+      properties:
+        id:
+          type: string
+          example: dom_3f4a1c9e
+        tenant_id:
+          type: string
+          example: t_acme
+        app_name:
+          type: string
+          example: api
+        fqdn:
+          type: string
+          example: api.acme.com
+        status:
+          type: string
+          enum: [pending, active, failed]
+          example: pending
+        last_error:
+          type: string
+          nullable: true
+          description: Set by the (v2) Caddy event webhook when ACME fails.
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-06-22T12:34:56Z'
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+      required: [id, tenant_id, app_name, fqdn, status, created_at]
+
+    DomainListResponse:
+      type: object
+      properties:
+        domains:
+          type: array
+          items:
+            $ref: '#/components/schemas/Domain'
+
+    AddDomainRequest:
+      type: object
+      properties:
+        fqdn:
+          type: string
+          description: |
+            Fully-qualified domain name. Must be RFC 1035 shape (lowercase,
+            ≤253 chars, ≤63 chars per label, no leading/trailing hyphens),
+            no wildcards, and not ending in `.edgecloud.dev` (platform-managed
+            host).
+          example: api.acme.com
+      required: [fqdn]
+
   responses:
     BadRequest:
       description: Bad request — invalid or missing parameters.
@@ -753,10 +949,36 @@ components:
               code: INTERNAL_ERROR
               message: internal error
 
+  parameters:
+    appName:
+      name: appName
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique name of the app within the tenant.
+
 paths:
   # -------------------------------------------------------------------------
   # Public
   # -------------------------------------------------------------------------
+  /metrics:
+    get:
+      operationId: getAllMetrics
+      summary: Prometheus metrics scrape endpoint (all tenants)
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for all tenants.
+        Unauthenticated — intended for internal operator/Prometheus scrape access
+        only. Do not expose on the public load balancer.
+      security: []
+      responses:
+        '200':
+          description: Prometheus text-format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /health:
     get:
       operationId: health
@@ -1190,6 +1412,108 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/apps/{appName}/logs:
+    get:
+      operationId: listLogsForApp
+      summary: List recent log entries for an app
+      description: |
+        Returns the most recent log entries for the named app within
+        the caller's tenant, newest first. Supports `since` (RFC3339
+        cutoff), `level` (minimum severity), and `limit` (max items).
+
+        The cutoff is computed server-side against the database clock
+        (NOW() - interval), so wall-clock skew between this server
+        and the database does not affect what is returned.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: |
+            RFC3339 cutoff; missing → server default (5m). Future-dated
+            values are clamped to the default window.
+        - name: level
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [trace, debug, info, warn, error]
+          description: |
+            Minimum severity. Filter is inclusive: `level=warn` returns
+            `warn` and `error`. Unknown values → 400.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+          description: |
+            Maximum items to return. Values outside [1, 1000] are
+            clamped; absent or zero → server default (100).
+      responses:
+        '200':
+          description: Log entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/status:
+    get:
+      operationId: getAppWorkerStatus
+      summary: Get the worker-reported status of an app
+      description: |
+        Returns the most recent worker-reported status for the named
+        app within the caller's tenant. The `status` field is the
+        same string the worker publishes in NATS heartbeats
+        (`running`, `starting`, `stopping`, `crashed`, `hung`), or
+        `unknown` when no worker has reported on this app yet.
+
+        A `crashed` status surfaces when the worker observed the
+        app's WASM component exit with a non-zero code or fail
+        health checks. The CLI's `edge logs` uses this status to
+        print a rollback hint when fresh (< 5 minutes old).
+
+        There is no server-side TTL on heartbeats — a dead worker
+        leaves its last-known status behind indefinitely. The
+        client should treat a `last_heartbeat` older than a few
+        minutes as stale.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Worker-reported status (or "unknown" if no worker has reported).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppWorkerStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # -------------------------------------------------------------------------
   # Traffic Splits
   # -------------------------------------------------------------------------
@@ -1552,6 +1876,71 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
+  # Egress allowlist
+  # -------------------------------------------------------------------------
+  /api/v1/egress:
+    get:
+      operationId: getEgressAllowlist
+      summary: Get the authenticated tenant's outbound egress allowlist
+      responses:
+        '200':
+          description: Current egress allowlist. Empty array means allow-all (no restriction).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: updateEgressAllowlist
+      summary: Replace the authenticated tenant's outbound egress allowlist
+      description: >
+        Replaces the tenant's allowlist and immediately republishes TaskMessages
+        to all running workers so they enforce the new policy without a manual
+        re-activate. An empty array clears the list (allow-all). A non-empty
+        array restricts outbound HTTP to only the listed hostnames or wildcard
+        patterns (e.g. `api.stripe.com`, `*.sendgrid.net`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EgressAllowlist'
+      responses:
+        '200':
+          description: Updated allowlist (normalized to lowercase).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/metrics:
+    get:
+      operationId: getTenantMetrics
+      summary: Prometheus metrics for the authenticated tenant
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for the calling tenant only.
+        Includes request counts, outbound bytes, and any guest-emitted counters,
+        gauges, and histogram samples from `edge:observe`.
+      responses:
+        '200':
+          description: Prometheus text-format metrics for this tenant
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
   # Admin: Tenants
   # -------------------------------------------------------------------------
   /api/v1/admin/tenants:
@@ -1735,6 +2124,136 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Custom domains (issue #83)
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/domains:
+    post:
+      operationId: addDomain
+      summary: Bind a custom FQDN to an existing app
+      description: |
+        Validates the FQDN shape (RFC 1035, lowercase, ≤253 chars, no
+        wildcards, no `.edgecloud.dev` suffix), enforces a per-app quota
+        (50 by default), and inserts a row in `pending` state. The ingress
+        picks up the new row on its next 30 s poll and Caddy begins ACME
+        issuance on the first request to that host.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDomainRequest'
+      responses:
+        '201':
+          description: Domain row created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: App not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: listDomains
+      summary: List all custom FQDNs bound to an app
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+      responses:
+        '200':
+          description: List of domain rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/domains/{fqdn}:
+    get:
+      operationId: getDomain
+      summary: Fetch one domain row by FQDN
+      description: |
+        Returns the row including its `status`, `last_error` (if the v2
+        Caddy webhook has populated it), and `verified_at`. Use this to
+        diagnose a `failed` row.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+        - name: fqdn
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The FQDN to look up.
+      responses:
+        '200':
+          description: Domain row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No row matches (app, fqdn).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: removeDomain
+      summary: Unbind a custom FQDN from an app
+      description: |
+        Deletes the row. The ingress drops the FQDN route on its next
+        30 s poll and Caddy's cert for that host is not renewed on expiry.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+        - name: fqdn
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The FQDN to remove.
+      responses:
+        '204':
+          description: Domain row removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No row matches (app, fqdn).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 

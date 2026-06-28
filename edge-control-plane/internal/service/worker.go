@@ -11,7 +11,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
-	"github.com/nats-io/nats.go"
+	nats "github.com/nats-io/nats.go"
 )
 
 // Sentinel errors for WorkerService Register.
@@ -31,6 +31,7 @@ type workerRepoInterface interface {
 	UpdateAddr(ctx context.Context, id, addr string) error
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
 	ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
+	GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
 }
 
 // quotaRepoInterface defines the repository methods used by WorkerService.
@@ -65,6 +66,7 @@ type WorkerService struct {
 	activeRepo   activeRepoInterface
 	nc           *nats.Conn
 	stableWindow time.Duration
+	metricsAgg   *MetricsAggregator
 }
 
 // NewWorkerService creates a new WorkerService.
@@ -75,7 +77,7 @@ type WorkerService struct {
 // the default (30s, configurable via STABLE_WINDOW_SECONDS env). The
 // CLI accepts any non-negative integer; sub-second precision is not
 // supported.
-func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration) *WorkerService {
+func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration, metricsAgg *MetricsAggregator) *WorkerService {
 	if stableWindow <= 0 {
 		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
 	}
@@ -85,6 +87,7 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 		activeRepo:   activeRepo,
 		nc:           nc,
 		stableWindow: stableWindow,
+		metricsAgg:   metricsAgg,
 	}
 }
 
@@ -235,6 +238,33 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	// writes — byte deltas must reach the DB even when the subscriber is
 	// shutting down. Context values (trace IDs, etc.) are preserved.
 	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
+
+	// Ingest observer metrics into the in-memory aggregator so they are
+	// immediately available at the Prometheus scrape endpoints. Pure
+	// in-memory — no DB round-trip, so we do it inline (cheap).
+	if s.metricsAgg != nil {
+		s.ingestMetrics(hb.Apps)
+	}
+}
+
+// ingestMetrics decodes the apps JSON from a heartbeat and feeds each app's
+// observer_metrics (plus the built-in request_count / outbound_bytes) into
+// the MetricsAggregator so they are immediately available at the Prometheus
+// scrape endpoints.
+func (s *WorkerService) ingestMetrics(appsRaw json.RawMessage) {
+	if len(appsRaw) == 0 {
+		return
+	}
+	var apps map[string]domain.AppStatus
+	if err := json.Unmarshal(appsRaw, &apps); err != nil {
+		return
+	}
+	for appName, app := range apps {
+		if app.TenantID == "" {
+			continue
+		}
+		s.metricsAgg.Ingest(app.TenantID, appName, app.RequestCount, app.OutboundBytes, app.ObserverMetrics)
+	}
 }
 
 // checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
@@ -306,6 +336,37 @@ func (s *WorkerService) GetAppTarget(ctx context.Context, tenantID, appName stri
 		return nil, nil
 	}
 	return &targets[0], nil
+}
+
+// GetAppStatus returns the worker-reported status for one of the
+// tenant's apps. The handler calls this for GET /api/v1/apps/{appName}/status.
+//
+// Two cases the handler relies on:
+//   - No row from the repo (no worker has reported on this app, OR a
+//     cross-tenant request for an app that exists but is not the
+//     caller's): return a zero-value AppWorkerStatus{AppName: appName,
+//     Status: "unknown"}. The handler encodes this as 200, not 404 —
+//     404 would leak the existence of the app to a probing tenant.
+//   - Repo returns a row: pass it through unchanged, with AppName
+//     populated from the input (the repo echoes the JSONB key but
+//     we set it here so callers see exactly what they asked for).
+//
+// The repo handles the cross-tenant guard at the SQL level (the JSONB
+// `tenant_id` filter), so a t_evil request for t_victim's app
+// produces the same "unknown" path as a never-deployed app.
+func (s *WorkerService) GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error) {
+	row, err := s.workerRepo.GetAppStatus(ctx, tenantID, appName)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return &domain.AppWorkerStatus{
+			AppName: appName,
+			Status:  "unknown",
+		}, nil
+	}
+	row.AppName = appName
+	return row, nil
 }
 
 // evaluateStability drives the "promote running deployment to
