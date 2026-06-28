@@ -159,7 +159,7 @@ func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymen
 	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
 }
 
-// Delete DELETEs the artifact bytes from S3. Idempotent: a 404 (key
+// Delete removes the artifact bytes from S3. Idempotent: a 404 (key
 // already gone) is treated as success so concurrent deletes don't
 // surface spurious errors, matching the FSArtifactStore contract.
 func (s *S3ArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
