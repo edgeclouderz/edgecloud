@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
 // ClusterView is the operator-facing snapshot of every region + worker
@@ -39,15 +38,21 @@ type ClusterServiceInterface interface {
 	List(ctx context.Context) (*ClusterView, error)
 }
 
+// ClusterWorkerRepoInterface is the subset of *repository.WorkerRepository used by ClusterService.
+type ClusterWorkerRepoInterface interface {
+	List(ctx context.Context) ([]domain.Worker, error)
+	GetLatestStatuses(ctx context.Context, ids []string) (map[string]domain.WorkerStatus, error)
+}
+
 // ClusterService builds the cluster view from the worker + worker_status
 // repositories. Both queries are best-effort: a worker with no status
 // row simply gets AppCount=0 (heartbeat hasn't arrived yet).
 type ClusterService struct {
-	workerRepo *repository.WorkerRepository
+	workerRepo ClusterWorkerRepoInterface
 }
 
 // NewClusterService constructs a ClusterService.
-func NewClusterService(workerRepo *repository.WorkerRepository) *ClusterService {
+func NewClusterService(workerRepo ClusterWorkerRepoInterface) *ClusterService {
 	return &ClusterService{workerRepo: workerRepo}
 }
 

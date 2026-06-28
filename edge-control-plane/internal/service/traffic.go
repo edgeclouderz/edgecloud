@@ -13,16 +13,52 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
+// TrafficDeploymentRepoInterface is the deployment-repo subset needed by TrafficService.
+type TrafficDeploymentRepoInterface interface {
+	GetByID(ctx context.Context, id string) (*domain.Deployment, error)
+}
+
+// TrafficSplitRepoInterface is the split-repo subset needed by TrafficService.
+type TrafficSplitRepoInterface interface {
+	Get(ctx context.Context, tenantID, appName string) ([]*domain.TrafficSplit, error)
+	DeleteAllForApp(ctx context.Context, tenantID, appName string) error
+}
+
+// TrafficActiveRepoInterface is the active-deployment-repo subset needed by TrafficService.
+type TrafficActiveRepoInterface interface {
+	Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+}
+
+// TrafficEnvRepoInterface is the app-env-repo subset needed by TrafficService.
+type TrafficEnvRepoInterface interface {
+	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+}
+
+// TrafficTenantRepoInterface is the tenant-repo subset needed by TrafficService.
+type TrafficTenantRepoInterface interface {
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
+// TrafficQuotaRepoInterface is the quota-repo subset needed by TrafficService.
+type TrafficQuotaRepoInterface interface {
+	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+}
+
+// TrafficPublisherInterface is the NATS publisher subset needed by TrafficService.
+type TrafficPublisherInterface interface {
+	PublishTaskUpdate(region string, msg *nats.TaskMessage) error
+}
+
 // TrafficService handles traffic split business logic.
 type TrafficService struct {
 	db             *sqlx.DB
-	splitRepo      *repository.TrafficSplitRepository
-	deploymentRepo *repository.DeploymentRepository
-	activeRepo     *repository.ActiveDeploymentRepository
-	appEnvRepo     *repository.AppEnvRepository
-	tenantRepo     *repository.TenantRepository
-	quotaRepo      *repository.QuotaRepository
-	publisher      nats.Publisher
+	splitRepo      TrafficSplitRepoInterface
+	deploymentRepo TrafficDeploymentRepoInterface
+	activeRepo     TrafficActiveRepoInterface
+	appEnvRepo     TrafficEnvRepoInterface
+	tenantRepo     TrafficTenantRepoInterface
+	quotaRepo      TrafficQuotaRepoInterface
+	publisher      TrafficPublisherInterface
 	// defaultRegion is the fallback when none of the splits' deployments
 	// declare any regions of their own. Mirrors DeploymentService.defaultRegion
 	// (which gets it from config) so a control plane that runs without an
@@ -33,13 +69,13 @@ type TrafficService struct {
 // NewTrafficService creates a TrafficService.
 func NewTrafficService(
 	db *sqlx.DB,
-	splitRepo *repository.TrafficSplitRepository,
-	deploymentRepo *repository.DeploymentRepository,
-	activeRepo *repository.ActiveDeploymentRepository,
-	appEnvRepo *repository.AppEnvRepository,
-	tenantRepo *repository.TenantRepository,
-	quotaRepo *repository.QuotaRepository,
-	publisher nats.Publisher,
+	splitRepo TrafficSplitRepoInterface,
+	deploymentRepo TrafficDeploymentRepoInterface,
+	activeRepo TrafficActiveRepoInterface,
+	appEnvRepo TrafficEnvRepoInterface,
+	tenantRepo TrafficTenantRepoInterface,
+	quotaRepo TrafficQuotaRepoInterface,
+	publisher TrafficPublisherInterface,
 	defaultRegion string,
 ) *TrafficService {
 	return &TrafficService{

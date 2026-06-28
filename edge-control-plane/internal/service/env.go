@@ -4,15 +4,21 @@ import (
 	"context"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
+
+// EnvRepoInterface is the subset of *repository.AppEnvRepository used by EnvService.
+type EnvRepoInterface interface {
+	Set(ctx context.Context, env *domain.AppEnv) error
+	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+	Delete(ctx context.Context, tenantID, appName, key string) error
+}
 
 // EnvService handles environment variable business logic.
 type EnvService struct {
-	appEnvRepo *repository.AppEnvRepository
+	appEnvRepo EnvRepoInterface
 }
 
-func NewEnvService(appEnvRepo *repository.AppEnvRepository) *EnvService {
+func NewEnvService(appEnvRepo EnvRepoInterface) *EnvService {
 	return &EnvService{appEnvRepo: appEnvRepo}
 }
 
