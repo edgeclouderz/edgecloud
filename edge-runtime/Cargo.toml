@@ -9,7 +9,6 @@ description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces fo
 [dependencies]
 # Core wasmtime runtime
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
-wasmtime-wasi = { version = "25.0" }
 
 # Async runtime
 tokio = { version = "1.45", features = ["full"], optional = true }
