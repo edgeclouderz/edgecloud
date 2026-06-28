@@ -2,6 +2,7 @@
 
 mod auth;
 mod config;
+mod cpu_sample;
 mod downloader;
 mod log_forwarder;
 mod messages;
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         log_forwarder: log_forwarder.clone(),
         jwt_signer: jwt_signer.clone(),
         http,
+        cpu_sample: crate::cpu_sample::CpuSample::new(),
     });
 
     let heartbeat_supervisor = supervisor.clone();

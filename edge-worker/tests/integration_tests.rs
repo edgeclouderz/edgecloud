@@ -418,6 +418,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         log_forwarder,
         jwt_signer,
         http,
+        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
     });
 
     // Build and publish a heartbeat manually
@@ -581,6 +582,7 @@ async fn build_supervisor(
         log_forwarder,
         jwt_signer,
         http,
+        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
     }))
 }
 
@@ -1783,5 +1785,6 @@ async fn build_supervisor_only_with_cp(
         log_forwarder,
         jwt_signer,
         http,
+        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
     }))
 }

@@ -14,6 +14,7 @@ use wasmtime::component::InstancePre;
 
 use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
+use crate::cpu_sample::CpuSample;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{
@@ -47,6 +48,10 @@ pub struct Supervisor {
     /// instance also lets the connection pool coalesce concurrent
     /// fallback requests to the same control-plane host.
     pub http: reqwest::Client,
+    /// Cached CPU% sampler for the heartbeat's cluster_headroom.cpu_pct
+    /// field (issue #85). See `cpu_sample.rs` for why a single sample
+    /// is always 0 and we need a primed baseline.
+    pub cpu_sample: CpuSample,
 }
 
 impl Supervisor {
@@ -847,7 +852,7 @@ impl Supervisor {
             pool.capacity_remaining()
         };
         msg.cluster_headroom = Some(ClusterHeadroom {
-            cpu_pct: None,
+            cpu_pct: self.cpu_sample.take(),
             mem_pct: None,
             app_slots,
         });

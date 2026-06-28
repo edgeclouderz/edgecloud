@@ -150,6 +150,7 @@ async fn build_supervisor(
         log_forwarder,
         jwt_signer,
         http,
+        cpu_sample: edge_worker::cpu_sample::CpuSample::new(),
     }))
 }
 
