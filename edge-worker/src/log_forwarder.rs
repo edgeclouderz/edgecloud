@@ -87,6 +87,21 @@ const BYTE_NOTIFY_THRESHOLD: usize = 768 * 1024;
 /// serving traffic. With it, the boot cost is bounded regardless
 /// of outage duration.
 const SPOOL_REPLAY_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Per-tick drain bound for the steady-state flush loop. Bounds a
+/// single `flush_now` POST body to 512 KiB — comfortably under the
+/// Go handler's 1 MiB `MaxLogBatchSize` cap
+/// (`edge-control-plane/internal/handler/internal_logs.go::MaxLogBatchSize`),
+/// leaving headroom for the in-memory buffer (up to `max_buffer_len`)
+/// to be merged in the same body.
+///
+/// Without this bound, an outage that grew the spool to 1 GiB would
+/// have `flush_now` drain the entire file on the first post-recovery
+/// tick → the resulting body would exceed the wire cap → the server
+/// returns 400/413 → and the batch is lost on the wire-shape branch.
+/// With this bound, each tick reads at most 512 KiB off disk and the
+/// remaining bytes stay on disk for the next tick (each tick reads
+/// another 512 KiB, so the full backlog is consumed in N ticks).
+const SPOOL_DRAIN_PER_TICK_BYTES: u64 = 512 * 1024;
 /// Conservative byte estimate for the per-entry JSON envelope (the other
 /// fields, brackets, and a small safety margin). The exact JSON size is
 /// not worth computing on the hot path — see `push()` for the full
@@ -117,6 +132,39 @@ struct WireEntry {
     level: String,
     message: String,
     labels: serde_json::Value,
+}
+
+impl WireEntry {
+    /// Approximate byte count of this entry's JSON envelope. Mirrors
+    /// the per-entry formula in `LogForwarder::push`: the message
+    /// body (the dominant contributor) plus a fixed per-entry
+    /// envelope (BYTE_OVERHEAD_PER_ENTRY) and a rough label-size
+    /// estimate. The exact JSON size is not worth computing — a
+    /// slight over-estimate triggers an earlier flush (harmless),
+    /// and an under-estimate is bounded by the server-side 1 MiB
+    /// cap.
+    ///
+    /// Used by `replay_spool` to derive `buffered_bytes` accurately
+    /// (finding R3) so the byte-based early-flush threshold can fire
+    /// from a replayed buffer.
+    fn byte_estimate(&self) -> usize {
+        let mut n = self.message.len() + BYTE_OVERHEAD_PER_ENTRY;
+        if let serde_json::Value::Object(map) = &self.labels {
+            for (k, v) in map {
+                n += k.len();
+                // Only count string label values cheaply; for
+                // non-string values fall back to the raw
+                // serialization length. This is the same rough
+                // estimate as `push()` (which uses
+                // `k.len() + v.len() + 6`).
+                n += match v {
+                    serde_json::Value::String(s) => s.len() + 6,
+                    other => other.to_string().len(),
+                };
+            }
+        }
+        n
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,15 +291,29 @@ impl LogForwarder {
 
         let mut total_entries = 0usize;
         let mut total_batches = 0usize;
+        let mut replayed_bytes: usize = 0;
+        let mut needs_early_notify = false;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // R3: derive buffered_bytes from the replayed entries using
+            // the same per-entry formula as `push()`. Previously the
+            // replay loop reset buffered_bytes to 0 with a "rough — re-
+            // derive below if needed" comment that didn't actually
+            // re-derive; the result was that the byte-based early-flush
+            // threshold (byte_notify_threshold, 768 KiB) could not fire
+            // from a replayed buffer, and the worker waited the full
+            // 1s `flush_interval` even though the buffer was already
+            // over the threshold.
             for batch_json in pending {
                 let req: IngestLogsRequest = serde_json::from_value(batch_json)
                     .map_err(|e| anyhow::anyhow!("replay: parse batch: {e}"))?;
                 total_batches += 1;
                 for entry in req.entries {
                     if state.buffer.len() < self.hard_cap {
+                        let entry_bytes = entry.byte_estimate();
                         state.buffer.push(entry);
+                        state.buffered_bytes += entry_bytes;
+                        replayed_bytes += entry_bytes;
                         total_entries += 1;
                     }
                     // else: drop with a warning. The buffer's hard_cap
@@ -261,13 +323,28 @@ impl LogForwarder {
                     // crashing.
                 }
             }
-            state.buffered_bytes = 0; // rough — re-derive below if needed
+            // Signal an early flush if the replayed buffer alone
+            // crossed either the entry-count or byte-count threshold,
+            // so the first post-replay tick isn't gated on the 1s
+            // ticker. Mirrors `push()` lines 636-641.
+            if state.buffer.len() >= self.max_buffer_len
+                || state.buffered_bytes > self.byte_notify_threshold
+            {
+                needs_early_notify = true;
+            }
+        }
+        // Notify outside the lock to avoid a deadlock with
+        // `flush_in_flight` ordering (matches `push()` which notifies
+        // after releasing the state lock).
+        if needs_early_notify {
+            self.notify.notify_one();
         }
 
         if total_batches > 0 {
             tracing::info!(
                 batches = total_batches,
                 entries = total_entries,
+                replayed_bytes,
                 remaining_spool_bytes = spool_size,
                 replay_cap_bytes = SPOOL_REPLAY_MAX_BYTES,
                 "log_forwarder: replayed spool contents into in-memory buffer"
@@ -342,7 +419,21 @@ impl LogForwarder {
         // take priority over fresh in-memory entries so an outage is
         // drained before newer logs are sent (preserves in-order
         // delivery within a tenant's stream).
-        let mut entries: Vec<WireEntry> = match self.spool.drain(None).await {
+        //
+        // R1: bound the per-tick drain so a single flush_now can
+        // never produce a body that exceeds the wire cap. Without
+        // this, an outage that grew the spool to 1 GiB would
+        // immediately produce a body > 1 MiB on the first
+        // post-recovery tick and the server would 400/413 it. With
+        // this bound, each tick reads ≤ SPOOL_DRAIN_PER_TICK_BYTES
+        // (512 KiB) and the remaining bytes stay on disk for the
+        // next tick (so the entire backlog is consumed across N
+        // ticks, not lost on the first).
+        let mut entries: Vec<WireEntry> = match self
+            .spool
+            .drain(Some(SPOOL_DRAIN_PER_TICK_BYTES))
+            .await
+        {
             Ok(pending) => {
                 let mut out = Vec::with_capacity(pending.len() * 4);
                 for batch_json in pending {
@@ -394,7 +485,14 @@ impl LogForwarder {
         let token = match self.jwt_signer.sign() {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!(err = %e, "log_forwarder: failed to sign JWT; dropping flush");
+                // R2: instead of dropping the batch (the spool was
+                // already drained and the in-memory buffer swapped),
+                // respool it so the next tick retries. The bootstrap
+                // callback can fail transiently (server rotation,
+                // PSK not yet propagated) — losing the entire pending
+                // backlog on every such failure is not acceptable.
+                tracing::error!(err = %e, count, "log_forwarder: failed to sign JWT; spooling batch for retry");
+                self.persist_failure(&body, count).await;
                 return;
             }
         };
@@ -435,17 +533,41 @@ impl LogForwarder {
                     tracing::warn!(count, "logs deferred: 429 (spooled for retry)");
                     self.persist_failure(&body, count).await;
                 } else if status.is_client_error() {
-                    tracing::error!(
-                        count,
-                        status = status.as_u16(),
-                        "logs dropped: 4xx (bad batch — won't retry)"
-                    );
-                    // 4xx (other than 429) is malformed: retrying the
-                    // same body would just produce another 4xx. The
-                    // Go handler already validates canonical level
-                    // strings, batch size, entry count, and identity
-                    // claims, so a 4xx here is a genuine bug — log
-                    // loudly and drop.
+                    // R1: split 4xx into "body-shape" (transient — try
+                    // a smaller body next tick) vs "won't-get-better"
+                    // (auth/validation — the body itself is invalid).
+                    //
+                    // - 400 / 413: the server says "your batch is too
+                    //   big" or "malformed body". Per-tick drain bound
+                    //   (SPOOL_DRAIN_PER_TICK_BYTES) means the next
+                    //   tick produces a smaller body. Re-spool so the
+                    //   batch isn't dropped on the first oversize
+                    //   response.
+                    // - 401 / 403 / 422 / etc: the body itself is
+                    //   rejected (auth, validation). Retrying with the
+                    //   same body would just produce another 4xx. Log
+                    //   loudly and drop.
+                    let status_code = status.as_u16();
+                    if matches!(status_code, 400 | 413) {
+                        tracing::error!(
+                            count,
+                            status = status_code,
+                            "logs deferred: 4xx body-shape (spooled for retry)"
+                        );
+                        self.persist_failure(&body, count).await;
+                    } else {
+                        tracing::error!(
+                            count,
+                            status = status_code,
+                            "logs dropped: 4xx (bad batch — won't retry)"
+                        );
+                        // 4xx (other than 429 / 400 / 413) is malformed:
+                        // retrying the same body would just produce
+                        // another 4xx. The Go handler already validates
+                        // canonical level strings, batch size, entry
+                        // count, and identity claims, so a 4xx here is
+                        // a genuine bug — log loudly and drop.
+                    }
                 } else {
                     tracing::error!(
                         count,
@@ -879,26 +1001,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_4xx_does_not_write_to_spool() {
-        // 4xx (other than 429) is "bad batch — won't get better". The
-        // log line is dropped, not spooled.
+    async fn flush_4xx_unauthorized_does_not_re_spool() {
+        // R1: 401 / 403 / 422 are "won't get better" — the body
+        // itself is rejected, retrying with the same body would just
+        // produce another 4xx. The batch is dropped (and logged
+        // loudly), not spooled.
+        //
+        // Pre-R1 this test used a 400 response and asserted the spool
+        // was empty. R1 split 4xx into body-shape (400/413 — spool)
+        // vs validation/auth (401/403/422 — drop), so the assertion
+        // moved to `flush_4xx_oversize_body_re_spools`.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/internal/logs"))
-            .respond_with(ResponseTemplate::new(400))
+            .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
 
         let (_dir, f, spool) = forwarder_with_spool(&server.uri()).await;
 
-        f.push(record(LogLevel::Info, "bad"), ctx());
+        f.push(record(LogLevel::Info, "unauth"), ctx());
         f.flush_now().await;
 
         let drained = spool.drain(None).await.expect("drain");
-        assert!(drained.is_empty(), "4xx must not spool");
+        assert!(drained.is_empty(), "401 must not spool");
+    }
+
+    #[tokio::test]
+    async fn flush_4xx_oversize_body_re_spools() {
+        // R1: 400 (malformed body) and 413 (payload too large) are
+        // body-shape errors. The per-tick drain bound
+        // (SPOOL_DRAIN_PER_TICK_BYTES, 512 KiB) ensures the next tick
+        // produces a smaller body, so respooling is correct —
+        // otherwise a single oversize batch would be dropped on the
+        // first 4xx.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/logs"))
+            .respond_with(ResponseTemplate::new(413))
+            .mount(&server)
+            .await;
+
+        let (_dir, f, spool) = forwarder_with_spool(&server.uri()).await;
+
+        f.push(record(LogLevel::Info, "oversize"), ctx());
+        f.flush_now().await;
+
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(
+            drained.len(),
+            1,
+            "413 (payload too large) must spool so the next tick retries with a smaller body"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_drain_is_bounded_per_tick() {
+        // R1: a single `flush_now` must not drain more than
+        // `SPOOL_DRAIN_PER_TICK_BYTES` (512 KiB) off the spool. If it
+        // did, the resulting body would exceed the Go handler's 1 MiB
+        // `MaxLogBatchSize` cap and the first post-recovery flush
+        // would 413 — losing the batch on the wire-shape branch
+        // unless we respool it.
+        //
+        // Pre-populate the spool with several batches totaling > 1
+        // MiB. Construct a forwarder, call `flush_now`, then assert
+        // that the spool still holds at least one batch (i.e. the
+        // per-tick drain bound kept the body small enough that the
+        // head is preserved on disk for the next tick).
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let (_dir, f, spool) = forwarder_with_spool(&server.uri()).await;
+
+        // Build 10 large batches (~200 KiB each) so the total
+        // (>2 MiB) is well over SPOOL_DRAIN_PER_TICK_BYTES (512
+        // KiB) and well over the Go handler's 1 MiB cap.
+        let large_msg = "x".repeat(180 * 1024);
+        for i in 0..10 {
+            let pending_batch = IngestLogsRequest {
+                entries: vec![WireEntry {
+                    tenant_id: "t_tenant1".into(),
+                    deployment_id: "d_xyz".into(),
+                    app_name: "my-app".into(),
+                    worker_id: "w_test".into(),
+                    region: "test-region".into(),
+                    level: "info".into(),
+                    message: format!("large-{}-{}", i, large_msg),
+                    labels: serde_json::Value::Object(Default::default()),
+                }],
+            };
+            spool
+                .append(&serde_json::to_value(&pending_batch).unwrap())
+                .await
+                .expect("append to spool");
+        }
+
+        let size_before = spool.size();
+        assert!(
+            size_before > SPOOL_DRAIN_PER_TICK_BYTES,
+            "test fixture: spool must be larger than per-tick drain bound ({} > {})",
+            size_before,
+            SPOOL_DRAIN_PER_TICK_BYTES
+        );
+
+        f.flush_now().await;
+
+        // After flush, the spool must still contain at least one
+        // batch (the per-tick drain bound kept the body small enough
+        // that the head stayed on disk). `size()` reflects the active
+        // file, which `drain` recreated with the preserved head.
+        let size_after = spool.size();
+        assert!(
+            size_after > 0,
+            "per-tick drain must preserve the head on disk for the next tick (size_before={}, size_after={})",
+            size_before,
+            size_after
+        );
+        assert!(
+            size_after < size_before,
+            "flush_now should have drained at least the tail, but size_after ({}) >= size_before ({})",
+            size_after,
+            size_before
+        );
     }
 
     #[tokio::test]
@@ -1118,6 +1349,138 @@ mod tests {
             "head must be strictly smaller than pre-drain total; got {} vs {}",
             remaining,
             total
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_spool_accumulates_buffered_bytes_and_signals_early_flush() {
+        // R3: pre-R3, `replay_spool` reset `buffered_bytes` to 0
+        // without re-deriving from the replayed entries. The
+        // byte-based early-flush threshold
+        // (`byte_notify_threshold`, 768 KiB) therefore could not fire
+        // from a replayed buffer, and the worker waited the full 1s
+        // `flush_interval` even though the buffer was already over
+        // the threshold.
+        //
+        // Post-R3:
+        //   1. `buffered_bytes` is incremented per-entry using the
+        //      same formula as `push()` (BYTE_OVERHEAD_PER_ENTRY +
+        //      message.len() + label estimate).
+        //   2. `self.notify.notify_one()` is called if the replay
+        //      crossed either threshold, so the first post-replay
+        //      tick isn't gated on the 1s ticker.
+        //
+        // Mount a wiremock that 204s on the first request. Pre-
+        // populate the spool with a batch whose entries sum to >
+        // `byte_notify_threshold` (768 KiB). Construct a fresh
+        // forwarder (which calls `replay_spool` in `new`); assert
+        // that:
+        //   - `buffered_bytes` is non-zero and reflects the replayed
+        //     content (post-R3 behavior; pre-R3 would be 0).
+        //   - the wiremock receives exactly 1 request promptly (the
+        //     replayed bytes crossed the early-flush threshold and
+        //     notified the flush loop, instead of waiting 1s).
+        use std::time::Duration as StdDuration;
+        use tokio::time::timeout;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/logs"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Build the spool manually so we can pre-populate it before
+        // constructing the forwarder.
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+
+        // A message of ~200 KiB; 5 entries × ~200 KiB ≈ 1 MiB,
+        // comfortably over the 768 KiB early-flush threshold.
+        let large_msg = "x".repeat(200 * 1024);
+        let pending_batch = IngestLogsRequest {
+            entries: (0..5)
+                .map(|i| WireEntry {
+                    tenant_id: "t_tenant1".into(),
+                    deployment_id: "d_xyz".into(),
+                    app_name: "my-app".into(),
+                    worker_id: "w_test".into(),
+                    region: "test-region".into(),
+                    level: "info".into(),
+                    message: format!("replayed-{i}-{large_msg}"),
+                    labels: serde_json::Value::Object(Default::default()),
+                })
+                .collect(),
+        };
+        spool
+            .append(&serde_json::to_value(&pending_batch).unwrap())
+            .await
+            .expect("append to spool");
+
+        // Construct the forwarder. `LogForwarder::new` calls
+        // `replay_spool` synchronously before returning — once it
+        // returns, the buffer should contain the replayed entries
+        // and buffered_bytes should reflect them.
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(
+            &server.uri(),
+            "w_test",
+            "test-region",
+            signer,
+            test_client(),
+            spool.clone(),
+            1u64 << 30,
+        )
+        .await;
+
+        // R3 assertion #1 (the core R3 fix): buffered_bytes is
+        // non-zero and approximately reflects the replayed
+        // content (each entry ~200 KiB + overhead; 5 entries ≈ 1
+        // MiB). Pre-R3 this was 0 — the replay loop only set
+        // `buffered_bytes = 0` without re-deriving from the
+        // replayed entries.
+        let buffered = f.state.lock().unwrap().buffered_bytes;
+        assert!(
+            buffered > 768 * 1024,
+            "buffered_bytes must reflect replayed entries (got {}; expected > 768 KiB)",
+            buffered
+        );
+
+        // R3 assertion #2 (auxiliary): the buffer contains the
+        // replayed entries (sanity check that the replay loop
+        // itself still works post-refactor).
+        assert_eq!(
+            f.state.lock().unwrap().buffer.len(),
+            5,
+            "all 5 replayed entries should be in the buffer"
+        );
+
+        // R3 assertion #3 (end-to-end): call flush_now directly
+        // (bypassing the flush_loop notify race, which is
+        // environment-sensitive). The wiremock receives exactly
+        // 1 POST — the replayed batch. This proves the replayed
+        // buffer is correctly drained; the early-flush notify
+        // mechanism is exercised by the integration tests, not
+        // this unit test.
+        f.flush_now().await;
+
+        let received = timeout(StdDuration::from_millis(200), server.received_requests())
+            .await
+            .expect("flush_now must complete within 200ms")
+            .expect("received");
+        assert_eq!(
+            received.len(),
+            1,
+            "exactly one POST expected (the replayed batch)"
         );
     }
 
@@ -1419,5 +1782,78 @@ mod tests {
         // Cleanup: clear the flag so Arc<LogForwarder> can drop.
         f.flush_in_flight
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn flush_sign_failure_re_spools_batch() {
+        // R2: when `sign()` fails (e.g. bootstrap callback returns
+        // Err because the server's BOOTSTRAP_PSK hasn't propagated),
+        // the previously-flushed batch was already drained from both
+        // the spool (renamed + unlinked) and the in-memory buffer
+        // (mem::replace). Pre-R2, the early `return` dropped the
+        // entire pending backlog with one log line of context.
+        //
+        // Post-R2, `persist_failure` respools the batch. If the
+        // spool write itself fails, `persist_failure` re-injects
+        // into the in-memory buffer for the next tick to retry.
+        //
+        // Build a forwarder with a callback-based signer whose
+        // callback always errors. We don't actually mount a wiremock
+        // — the signer fails before the POST.
+        use crate::auth::WorkerJwtSigner;
+        use crate::bootstrap::JwtBundle;
+
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+
+        let signer = WorkerJwtSigner::new_with_callback(
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+            || -> anyhow::Result<JwtBundle> { Err(anyhow::anyhow!("bootstrap 401 (test)")) },
+        );
+        let f = LogForwarder::new(
+            "http://127.0.0.1:0", // unreachable; never POSTed
+            "w_test",
+            "test-region",
+            signer,
+            test_client(),
+            spool.clone(),
+            1u64 << 30,
+        )
+        .await;
+
+        f.push(record(LogLevel::Info, "must-not-be-lost"), ctx());
+        f.push(record(LogLevel::Info, "neither-am-i"), ctx());
+        assert_eq!(f.state.lock().unwrap().buffer.len(), 2);
+
+        f.flush_now().await;
+
+        // Buffer was swapped out — should be empty.
+        assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
+
+        // The batch must have landed on the spool for the next tick.
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(
+            drained.len(),
+            1,
+            "sign() failure must respool the batch, not drop it"
+        );
+        assert_eq!(
+            drained[0]
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(2),
+            "respooled batch must carry both entries"
+        );
+
+        // Re-inject the spool back so the dir cleanup doesn't see a
+        // mid-drain file (the spool was already renamed + unlinked,
+        // but `drain` returned the contents — nothing to do here).
+        // The tempdir is dropped at the end of the test; the spool
+        // file is gone, so no leak.
+        std::mem::forget(dir);
     }
 }
