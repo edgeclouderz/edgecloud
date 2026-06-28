@@ -75,7 +75,9 @@ func TestEgressHandler_Get_Empty(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
 	var resp egressResponse
-	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal empty: %v", err)
+	}
 	if len(resp.Allowlist) != 0 {
 		t.Errorf("Allowlist len = %d, want 0", len(resp.Allowlist))
 	}

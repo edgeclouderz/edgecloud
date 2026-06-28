@@ -65,7 +65,7 @@ func TestLimitReadCloser_SubsequentReadsAfterExceed(t *testing.T) {
 	l := newLimitReadCloser(rc, 10)
 
 	buf := make([]byte, 11)
-	l.Read(buf)
+	_, _ = l.Read(buf)
 
 	// All subsequent reads must return ErrArtifactTooLarge
 	buf2 := make([]byte, 1)
