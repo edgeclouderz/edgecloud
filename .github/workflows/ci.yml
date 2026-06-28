@@ -542,7 +542,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install cargo-geiger
-        uses: taiki-e/install-action@cargo-geiger
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-geiger
 
       - name: Run cargo-geiger
         run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
