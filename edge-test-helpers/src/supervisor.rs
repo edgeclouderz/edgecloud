@@ -86,7 +86,22 @@ pub fn test_config(
         // config still sees a sensible value. The 1 GiB cap matches
         // the production default (config.rs::from_env) — tests that
         // exercise overflow can override it after the call.
-        spool_dir: PathBuf::from("/tmp/edge-worker-test-spool"),
+        //
+        // R4: per-process spool dir (instead of the prior
+        // `/tmp/edge-worker-test-spool` shared across every test
+        // worker). cargo test runs test files in parallel across
+        // multiple processes; sharing a single dir means a 503
+        // response in test A's mock control plane could write
+        // pending batches to the spool that test B's
+        // `LogForwarder::new` would then replay into its in-memory
+        // buffer and POST to test B's mock. Suffixing with the
+        // process id gives each test runner its own spool root;
+        // the OS cleans up `/tmp` on reboot. Tests that need
+        // stricter isolation (one spool per test) override
+        // `spool_dir` with a `tempfile::TempDir` after the call —
+        // that pattern stays valid.
+        spool_dir: std::env::temp_dir()
+            .join(format!("edge-worker-test-spool-{}", std::process::id())),
         spool_max_bytes: 1u64 << 30,
     }
 }
@@ -105,20 +120,135 @@ pub fn test_config(
 /// download. `spool_dir` is opened via `Spool::open`, which creates
 /// the directory if missing.
 ///
-/// **JWT signer:** uses the legacy `WorkerJwtSigner::new` (static
-/// secret) so existing tests continue to work without changes. Tests
-/// that exercise the Phase 4 bootstrap path call
-/// `build_supervisor_with_signer` with their own pre-built signer.
-#[allow(deprecated)]
+/// **JWT signer:** R5 — branches on
+/// `config.worker_bootstrap_psk`. When `Some(psk)`, constructs a
+/// `WorkerJwtSigner::new_with_callback(...)` whose callback fires
+/// against the configured `control_plane_url`. When `None`, falls
+/// back to the legacy `WorkerJwtSigner::new` (static secret) so
+/// existing tests that don't exercise the bootstrap path keep
+/// working. Tests that need a custom callback or a pre-seeded
+/// signer call `build_supervisor_with_signer` directly.
 pub async fn build_supervisor(config: Config) -> anyhow::Result<Arc<Supervisor>> {
-    let signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.tenant_id_for_signer(),
-    );
+    let signer = build_signer_for_config(&config);
     build_supervisor_inner(config, signer).await
+}
+
+/// Pick the right JWT signer for the given `Config`. When
+/// `worker_bootstrap_psk` is set, returns a callback-based signer
+/// whose callback hits the control plane's
+/// `POST /api/internal/auth/token` endpoint on cache miss. When
+/// unset, returns the legacy static-secret signer (deprecated for
+/// production use; here it preserves the pre-R5 behavior for tests
+/// that don't exercise the bootstrap path).
+///
+/// `pub(crate)` so the smoke tests in `lib.rs::tests` can introspect
+/// the chosen path (R5) without going through the full
+/// `build_supervisor` wiring (which would require a working NATS
+/// container).
+pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
+    if let Some(psk) = config.worker_bootstrap_psk.as_deref() {
+        // R5: honor `worker_bootstrap_psk` so tests that set it
+        // actually exercise the bootstrap path (the prior code
+        // silently used `worker_jwt_secret` regardless, giving
+        // false coverage).
+        let psk_bytes: Vec<u8> = pkcs7_pad_psk(psk).into_bytes();
+        let control_plane_url = config.control_plane_url.clone();
+        let worker_id = config.worker_id.clone();
+        let region = config.region.clone();
+        let tenant_id = config.worker_tenant_id.clone();
+        let issuer = config.worker_jwt_issuer.clone();
+        let http_client = Arc::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("build reqwest client for bootstrap callback"),
+        );
+        // `new_with_callback` takes the four identity strings by
+        // value; clone them so they're also available to the
+        // closure body (the closure needs `worker_id` etc. for
+        // both the request headers and the body JSON).
+        WorkerJwtSigner::new_with_callback(
+            issuer.clone(),
+            worker_id.clone(),
+            region.clone(),
+            tenant_id.clone(),
+            move || {
+                // The signer holds this closure via Arc<dyn Fn>;
+                // cloning the captured Arcs into the request keeps
+                // the closure 'static without leaking the
+                // surrounding Config. Sync→async bridge.
+                //
+                // Production wires this through
+                // `Handle::current().block_on(...)` from main()'
+                // s non-async context. For tests, the closure may
+                // already be running on a thread inside an active
+                // tokio runtime (e.g. when a test calls `sign()`
+                // from inside its own `block_on`). In that case
+                // `Handle::current().block_on(...)` panics with
+                // "Cannot start a runtime from within a runtime".
+                // To handle both contexts, build a fresh
+                // single-threaded runtime on demand. This is
+                // strictly more expensive than the production
+                // path but acceptable for tests (which only fire
+                // the callback on cache miss).
+                let url = format!("{control_plane_url}/api/internal/auth/token");
+                let req = http_client
+                    .post(&url)
+                    .header("X-Worker-Id", worker_id.clone())
+                    .header("X-Worker-Region", region.clone())
+                    .header(
+                        "X-Bootstrap-Signature",
+                        edge_worker::bootstrap::sign_with_psk(
+                            &psk_bytes, &worker_id, &region, &tenant_id,
+                        ),
+                    )
+                    .json(&serde_json::json!({
+                        "worker_id": worker_id,
+                        "region": region,
+                        "tenant_id": tenant_id,
+                    }));
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build runtime for bootstrap callback");
+                rt.block_on(async move {
+                    let resp = req.send().await?;
+                    let bundle: edge_worker::bootstrap::JwtBundle = resp.json().await?;
+                    Ok(bundle)
+                })
+            },
+        )
+    } else {
+        #[allow(deprecated)]
+        WorkerJwtSigner::new(
+            config.worker_jwt_secret.clone(),
+            config.worker_jwt_issuer.clone(),
+            config.worker_id.clone(),
+            config.region.clone(),
+            config.tenant_id_for_signer(),
+        )
+    }
+}
+
+/// Pad the PSK up to the 32-byte minimum the server enforces
+/// (`BOOTSTRAP_PSK` length floor). The worker accepts any byte
+/// length in production but warns on < 32; for tests we want the
+/// callback to be sent without server-side rejection so the test
+/// exercises the callback path, not the rejection path. Pads with
+/// ASCII `!` characters (preserves ASCII-only contract — server
+/// doesn't actually require that, but it keeps the test PSK
+/// printable in logs).
+fn pkcs7_pad_psk(psk: &str) -> String {
+    if psk.len() >= 32 {
+        psk.to_string()
+    } else {
+        let mut s = String::with_capacity(32);
+        s.push_str(psk);
+        for _ in 0..(32 - psk.len()) {
+            s.push('!');
+        }
+        s
+    }
 }
 
 /// Like `build_supervisor` but takes a pre-built JWT signer. Tests

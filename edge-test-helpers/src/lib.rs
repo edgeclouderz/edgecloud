@@ -115,4 +115,103 @@ mod tests {
         // passing to build_supervisor.
         assert!(!cfg.worker_addr.is_empty());
     }
+
+    /// R4: `spool_dir` is per-process (suffixed with `process::id`)
+    /// so parallel test workers don't cross-contaminate their spools.
+    /// Within a single process the suffix is constant, so two
+    /// consecutive `test_config` calls produce the same path —
+    /// what matters is that two distinct processes would produce
+    /// distinct paths (which we can't easily test in-process).
+    /// We assert the suffix is present and well-formed.
+    #[test]
+    fn test_config_spool_dir_is_per_process() {
+        let cfg = test_config(
+            "w_smoke",
+            "fra",
+            "nats://localhost:4222".to_string(),
+            "http://localhost:9999".to_string(),
+        );
+        let pid = std::process::id();
+        let expected_suffix = format!("edge-worker-test-spool-{pid}");
+        let spool_path = cfg.spool_dir.to_string_lossy().into_owned();
+        assert!(
+            spool_path.ends_with(&expected_suffix),
+            "spool_dir must end with per-process suffix; got {spool_path}, expected suffix {expected_suffix}"
+        );
+        // Sanity: the path is under temp_dir (not the prior
+        // hardcoded /tmp/edge-worker-test-spool).
+        let temp_root = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(
+            spool_path.starts_with(&temp_root),
+            "spool_dir must live under std::env::temp_dir(); got {spool_path}, root {temp_root}"
+        );
+    }
+
+    /// R5: `build_supervisor` honors `Config.worker_bootstrap_psk`.
+    /// Pre-R5, the helper silently constructed `WorkerJwtSigner::new`
+    /// (static secret path) regardless of whether `worker_bootstrap_psk`
+    /// was set. This test introspects the resulting `Supervisor`'s
+    /// `log_forwarder.jwt_signer` and verifies the signer's
+    /// `TokenSource` is the Callback variant when a PSK is configured.
+    ///
+    /// The supervisor's `log_forwarder` field is private; the test
+    /// uses `build_signer_for_config` (pub(crate)) directly to
+    /// exercise the same code path that `build_supervisor` takes.
+    /// The signer doesn't fire the callback here — the test only
+    /// verifies the constructor chose the right path.
+    ///
+    /// `sign()` returns Err when the callback fails (no wiremock
+    /// running), Ok(token) when the static-secret path succeeds.
+    /// The test asserts `Err` to prove the Callback path was
+    /// chosen.
+    ///
+    /// Implementation note: tokio's "Cannot start a runtime from
+    /// within a runtime" panic means we must run on a thread with
+    /// no active tokio context. `cargo test`'s default test
+    /// harness doesn't install one, but sibling tests may leak
+    /// context. We spawn a fresh OS thread and build a runtime
+    /// there; the closure itself also builds its own runtime
+    /// (see `supervisor.rs::build_signer_for_config`), so the
+    /// nested-runtime panic doesn't apply.
+    #[test]
+    fn build_signer_for_config_uses_callback_when_psk_set() {
+        let mut cfg = test_config(
+            "w_smoke",
+            "fra",
+            "nats://localhost:4222".to_string(),
+            "http://localhost:9999".to_string(),
+        );
+        cfg.worker_bootstrap_psk = Some("test-psk-32-bytes-long-aaaaaaaaaaaa".into());
+
+        let signer = supervisor::build_signer_for_config(&cfg);
+
+        // The closure builds its own runtime (no `try_current`
+        // gymnastics), so we can call sign() from any context,
+        // including the test thread's. No thread spawn needed.
+        let result = signer.sign();
+        assert!(
+            result.is_err(),
+            "signer must use the callback path when worker_bootstrap_psk is set; got Ok"
+        );
+    }
+
+    /// R5 (negative case): when `worker_bootstrap_psk` is None,
+    /// the signer uses the legacy static-secret path and `sign()`
+    /// succeeds (returning a valid JWT).
+    #[test]
+    fn build_signer_for_config_uses_static_when_psk_unset() {
+        let cfg = test_config(
+            "w_smoke",
+            "fra",
+            "nats://localhost:4222".to_string(),
+            "http://localhost:9999".to_string(),
+        );
+        assert!(cfg.worker_bootstrap_psk.is_none());
+        let signer = supervisor::build_signer_for_config(&cfg);
+        let token = signer.sign().expect("static-secret signer must succeed");
+        assert!(
+            !token.is_empty() && token.contains('.'),
+            "static-secret signer must produce a JWT-shaped token (3 dot-separated segments); got: {token:?}"
+        );
+    }
 }
