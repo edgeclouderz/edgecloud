@@ -495,6 +495,17 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
 	go logGC.Run(rootCtx, logGCInterval, logRetention)
 
+	// Start periodic full-state reconcile (issue #53). Tunable via
+	// RECONCILE_INTERVAL; default 5min. The first sweep fires
+	// immediately so a fresh boot catches up workers that missed
+	// messages, then ticks on the configured interval. Idempotent —
+	// the worker-side diff treats identical AppConfig as a no-op.
+	reconcileSvc := service.NewReconcileService(
+		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+	)
+	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
+	go reconcileSvc.Run(rootCtx, reconcileInterval)
+
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
