@@ -169,6 +169,11 @@ func main() {
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc)
+	// Wire the read-only side of ReconcileService so the /sync HTTP
+	// fallback endpoint (issue #53) can return the same payload the
+	// periodic loop publishes. Done separately from NewInternalHandler
+	// so the constructor stays compact for tests.
+	internalHandler.SetSyncBuilder(reconcileSvc)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -396,6 +401,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
+	internalMux.HandleFunc("GET /api/internal/workers/{workerID}/sync", internalHandler.Sync)
 	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// Worker-driven auto-rollback: an edge-worker POSTs here when its
 	// supervisor exhausts the restart cap on a tenant app. The

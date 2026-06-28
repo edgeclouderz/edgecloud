@@ -12,6 +12,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
@@ -64,6 +65,12 @@ type InternalHandler struct {
 	domainSvc     InternalDomainServiceInterface
 	logEntryRepo  logEntryRepo
 	reconcileSvc  syncRequester
+	// syncBuilder is the read-only side of the ReconcileService — it
+	// computes the per-region AppConfig map without publishing, so the
+	// HTTP /sync fallback endpoint (issue #53) can return the exact
+	// payload the periodic loop would publish. Tests inject a stub.
+	// nil-safe: when nil, the Sync endpoint returns 501.
+	syncBuilder syncPayloadBuilder
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -88,6 +95,10 @@ type autoRollbacker interface {
 type workerRegisterer interface {
 	Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	// Get resolves a worker_id (from the URL path of /api/internal/workers/{workerID}/sync)
+	// to a *domain.Worker so the handler can scope the sync payload to
+	// that worker's (tenant, region). Issue #53.
+	Get(ctx context.Context, workerID string) (*domain.Worker, error)
 }
 
 // syncRequester is the narrow contract RegisterWorker uses to trigger
@@ -101,6 +112,14 @@ type workerRegisterer interface {
 // timer in cmd/api/main.go is the durable safety net.
 type syncRequester interface {
 	RequestSync(ctx context.Context, tenantID, region string)
+}
+
+// syncPayloadBuilder is the read-only counterpart: it computes the
+// per-region AppConfig map without publishing, so the HTTP /sync
+// fallback endpoint (issue #53) can return the same payload the
+// periodic loop would publish. *service.ReconcileService satisfies it.
+type syncPayloadBuilder interface {
+	BuildFullSync(ctx context.Context, tenantID, region string) (map[string]nats.AppConfig, error)
 }
 
 func NewInternalHandler(
@@ -117,6 +136,15 @@ func NewInternalHandler(
 		logEntryRepo:  logEntryRepo,
 		reconcileSvc:  reconcileSvc,
 	}
+}
+
+// SetSyncBuilder wires the /sync HTTP fallback endpoint's payload
+// builder. Kept separate from NewInternalHandler because the builder
+// is optional (when nil, /sync returns 501) and adding it as a 6th
+// constructor arg would force every existing test stub to pass nil
+// in a new position.
+func (h *InternalHandler) SetSyncBuilder(b syncPayloadBuilder) {
+	h.syncBuilder = b
 }
 
 // Download serves Wasm artifacts to authenticated workers.
@@ -319,6 +347,70 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 		"deployment_id": newID,
 	}); err != nil {
 		log.Printf("AutoRollback: failed to encode response: %v", err)
+	}
+}
+
+// Sync handles GET /api/internal/workers/{workerID}/sync — HTTP
+// fallback for when a worker hasn't received any NATS message on
+// edgecloud.tasks.<region> for > N seconds (the worker's own
+// watchdog decides when to call; this endpoint just answers).
+//
+// Worker-authenticated: any valid worker JWT works (the data is
+// scoped to the worker's own (tenant, region) via workerSvc.Get).
+// Returns the same TaskMessage payload the periodic full_sync
+// publish would emit, so the worker's existing handle_task_message
+// can apply it without any new logic. The wire type is "full_sync"
+// so the worker can log/metric it distinctly from event-driven
+// task_update messages.
+//
+// 501 when the control plane was built without the sync builder
+// wired in (tests, or an operator who explicitly disabled the
+// fallback). 404 when the workerID isn't registered. 500 on a DB
+// error from workerSvc.Get or syncBuilder.BuildFullSync.
+func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
+	if h.syncBuilder == nil {
+		http.Error(w, "sync fallback not enabled", http.StatusNotImplemented)
+		return
+	}
+	workerID := r.PathValue("workerID")
+	if workerID == "" {
+		http.Error(w, "worker_id path parameter required", http.StatusBadRequest)
+		return
+	}
+
+	worker, err := h.workerSvc.Get(r.Context(), workerID)
+	if err != nil {
+		log.Printf("Sync(%s): %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if worker == nil {
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
+
+	apps, err := h.syncBuilder.BuildFullSync(r.Context(), worker.TenantID, worker.Region)
+	if err != nil {
+		log.Printf("Sync(%s): build: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if apps == nil {
+		// BuildFullSync is documented to return an empty map, not nil,
+		// when there's nothing to publish. Defensively normalize so the
+		// worker's JSON deserializer never sees `"apps": null`.
+		apps = map[string]nats.AppConfig{}
+	}
+
+	payload := map[string]interface{}{
+		"type":      "full_sync",
+		"timestamp": time.Now().UTC(),
+		"tenant_id": worker.TenantID,
+		"apps":      apps,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Sync(%s): encode: %v", workerID, err)
 	}
 }
 

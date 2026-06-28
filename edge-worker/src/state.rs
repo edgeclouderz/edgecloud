@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use edge_runtime::{MetricsAccumulator, RequestMeter};
 use wasmtime::component::InstancePre;
@@ -62,6 +63,13 @@ pub struct WorkerState {
     pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
+    /// Wall-clock instant of the most recent TaskMessage (any variant)
+    /// successfully applied. Read by the heartbeat-loop watchdog to
+    /// decide when to fall back to the HTTP /sync endpoint (issue #53).
+    /// None means "we've never received a task message" — the watchdog
+    /// treats that as "infinitely stale" so the first heartbeat tick
+    /// after boot pulls /sync.
+    pub last_task_received_at: Mutex<Option<Instant>>,
 }
 
 impl WorkerState {
@@ -69,6 +77,7 @@ impl WorkerState {
         Self {
             apps: HashMap::new(),
             engine,
+            last_task_received_at: Mutex::new(None),
         }
     }
 }

@@ -81,9 +81,9 @@ func (p *capturingPublisher) PublishFullSync(region string, msg *nats.TaskMessag
 	return nil
 }
 
-func (p *capturingPublisher) PublishTaskUpdate(string, *nats.TaskMessage) error   { return nil }
+func (p *capturingPublisher) PublishTaskUpdate(string, *nats.TaskMessage) error     { return nil }
 func (p *capturingPublisher) PublishHeartbeat(string, *nats.HeartbeatMessage) error { return nil }
-func (p *capturingPublisher) EnsureStream(nats.StreamConfig) error                { return nil }
+func (p *capturingPublisher) EnsureStream(nats.StreamConfig) error                  { return nil }
 
 func (p *capturingPublisher) callsByRegion() map[string]*nats.TaskMessage {
 	out := map[string]*nats.TaskMessage{}

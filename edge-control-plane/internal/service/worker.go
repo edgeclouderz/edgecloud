@@ -27,6 +27,7 @@ type workerRepoInterface interface {
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	Delete(ctx context.Context, id string) error
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	GetByID(ctx context.Context, id string) (*domain.Worker, error)
 	UpdateLastSeen(ctx context.Context, id string) error
 	UpdateAddr(ctx context.Context, id, addr string) error
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
@@ -148,6 +149,16 @@ func (s *WorkerService) Register(ctx context.Context, tenantID string, req *doma
 // ListByTenant returns all workers for a tenant.
 func (s *WorkerService) ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error) {
 	return s.workerRepo.ListByTenant(ctx, tenantID)
+}
+
+// Get returns the worker row for the given workerID. Returns
+// (nil, nil) when no row exists so callers can distinguish "not
+// found" from "db error" via the sentinel in service.ErrWorkerNotFound
+// if/when the handler wants a 404. Used by the HTTP /sync fallback
+// endpoint (issue #53) to map a worker_id in the URL to a
+// (tenantID, region) pair before calling ReconcileService.BuildFullSync.
+func (s *WorkerService) Get(ctx context.Context, workerID string) (*domain.Worker, error) {
+	return s.workerRepo.GetByID(ctx, workerID)
 }
 
 // SubscribeHeartbeats starts a background NATS subscription to edgecloud.heartbeats.*
