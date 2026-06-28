@@ -265,11 +265,7 @@ impl CAnalyzer {
                                 && hint + SEARCH_BUDGET <= source.len()
                                 && source[hint..hint + SEARCH_BUDGET].contains(args);
                             if !already_at_hint {
-                                if let Some(found) = find_snippet_in_source(
-                                    source,
-                                    args,
-                                    hint,
-                                ) {
+                                if let Some(found) = find_snippet_in_source(source, args, hint) {
                                     let found = found.min(source.len());
                                     // Walk back from the args-tail
                                     // start to find the identifier
@@ -279,8 +275,7 @@ impl CAnalyzer {
                                     // non-identifier byte. This gives
                                     // us the full call expression in
                                     // the original source.
-                                    let call_start =
-                                        walk_back_to_call_start(source, found);
+                                    let call_start = walk_back_to_call_start(source, found);
                                     m.original_start_byte = call_start;
                                     // Walk forward in the ORIGINAL
                                     // source to the close-paren, not
@@ -1212,9 +1207,8 @@ int main(void) {
             // The match's byte range must either:
             //   1. Be in-bounds and within the original source, OR
             //   2. Be the u32::MAX sentinel (routed to manual_review).
-            let is_in_bounds =
-                m.original_end_byte <= source_bytes.len()
-                    && m.original_start_byte <= m.original_end_byte;
+            let is_in_bounds = m.original_end_byte <= source_bytes.len()
+                && m.original_start_byte <= m.original_end_byte;
             let is_sentinel = m.original_start_byte == u32::MAX as usize
                 && m.original_end_byte == u32::MAX as usize;
             assert!(
