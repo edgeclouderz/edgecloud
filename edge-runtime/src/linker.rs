@@ -20,9 +20,7 @@ const P1_EPOCH_DEADLINE_TICKS: u64 = 100;
 /// that P1 modules can call them without trapping.  The store data type must be
 /// [`WasiP1Ctx`]; build one with [`build_wasi_p1_ctx`].
 #[cfg(feature = "wasi-preview1")]
-pub fn create_linker(
-    engine: &Engine,
-) -> Result<Linker<wasmtime_wasi::preview1::WasiP1Ctx>> {
+pub fn create_linker(engine: &Engine) -> Result<Linker<wasmtime_wasi::preview1::WasiP1Ctx>> {
     let mut linker: Linker<wasmtime_wasi::preview1::WasiP1Ctx> = Linker::new(engine);
     wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
     Ok(linker)
@@ -140,7 +138,9 @@ mod tests {
 
         // proc_exit(0) causes wasmtime to surface an I32Exit trap, not
         // "unknown import". Verify the error is NOT about a missing import.
-        let err = start.call(&mut store, ()).expect_err("proc_exit always traps");
+        let err = start
+            .call(&mut store, ())
+            .expect_err("proc_exit always traps");
         let msg = format!("{:?}", err).to_lowercase();
         assert!(
             !msg.contains("unknown import"),
@@ -181,7 +181,9 @@ mod tests {
         let ctx = build_wasi_p1_ctx(&[] as &[(&str, &str)], &["my-app"]);
         let mut store = create_p1_store(&engine, 64, ctx);
 
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let check = instance
             .get_typed_func::<(), i32>(&mut store, "check_args")
             .expect("check_args export");
