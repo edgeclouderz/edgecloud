@@ -394,15 +394,15 @@ fn keys_list(as_json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<16} {:<20} {:<12} {:<22} NOTE",
+        "{:<38} {:<24} {:<12} {:<22} NOTE",
         "ID", "NAME", "ROLE", "CREATED"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(102));
     for k in &keys {
         let is_current = current_id.as_deref() == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
         println!(
-            "{:<16} {:<20} {:<12} {:<22} {}",
+            "{:<38} {:<24} {:<12} {:<22} {}",
             k.id, k.name, k.role, k.created_at, note
         );
     }

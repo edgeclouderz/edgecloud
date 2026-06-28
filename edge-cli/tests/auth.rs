@@ -492,6 +492,73 @@ async fn keys_list_prints_table_with_current_marker() {
 }
 
 #[tokio::test]
+async fn keys_list_handles_real_length_uuid_ids() {
+    // PR #163 review finding F3: real server-generated key ids are
+    // "k_" + 36-char UUID = 38 characters. The table column widths
+    // must accommodate this without panicking or truncating. Use
+    // two realistic IDs and assert the table still renders cleanly
+    // (substring matches confirm each full id appears verbatim in
+    // stdout — if the column width were narrower than the id, the
+    // id would still appear in stdout, so this test primarily
+    // pins 'no panic, no truncation' for real-length IDs).
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_11111111-1111-1111-1111-111111111111");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_11111111-1111-1111-1111-111111111111",
+            "api_key_name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "k_11111111-1111-1111-1111-111111111111",
+                "name": "default",
+                "role": "developer",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": "k_22222222-2222-2222-2222-222222222222",
+                "name": "ci-deploy",
+                "role": "viewer",
+                "created_at": "2026-06-22T00:00:00Z",
+            },
+        ])))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("list");
+
+    // Each full 38-char id must appear verbatim in stdout.
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "k_11111111-1111-1111-1111-111111111111",
+        ))
+        .stdout(predicate::str::contains(
+            "k_22222222-2222-2222-2222-222222222222",
+        ))
+        .stdout(predicate::str::contains("(current)"));
+}
+
+#[tokio::test]
 async fn keys_list_json_emits_raw_array() {
     let home = common::isolated_home();
     let server = MockServer::start().await;
