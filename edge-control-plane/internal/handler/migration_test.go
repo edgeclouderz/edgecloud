@@ -23,6 +23,13 @@ import (
 type mockDeploymentRepo struct {
 	deployments []*domain.Deployment
 	createErr   error
+	// deleteCalls records each DeleteByID invocation. Used by the
+	// rollback tests to assert the compensating write fired.
+	deleteCalls []string
+	// deleteErr returns this error from DeleteByID if non-nil.
+	deleteErr error
+	// saveErr returns this error from Save if non-nil. The artifact
+	// store mock reads it via the `saveErr` field below.
 }
 
 func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
@@ -33,15 +40,37 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	return nil
 }
 
+func (m *mockDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
+	m.deleteCalls = append(m.deleteCalls, id)
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	for i, d := range m.deployments {
+		if d.ID == id {
+			m.deployments = append(m.deployments[:i], m.deployments[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
 // mockArtifactStore implements storage.ArtifactStore for testing.
 // Migrate / MigrateTree only call Save, so Open and Delete are
 // no-ops — they exist so the mock satisfies the wider interface
 // (introduced by issue #127, when ArtifactStoreInterface was
 // folded into storage.ArtifactStore).
-type mockArtifactStore struct{}
+type mockArtifactStore struct {
+	// saveErr makes Save return this error if non-nil. Used by the
+	// rollback tests to trigger the compensating-write path.
+	saveErr error
+}
 
 func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
-	return nil
+	return m.saveErr
+}
+
+func (m *mockArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	return nil, m.saveErr
 }
 
 func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
@@ -539,26 +568,29 @@ func itoa(i int) string {
 func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
 	h := NewMigrationHandler(svc)
-	// Build a valid multipart body that's over the cap. We use a
-	// single large file part padded past maxTreeBodyBytes.
-	body := &bytes.Buffer{}
-	w := multipart.NewWriter(body)
-	_ = w.WriteField("app_name", "hello")
-	_ = w.WriteField("language", "c")
-	_ = w.WriteField("tree", `{"files":["main.c"]}`)
-	fw, _ := w.CreateFormFile("file", "main.c")
-	padding := make([]byte, maxTreeBodyBytes+1024)
-	for i := range padding {
-		padding[i] = 'a'
-	}
-	if _, err := fw.Write(padding); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+// Build a valid multipart body that's over the cap, but stream
+	// it through io.Pipe + zeroReader so we never allocate the full
+	// ~50 MiB up front. The multipart envelope (form fields + part
+	// headers + trailing boundary) writes eagerly into the pipe;
+	// the file-part payload streams from io.LimitReader, so the
+	// server hits MaxBytesReader mid-stream and returns 413 before
+	// we ever fill more than ~32 KiB of pipe buffer.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = mw.WriteField("app_name", "hello")
+		_ = mw.WriteField("language", "c")
+		_ = mw.WriteField("tree", `{"files":["main.c"]}`)
+		fw, _ := mw.CreateFormFile("file", "main.c")
+		_, _ = io.Copy(fw, io.LimitReader(zeroReader{}, maxMigrateBodyBytes+1024))
+		_ = mw.Close()
+	}()
+	req := httptest.NewRequest("POST", "/api/migrate-tree", pr)
+	// FormDataContentType() must be called in the main goroutine
+	// BEFORE the goroutine writes (boundary is set lazily on first
+	// WriteField).
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
 	h.MigrateTree(rr, req)
@@ -821,5 +853,44 @@ func TestMigrateTree_ZipSlip(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "unsafe zip entry") {
 		t.Errorf("expected 'unsafe zip entry' in body, got: %s", rr.Body.String())
+	}
+}
+
+// TestMigrate_RejectsOversizedBody verifies that the single-file
+// Migrate handler caps the request body at maxMigrateBodyBytes
+// (50 MiB) via http.MaxBytesReader. A multipart body that exceeds
+// the cap returns 413, before the migration service is ever called.
+//
+// Pre-fix this parsed the multipart form with a 50 MiB "max memory"
+// hint that didn't actually cap the underlying body read; the
+// service-layer cap was too late. Now the handler wraps the body
+// with MaxBytesReader up front.
+//
+// The body is streamed via io.Pipe + zeroReader rather than
+// allocated eagerly — see TestMigrateTree_RejectsOversizedBody for
+// the streaming pattern's rationale.
+func TestMigrate_RejectsOversizedBody(t *testing.T) {
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	h := NewMigrationHandler(svc)
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = mw.WriteField("filename", "hello.c")
+		_ = mw.WriteField("language", "c")
+		fw, _ := mw.CreateFormFile("file", "hello.c")
+		_, _ = io.Copy(fw, io.LimitReader(zeroReader{}, maxMigrateBodyBytes+1024))
+		_ = mw.Close()
+	}()
+	req := httptest.NewRequest("POST", "/api/migrate", pr)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req = withTenantID(req, "t_1")
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "request body too large") {
+		t.Errorf("expected 'request body too large' in body, got: %s", rr.Body.String())
 	}
 }

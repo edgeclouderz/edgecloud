@@ -3,10 +3,11 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -43,6 +44,31 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
+	// DeleteByID removes a deployment row by ID. Idempotent on missing
+	// row. Used as the compensating write when the artifact save
+	// fails after the row was inserted.
+	DeleteByID(ctx context.Context, id string) error
+}
+
+// ArtifactStoreInterface abstracts wasm artifact storage for testing.
+// Mirrors storage.ArtifactStore (ctx-aware) so rollbackArtifactSave
+// and test mocks can pass through to the production type without a
+// signature adapter.
+type ArtifactStoreInterface interface {
+	Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error
+	// SaveAndHash streams the artifact to disk and returns its SHA-256
+	// in a single io.Copy pass (no intermediate buffer). Hash + write
+	// are concurrent via io.MultiWriter; the final path either
+	// contains the full artifact (with a verified hash) or doesn't
+	// exist (atomic temp-rename). Prefer this over Save when the
+	// caller needs the hash; the older Save was retained for callers
+	// that don't (and for the migration pre-compile path that
+	// already has the bytes hashed separately).
+	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
+	// Delete removes an artifact. Idempotent on missing file. Used as
+	// the compensating write when the row insert fails after the
+	// artifact was written.
+	Delete(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.
@@ -324,31 +350,13 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return &report, compileSentinel
 	}
 
-	// Read wasm bytes
-	wasmBytes, err := os.ReadFile(tmpWasmPath)
+	// Stat the compiled wasm for the size cap. Avoids buffering the
+	// full artifact (up to MaxArtifactSize = 100 MiB) into RAM just
+	// to read its length — the streaming SaveAndHash below hashes
+	// and writes the file in a single pass.
+	info, err := os.Stat(tmpWasmPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading compiled wasm: %w", err)
-	}
-
-	// Reject output that isn't actually wasm. A misconfigured
-	// wasi-sdk or a non-wasm target will produce a file that passes the
-	// compiler but fails on the worker — surface that here so the
-	// migration report reflects a clear failure rather than silently
-	// storing a broken artifact.
-	if !validateWasm(wasmBytes) {
-		report := envelope.Report
-		report.Status = domain.MigrationStatusFailed
-		report.WasmStored = false
-		report.AppName = appName
-		report.DeploymentID = nil
-		report.Errors = []domain.ErrorInfo{{
-			Line:    0,
-			Message: "compiled output is not a valid wasm binary (missing magic bytes)",
-		}}
-		if len(report.PatternsTransformed) == 0 {
-			report.PatternsTransformed = patternsTransformed
-		}
-		return &report, fmt.Errorf("compiled output is not a valid wasm binary")
+		return nil, fmt.Errorf("stat compiled wasm: %w", err)
 	}
 
 	// Enforce MaxArtifactSize. Catches accidental huge builds (e.g.,
@@ -356,7 +364,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	// hit the database or filesystem. Closes the pre-existing gap on
 	// the single-file `Migrate` path (M2.C8) — MigrateTree enforces
 	// the same cap separately.
-	if int64(len(wasmBytes)) > MaxArtifactSize {
+	if info.Size() > MaxArtifactSize {
 		report := envelope.Report
 		report.Status = domain.MigrationStatusFailed
 		report.WasmStored = false
@@ -376,27 +384,84 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return &report, ErrMigrationFailed
 	}
 
-	// Generate deployment ID and hash
-	depID := "d_" + uuid.New().String()
-	hash := sha256.Sum256(wasmBytes)
+	// Reject output that isn't actually wasm. A misconfigured
+	// wasi-sdk or a non-wasm target will produce a file that passes the
+	// compiler but fails on the worker — surface that here so the
+	// migration report reflects a clear failure rather than silently
+	// storing a broken artifact. Peek the magic bytes from the file
+	// directly (4 bytes is enough; the spec's 8-byte header is just
+	// magic + version, and a bad magic always means a bad file).
+	magicFile, err := os.Open(tmpWasmPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening compiled wasm: %w", err)
+	}
+	var magic [4]byte
+	if _, err := io.ReadFull(magicFile, magic[:]); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("reading wasm magic: %w", err)
+	}
+	if !bytes.HasPrefix(magic[:], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		_ = magicFile.Close()
+		report := envelope.Report
+		report.Status = domain.MigrationStatusFailed
+		report.WasmStored = false
+		report.AppName = appName
+		report.DeploymentID = nil
+		report.Errors = []domain.ErrorInfo{{
+			Line:    0,
+			Message: "compiled output is not a valid wasm binary (missing magic bytes)",
+		}}
+		if len(report.PatternsTransformed) == 0 {
+			report.PatternsTransformed = patternsTransformed
+		}
+		return &report, fmt.Errorf("compiled output is not a valid wasm binary")
+	}
+	// Rewind so SaveAndHash below reads from byte 0, not byte 4.
+	if _, err := magicFile.Seek(0, io.SeekStart); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("rewinding compiled wasm: %w", err)
+	}
 
-	// Create deployment DB record
+	// Generate deployment ID
+	depID := "d_" + uuid.New().String()
+
+	// Create deployment DB record. Hash is filled in after SaveAndHash
+	// returns — the hash is computed in the same io.Copy pass that
+	// writes the artifact to disk.
 	deployment := &domain.Deployment{
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    domain.StatusMigrated,
-		Hash:      hex.EncodeToString(hash[:]),
+		Hash:      "",
 		CreatedAt: time.Now(),
 	}
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
+		_ = magicFile.Close()
 		return nil, fmt.Errorf("creating deployment record: %w", err)
 	}
 
-	// Store wasm artifact
-	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		return nil, fmt.Errorf("saving wasm artifact: %w", err)
+// Stream the artifact to disk and compute the SHA-256 in a single
+	// pass. SaveAndHash is atomic on disk (temp-rename), so a failed
+	// read mid-stream leaves no partial blob at the final path. We
+	// inline the rollback (DeleteByID + Delete) rather than call
+	// rollbackArtifactSave because the production s.artifactStore is
+	// the ctx-aware storage.ArtifactStore, while rollbackArtifactSave
+	// takes the non-ctx service.ArtifactStoreInterface. The deployment
+	// row is rolled back by the caller's tx (or compensated in the
+	// no-tx path).
+	hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, depID, magicFile)
+	_ = magicFile.Close()
+	if saveErr != nil {
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed, saveErr)
 	}
+	deployment.Hash = hex.EncodeToString(hash)
 
 	// Build success report from envelope's structured Report (HEAD),
 	// overlaying fields the envelope doesn't carry (wasm_stored,
@@ -830,12 +895,15 @@ func (s *MigrationService) MigrateTree(
 		}, ErrMigrateTreeFailed
 	}
 
-	// Read + size-check the wasm.
-	wasmBytes, err := os.ReadFile(tmpWasmPath)
+	// Stat the compiled wasm for the size cap. Avoids buffering the
+	// full artifact (up to MaxArtifactSize = 100 MiB) into RAM just
+	// to read its length — the streaming SaveAndHash below hashes
+	// and writes the file in a single pass.
+	info, err := os.Stat(tmpWasmPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading compiled wasm: %w", err)
+		return nil, fmt.Errorf("stat compiled wasm: %w", err)
 	}
-	if int64(len(wasmBytes)) > MaxArtifactSize {
+	if info.Size() > MaxArtifactSize {
 		return &domain.TreeMigrationReport{
 			Status:            status,
 			WasmStored:        false,
@@ -850,7 +918,21 @@ func (s *MigrationService) MigrateTree(
 			}},
 		}, ErrMigrateTreeFailed
 	}
-	if !validateWasm(wasmBytes) {
+	// Peek the wasm magic bytes from the file directly (4 bytes is
+	// enough; the spec's 8-byte header is just magic + version, and
+	// a bad magic always means a bad file). Avoids a full
+	// os.ReadFile on a 100 MiB blob.
+	magicFile, err := os.Open(tmpWasmPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening compiled wasm: %w", err)
+	}
+	var magic [4]byte
+	if _, err := io.ReadFull(magicFile, magic[:]); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("reading wasm magic: %w", err)
+	}
+	if !bytes.HasPrefix(magic[:], []byte{0x00, 0x61, 0x73, 0x6d}) {
+		_ = magicFile.Close()
 		return &domain.TreeMigrationReport{
 			Status:            status,
 			WasmStored:        false,
@@ -865,24 +947,45 @@ func (s *MigrationService) MigrateTree(
 			}},
 		}, ErrMigrateTreeFailed
 	}
+	// Rewind so SaveAndHash below reads from byte 0, not byte 4.
+	if _, err := magicFile.Seek(0, io.SeekStart); err != nil {
+		_ = magicFile.Close()
+		return nil, fmt.Errorf("rewinding compiled wasm: %w", err)
+	}
 
 	// Persist: deployment row + artifact blob.
 	depID := "d_" + uuid.New().String()
-	hash := sha256.Sum256(wasmBytes)
 	deployment := &domain.Deployment{
 		ID:        depID,
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    "migrated",
-		Hash:      hex.EncodeToString(hash[:]),
+		Hash:      "",
 		CreatedAt: time.Now(),
 	}
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
+		_ = magicFile.Close()
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
-	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
-		return nil, fmt.Errorf("saving artifact: %w", err)
+// Stream the artifact to disk and compute the SHA-256 in a single
+	// pass. See the rollback comment in MigrationService.Migrate for
+	// why the blob is cleaned up here. We inline the rollback
+	// (DeleteByID + Delete) rather than call rollbackArtifactSave
+	// because the production s.artifactStore is the ctx-aware
+	// storage.ArtifactStore, while rollbackArtifactSave takes the
+	// non-ctx service.ArtifactStoreInterface.
+	hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, depID, magicFile)
+	_ = magicFile.Close()
+	if saveErr != nil {
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed, saveErr)
 	}
+	deployment.Hash = hex.EncodeToString(hash)
 
 	return &domain.TreeMigrationReport{
 		Status:            status,

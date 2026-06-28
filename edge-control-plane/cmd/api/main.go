@@ -463,8 +463,16 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 
 	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
-	// Wrap with request ID tracing — outermost middleware runs for every request.
-	srv := &http.Server{Addr: addr, Handler: middleware.RequestID(mux)}
+	// Wrap with request ID tracing (outermost) and a body-cap
+	// floor (MaxArtifactSize = 100 MiB). The body cap bounds
+	// uncapped handlers (e.g. the unauthenticated
+	// POST /api/v1/tenants) and is the smallest cap that's safe
+	// for Deploy — Deploy's own 100 MiB per-handler
+	// MaxBytesReader wrap composes cleanly via the wrapper
+	// chain (smaller wins, but they're equal here so no
+	// behavioral change). Tighter per-handler caps (Migrate
+	// 50 MiB, IngestLogs 1 MiB) compose via the same chain.
+	srv := &http.Server{Addr: addr, Handler: middleware.RequestID(middleware.MaxBodyBytes(service.MaxArtifactSize)(mux))}
 
 	go func() {
 		log.Printf("Starting edge-cloud control plane on %s", addr)

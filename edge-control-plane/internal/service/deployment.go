@@ -3,7 +3,6 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -104,6 +103,12 @@ var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	// ErrInvalidWasm is returned by Deploy when the artifact's first
+	// 4 bytes aren't the wasm magic (`\0asm`). Streaming keeps us
+	// from validating the full module here, but the magic-byte
+	// check is enough to reject obviously-non-wasm inputs before
+	// the bytes hit disk. Handler maps to HTTP 400.
+	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
@@ -305,24 +310,14 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, ErrMaxDeploymentsQuotaExceeded
 	}
 
-	// Read artifact and compute hash (bounded to prevent memory exhaustion)
-	data, err := io.ReadAll(io.LimitReader(r, MaxArtifactSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading artifact: %w", err)
-	}
-	if int64(len(data)) > MaxArtifactSize {
-		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
-	}
-
-	// Reject non-wasm artifacts before persisting them. Without this guard a
-	// non-wasm file would be stored, hashed, and shipped to workers, where
-	// it would fail only at execution time. Magic bytes are the cheapest
-	// first-line check — full module validation is wasmtime's job.
-	if !validateWasm(data) {
-		return nil, fmt.Errorf("invalid wasm artifact: missing magic bytes (\\0asm)")
-	}
-
-	hash := sha256.Sum256(data)
+	// Note: we no longer buffer the entire artifact in memory here.
+	// The streaming SaveAndHash below does hash + write in a single
+	// pass; the only bytes we touch up front are the 4-byte wasm
+	// magic (peeked inside the tx callback at line ~311) so we can
+	// reject non-wasm blobs cheaply before any disk I/O happens.
+	// The handler enforces the MaxArtifactSize cap via
+	// http.MaxBytesReader, so the inner read never sees more than
+	// MaxArtifactSize bytes.
 
 	// Resolve the effective regions list: explicit > default. We
 	// keep the empty `regions` slice distinct from nil so the repo
@@ -339,8 +334,11 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    domain.StatusDeployed,
-		Hash:      hex.EncodeToString(hash[:]),
-		Regions:   domain.StringArrayFrom(effectiveRegions),
+		// Hash is populated after SaveAndHash returns the SHA-256
+		// of the streamed bytes. Streaming keeps the bytes from
+		// ever sitting in RAM as a single buffer.
+		Hash:    "",
+		Regions: domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
 		// Persist the tenant opt-in on the artifact row so audit
 		// endpoints (`edge deployments --app foo`) can show which
@@ -349,13 +347,94 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		AutoRollbackEnabled: autoRollback,
 	}
 
-	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
-		return nil, fmt.Errorf("creating deployment: %w", err)
+// Wrap the row insert and the artifact save in a transaction
+	// so a failed SaveAndHash rolls the deployment row back
+	// atomically (we don't end up with a row pointing at no
+	// artifact). The artifact store is filesystem, so the tx only
+	// protects the row; if SaveAndHash succeeds and the tx commit
+	// fails, the blob is left on disk but no row references it
+	// (operator-cleanable). SaveAndHash is atomic on disk via the
+	// temp-rename pattern, so a failed write never leaves partial
+	// bytes at the final path.
+	//
+	// The 4-byte wasm magic peek runs INSIDE the tx callback so
+	// a non-wasm artifact is rejected before any disk I/O. The
+	// remaining stream is then handed to SaveAndHash, which hashes
+	// and writes in a single pass.
+	//
+	// When s.db is nil (the test path, where a sqlmock or
+	// in-memory harness wires repos but not a *sqlx.DB), fall
+	// back to the no-tx path so the call doesn't segfault on
+	// `db.BeginTxx(nil)`. Production callers always have s.db.
+	if s.db != nil {
+		err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+			magic := make([]byte, 4)
+			if _, err := io.ReadFull(r, magic); err != nil {
+				return fmt.Errorf("reading wasm magic: %w", err)
+			}
+			if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
+				return ErrInvalidWasm
+			}
+			hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r)
+			if saveErr != nil {
+				return saveErr
+			}
+			deployment.Hash = hex.EncodeToString(hash)
+			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
+				return fmt.Errorf("creating deployment: %w", err)
+			}
+			return nil
+		})
+		// Apps-row cleanup: CreateIfNotExists above inserted the
+		// apps row OUTSIDE the tx (nesting a tx inside another tx
+		// isn't supported by the sqlx layer), so a failed tx only
+		// rolls back the deployment row — not the apps row.
+		// Without this cleanup, a failed first deploy of an app
+		// would orphan the apps row forever, counting against the
+		// tenant's max_apps quota. The NOT EXISTS guard in
+		// DeleteIfNoDeployments makes this safe under concurrent
+		// deploys: if a parallel deploy succeeded for the same
+		// app, NOT EXISTS is FALSE and the apps row stays.
+		if err != nil && s.appSvc != nil {
+			if _, delErr := s.appSvc.DeleteIfNoDeployments(ctx, tenantID, appName); delErr != nil {
+				log.Printf("rollback apps-row cleanup failed after tx failure: tenant_id=%s app_name=%s error=%v", tenantID, appName, delErr)
+			}
+		}
+	} else {
+		// No-tx fallback path (test harnesses that wire repos but
+		// not s.db; production callers always go through the tx
+		// branch above). Use unique names for inner errors so we
+		// don't shadow the outer `err` via the if-init
+		// `err := ...` form.
+		magic := make([]byte, 4)
+		if _, readErr := io.ReadFull(r, magic); readErr != nil {
+			err = fmt.Errorf("reading wasm magic: %w", readErr)
+		} else if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
+			err = ErrInvalidWasm
+		} else if hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r); saveErr != nil {
+			// Compensate in the same order as the tx branch's
+			// equivalent: apps-row cleanup BEFORE deployment-row
+			// cleanup, so the NOT EXISTS guard on
+			// DeleteIfNoDeployments still sees the deployment row
+			// to decide whether to drop the apps row.
+			if s.appSvc != nil {
+				if _, delErr := s.appSvc.DeleteIfNoDeployments(ctx, tenantID, appName); delErr != nil {
+					log.Printf("rollback apps-row cleanup failed after artifact save error: tenant_id=%s app_name=%s error=%v", tenantID, appName, delErr)
+				}
+			}
+			if delErr := s.deploymentRepo.DeleteByID(ctx, deployment.ID); delErr != nil {
+				log.Printf("compensating DeleteByID failed after artifact save error (no-tx path): deployment_id=%s error=%v", deployment.ID, delErr)
+			}
+			err = saveErr
+		} else {
+			deployment.Hash = hex.EncodeToString(hash)
+			if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
+				err = fmt.Errorf("creating deployment: %w", createErr)
+			}
+		}
 	}
-
-	// Save artifact
-	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
-		return nil, fmt.Errorf("saving artifact: %w", err)
+	if err != nil {
+		return nil, err
 	}
 
 	return deployment, nil

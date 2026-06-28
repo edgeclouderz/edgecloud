@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 )
 
@@ -120,7 +121,7 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 		var maxErr *http.MaxBytesError
 		switch {
 		case errors.As(err, &maxErr):
-			http.Error(w, `{"error": "batch too large"}`, http.StatusBadRequest)
+			httperror.MaxBodyBytes(w, err, http.StatusBadRequest, "batch too large")
 		case errors.Is(err, io.EOF):
 			http.Error(w, `{"error": "empty body"}`, http.StatusBadRequest)
 		default:
