@@ -58,6 +58,10 @@ func (f *fakeWorkerSvc) ListByTenant(_ context.Context, _ string) ([]domain.Work
 	return nil, nil
 }
 
+func (f *fakeWorkerSvc) Get(_ context.Context, _ string) (*domain.Worker, error) {
+	return nil, nil
+}
+
 // withWorkerCtx returns a copy of the request with the worker tenant
 // id attached via the same context key the middleware uses. The
 // handler trusts this value (the same as it would after

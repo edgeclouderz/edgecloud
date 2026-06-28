@@ -67,13 +67,13 @@ type reconcileQuotas interface {
 //     fallback endpoint (commit 4) so the GET /sync handler can return
 //     the same payload the periodic loop would publish.
 type ReconcileService struct {
-	tenantRepo      reconcileTenants
-	activeRepo      reconcileActiveDeployments
-	deploymentRepo  reconcileDeployments
-	appEnvRepo      reconcileAppEnvs
-	quotaRepo       reconcileQuotas
-	publisher       nats.Publisher
-	defaultRegion   string
+	tenantRepo     reconcileTenants
+	activeRepo     reconcileActiveDeployments
+	deploymentRepo reconcileDeployments
+	appEnvRepo     reconcileAppEnvs
+	quotaRepo      reconcileQuotas
+	publisher      nats.Publisher
+	defaultRegion  string
 }
 
 func NewReconcileService(

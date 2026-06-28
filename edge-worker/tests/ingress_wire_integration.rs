@@ -94,6 +94,7 @@ async fn build_supervisor(
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: std::path::PathBuf::from("/tmp/edge-worker-ingress-wire-test"),
         heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 19_000,
@@ -135,7 +136,7 @@ async fn build_supervisor(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
-        jwt_signer,
+        jwt_signer.clone(),
     );
     Ok(Arc::new(Supervisor {
         config,
@@ -144,6 +145,7 @@ async fn build_supervisor(
         port_pool,
         nats,
         log_forwarder,
+        jwt_signer,
     }))
 }
 

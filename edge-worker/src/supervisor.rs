@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use edge_runtime::linker::create_component_linker;
@@ -11,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
+use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -32,6 +34,10 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
+    /// JWT signer used by `fetch_sync` to authenticate the HTTP /sync
+    /// fallback request. Issue #53. Cached internally so each call is
+    /// cheap; reused across all fallback attempts.
+    pub jwt_signer: Arc<WorkerJwtSigner>,
 }
 
 impl Supervisor {
@@ -177,7 +183,68 @@ impl Supervisor {
             }
         }
 
+        // Record that we just applied a TaskMessage — both event-driven
+        // TaskUpdate and periodic FullSync reset the watchdog timer.
+        // Issue #53: the heartbeat task reads this to decide when to
+        // fall back to GET /api/internal/workers/{workerID}/sync.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(Instant::now());
+        }
+
         Ok(())
+    }
+
+    /// Pull the current desired-state snapshot from the control plane
+    /// via the HTTP /sync fallback endpoint and return it as a
+    /// `TaskMessage` so the caller can apply it via
+    /// `handle_task_message` (issue #53).
+    ///
+    /// Used by the heartbeat-task watchdog when NATS has been silent
+    /// for longer than `EDGE_WORKER_SYNC_THRESHOLD_SECS`. The returned
+    /// message always has `type: "full_sync"` — the CP enforces that
+    /// on the wire — so the worker's existing handler applies it
+    /// identically to a NATS-delivered FullSync.
+    ///
+    /// Errors are NOT propagated as `Err` for transient failures
+    /// (network blip, 5xx); we return `Ok(None)` so the caller can
+    /// simply log and wait for the next heartbeat tick. A persistent
+    /// CP outage surfaces as repeated `warn!` log lines — the operator
+    /// signal that "NATS is silent AND the HTTP fallback is failing".
+    pub async fn fetch_sync(&self) -> anyhow::Result<Option<TaskMessage>> {
+        let url = format!(
+            "{}/api/internal/workers/{}/sync",
+            self.config.control_plane_url, self.config.worker_id
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let resp = match client
+            .get(&url)
+            .bearer_auth(self.jwt_signer.sign())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(err = %e, url = %url, "sync fallback: GET failed");
+                return Ok(None);
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                url = %url,
+                "sync fallback: non-2xx response"
+            );
+            return Ok(None);
+        }
+        match resp.json::<TaskMessage>().await {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                tracing::warn!(err = %e, "sync fallback: deserialize failed");
+                Ok(None)
+            }
+        }
     }
 
     /// Start a new app or restart a changed one.

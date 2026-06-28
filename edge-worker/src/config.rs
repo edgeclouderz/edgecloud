@@ -30,6 +30,14 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub heartbeat_interval_secs: u64,
     pub health_check_timeout_secs: u64,
+    /// Threshold for the HTTP /sync fallback watchdog (issue #53).
+    /// When the worker hasn't received any TaskMessage for this many
+    /// seconds, the heartbeat task pulls the desired-state snapshot
+    /// directly from the control plane. Default 60s — long enough that
+    /// the periodic CP-side reconcile (5min default) usually catches
+    /// up first on a healthy cluster; short enough that an isolated
+    /// worker doesn't sit stale for the full NATS retention window.
+    pub worker_sync_threshold_secs: u64,
     pub port_cooldown_secs: u64,
     pub starting_port: u16,
     /// Per-app memory cap in MiB, applied via wasmtime StoreLimits.
@@ -133,6 +141,10 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(".worker-cache")),
             heartbeat_interval_secs: 30,
+            worker_sync_threshold_secs: std::env::var("EDGE_WORKER_SYNC_THRESHOLD_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
             health_check_timeout_secs: std::env::var("EDGE_HEALTH_CHECK_TIMEOUT_SECS")
                 .unwrap_or_else(|_| "60".into())
                 .parse()
