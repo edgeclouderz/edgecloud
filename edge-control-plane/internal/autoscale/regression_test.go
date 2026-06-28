@@ -27,10 +27,8 @@ package autoscale
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,21 +94,17 @@ func newTestNATS(t *testing.T) *natsio.Conn {
 // so the cooldown test can observe a window without burning 60s of wall-clock.
 //
 // Returns the service, an event recorder (so the test can assert on what
-// was inserted), and a cloud provider that increments the package-level
-// `provisionCount` atomic on every Provision call so waitForProvision
-// can poll for activity without the caller threading a counter through
-// every helper.
+// was inserted), and a MockCloudProvider whose Provision counter
+// (cloud.ProvisionCalls()) is bumped automatically by the mock — no
+// caller-side accounting needed.
 func newServiceForRegression(t *testing.T, nc *natsio.Conn) (
 	*Service, *mockEventRepo, *MockCloudProvider,
 ) {
 	t.Helper()
 	events := &mockEventRepo{}
 	cloud := &MockCloudProvider{
-		KindFunc: func() string { return "mock" },
-		ProvisionFunc: func(_ context.Context, region string) (string, error) {
-			provisionCount.Add(1)
-			return "w_" + region + "_new", nil
-		},
+		KindFunc:      func() string { return "mock" },
+		ProvisionFunc: func(_ context.Context, region string) (string, error) { return "w_" + region + "_new", nil },
 	}
 	s := NewService(Deps{
 		Cfg: Config{
@@ -161,13 +155,14 @@ func publishHeartbeat(t *testing.T, nc *natsio.Conn, region string, appSlots uin
 }
 
 // waitForProvision polls until at least one Provision call has been
-// recorded, or `deadline` elapses. Uses a 50ms poll interval so the
-// test reacts within ~one tick (DecisionIntervalS=1s in test config).
+// recorded on `cloud`, or `deadline` elapses. Uses a 50ms poll
+// interval so the test reacts within ~one tick (DecisionIntervalS=1s
+// in test config).
 //
 // We poll because the autoscaler fires Provision asynchronously on
 // the decision goroutine, and the test cannot observe it without
 // yielding to the runtime.
-func waitForProvision(t *testing.T, deadline time.Duration) {
+func waitForProvision(t *testing.T, cloud *MockCloudProvider, deadline time.Duration) {
 	t.Helper()
 	timeout := time.NewTimer(deadline)
 	defer timeout.Stop()
@@ -178,17 +173,12 @@ func waitForProvision(t *testing.T, deadline time.Duration) {
 		case <-timeout.C:
 			t.Fatalf("waitForProvision: no Provision call within %v", deadline)
 		case <-tick.C:
-			if provisionCount.Load() >= 1 {
+			if cloud.ProvisionCalls() >= 1 {
 				return
 			}
 		}
 	}
 }
-
-// provisionCount is a package-level atomic so waitForProvision can
-// poll without the caller threading a counter through every helper.
-// Reset by the test (or by t.Cleanup) before each scenario.
-var provisionCount atomic.Int64
 
 // runSubscribeWithCleanup wires the autoscaler's Subscribe goroutine
 // with a sync.WaitGroup so the test can wait for clean exit. Service.Subscribe
@@ -240,10 +230,9 @@ func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
 	if reason, ok := shouldSkipRegression(); ok {
 		t.Skipf("regression: %s", reason)
 	}
-	provisionCount.Store(0)
 
 	nc := newTestNATS(t)
-	s, events, _ := newServiceForRegression(t, nc)
+	s, events, cloud := newServiceForRegression(t, nc)
 	// Wire Count to return 100 (the "spike aftermath"): the autoscaler
 	// will treat this as DesiredApps=100 and demand more workers.
 	s.deployRepo = &mockDeployRepo{
@@ -259,7 +248,7 @@ func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
 
 	// Wait ≤ 90s for cloud.Provision to fire. The autoscaler ticks
 	// at 1s and reacts within one tick of the heartbeat landing.
-	waitForProvision(t, 90*time.Second)
+	waitForProvision(t, cloud, 90*time.Second)
 
 	// Give the Insert a moment to land after Provision returns.
 	time.Sleep(100 * time.Millisecond)
@@ -290,10 +279,9 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 	if reason, ok := shouldSkipRegression(); ok {
 		t.Skipf("regression: %s", reason)
 	}
-	provisionCount.Store(0)
 
 	nc := newTestNATS(t)
-	s, events, _ := newServiceForRegression(t, nc)
+	s, events, cloud := newServiceForRegression(t, nc)
 	s.deployRepo = &mockDeployRepo{
 		countFunc: func(_ context.Context) (int, error) { return 100, nil },
 	}
@@ -304,8 +292,8 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 
 	// Trigger the first scale_up.
 	publishHeartbeat(t, nc, "fra", 0)
-	waitForProvision(t, 90*time.Second)
-	firstCount := provisionCount.Load()
+	waitForProvision(t, cloud, 90*time.Second)
+	firstCount := cloud.ProvisionCalls()
 
 	// Burst more heartbeats well within the 1s cooldown window. The
 	// next tick (within ~1s) must convert the resulting scale_up
@@ -323,7 +311,7 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 	// it does NOT.
 	time.Sleep(2500 * time.Millisecond)
 
-	secondCount := provisionCount.Load()
+	secondCount := cloud.ProvisionCalls()
 	if secondCount > firstCount {
 		t.Errorf("Provision called again after first scale_up: first=%d second=%d (cooldown should suppress)", firstCount, secondCount)
 	}
@@ -349,10 +337,9 @@ func TestRegression_MultiRegionIndependent(t *testing.T) {
 	if reason, ok := shouldSkipRegression(); ok {
 		t.Skipf("regression: %s", reason)
 	}
-	provisionCount.Store(0)
 
 	nc := newTestNATS(t)
-	s, _, _ := newServiceForRegression(t, nc)
+	s, _, cloud := newServiceForRegression(t, nc)
 	s.deployRepo = &mockDeployRepo{
 		countFunc: func(_ context.Context) (int, error) { return 100, nil },
 	}
@@ -372,18 +359,14 @@ func TestRegression_MultiRegionIndependent(t *testing.T) {
 	for {
 		select {
 		case <-deadline:
-			t.Fatalf("both regions did not Provision within 90s; calls=%d", provisionCount.Load())
+			t.Fatalf("both regions did not Provision within 90s; calls=%d", cloud.ProvisionCalls())
 		case <-tick.C:
-			if provisionCount.Load() >= 2 {
+			if cloud.ProvisionCalls() >= 2 {
 				return
 			}
 		}
 	}
 }
 
-// errSkipped is a sentinel so the test binary's exit code distinguishes
-// "skipped" from "failed". Today it's unused but kept as a guard against
-// accidental skip-via-error regressions in future refactors.
-var errSkipped = errors.New("test skipped")
-
-var _ = errSkipped // suppress unused-var lint in build-tag-gated file
+// errSkipped removed: the t.Skip / t.Skipf calls themselves gate the
+// tests; a sentinel adds noise without value.

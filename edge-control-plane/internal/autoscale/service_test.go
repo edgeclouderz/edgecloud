@@ -332,10 +332,12 @@ func TestNewCloudProvider_RejectsUnknown(t *testing.T) {
 	}
 }
 
-// TestNewCloudProvider_AcceptsKnown pins the happy paths: noop /
-// mock / empty (defaults to noop) must all succeed.
+// TestNewCloudProvider_AcceptsKnown pins the happy paths: empty
+// (defaults to noop) and "noop" must succeed. "mock" is rejected
+// here — tests construct MockCloudProvider directly rather than
+// routing through the factory.
 func TestNewCloudProvider_AcceptsKnown(t *testing.T) {
-	for _, kind := range []string{"", "noop", "mock"} {
+	for _, kind := range []string{"", "noop"} {
 		p, err := NewCloudProvider(kind, discardLogger())
 		if err != nil {
 			t.Errorf("NewCloudProvider(%q) err = %v", kind, err)
