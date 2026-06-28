@@ -64,7 +64,7 @@ func TestWrite_ResponseShape(t *testing.T) {
 
 func TestCtxVariants_PopulateRequestID(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/test", nil)
-	ctx := context.WithValue(r.Context(), requestIDKey, "ctx-req-456")
+	ctx := context.WithValue(r.Context(), requestIDKey, "ctx-req-456") //nolint:staticcheck // production uses bare string key
 	r = r.WithContext(ctx)
 
 	tests := []struct {
