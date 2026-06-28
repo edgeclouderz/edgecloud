@@ -60,10 +60,10 @@ type Deps struct {
 //     suppressed an otherwise-valid scale event.
 //
 // Concurrency model:
-//   - A single goroutine owns `fleets` and `lastEvent`. The Subscribe
-//     goroutine updates fleets from heartbeats; the decision ticker
-//     reads from it. No locks are needed because only one goroutine
-//     touches either.
+//   - A single goroutine owns `fleets` and `lastEventByRegion`. The
+//     Subscribe goroutine updates fleets from heartbeats; the decision
+//     ticker reads from it. No locks are needed because only one
+//     goroutine touches either.
 //   - CloudProvider calls run synchronously on the decision goroutine
 //     — a slow provision API extends the next tick but does not block
 //     the heartbeat path.
@@ -75,13 +75,19 @@ type Service struct {
 	cloud      CloudProvider
 	log        *slog.Logger
 
-	// mu guards fleets + lastEvent. Even though the current Subscribe
-	// goroutine is the only writer, exposing the fleet view through
-	// a getter method (used by tests) makes a lock necessary so the
-	// test's reader doesn't race with the production writer.
-	mu        sync.Mutex
-	fleets    map[string]map[string]WorkerHeadroom // region → workerID → headroom
-	lastEvent *domain.AutoscaleEvent
+	// mu guards fleets + lastEventByRegion. Even though the current
+	// Subscribe goroutine is the only writer, exposing the fleet view
+	// through a getter method (used by tests) makes a lock necessary
+	// so the test's reader doesn't race with the production writer.
+	//
+	// lastEventByRegion is keyed by region so each region's cooldown
+	// clock is independent. A scale_up in fra does not block iad's
+	// next scale_up, and vice versa. (Pre-#85 this was a single
+	// `lastEvent` shared cluster-wide, which contradicted the
+	// per-action-class docstring on applyCooldown.)
+	mu                sync.Mutex
+	fleets            map[string]map[string]WorkerHeadroom // region → workerID → headroom
+	lastEventByRegion map[string]*domain.AutoscaleEvent
 }
 
 // NewService constructs an autoscaler Service. Returns nil when cfg.Enabled
@@ -96,13 +102,14 @@ func NewService(d Deps) *Service {
 		d.Cfg.DecisionIntervalS = 30
 	}
 	return &Service{
-		cfg:        d.Cfg,
-		nc:         d.NC,
-		deployRepo: d.DeployRepo,
-		eventRepo:  d.EventRepo,
-		cloud:      d.Cloud,
-		log:        d.Log,
-		fleets:     make(map[string]map[string]WorkerHeadroom),
+		cfg:                d.Cfg,
+		nc:                 d.NC,
+		deployRepo:         d.DeployRepo,
+		eventRepo:          d.EventRepo,
+		cloud:              d.Cloud,
+		log:                d.Log,
+		fleets:             make(map[string]map[string]WorkerHeadroom),
+		lastEventByRegion:  make(map[string]*domain.AutoscaleEvent),
 	}
 }
 
@@ -155,10 +162,16 @@ func (s *Service) run(ctx context.Context, sub *natsio.Subscription, ch <-chan *
 }
 
 // evaluateAll snapshots every region's fleet, computes a decision,
-// and dispatches any non-noop actions through applyCooldown +
-// execute. Per-region processing keeps the failure blast radius
-// small: a panic or DB error in one region's decision doesn't
-// poison the others.
+// and dispatches it through applyCooldown + execute. Per-region
+// processing keeps the failure blast radius small: a panic or DB
+// error in one region's decision doesn't poison the others.
+//
+// Noop decisions (whether from "within target" in ComputeDecision or
+// from cooldown suppression in applyCooldown) flow through execute
+// so eventRepo.Insert records them — operators reading the
+// autoscale_events table can see both "we wanted to scale but were
+// suppressed" and "fleet is healthy, no action needed". Without
+// this, a cooldown-suppressed tick would be invisible to operators.
 func (s *Service) evaluateAll(ctx context.Context) {
 	s.mu.Lock()
 	snapshot := make(map[string][]WorkerHeadroom, len(s.fleets))
@@ -169,16 +182,16 @@ func (s *Service) evaluateAll(ctx context.Context) {
 		}
 		snapshot[region] = list
 	}
-	lastEvent := s.lastEvent
+	lastEvents := make(map[string]*domain.AutoscaleEvent, len(s.lastEventByRegion))
+	for region, ev := range s.lastEventByRegion {
+		lastEvents[region] = ev
+	}
 	s.mu.Unlock()
 
 	for region, workers := range snapshot {
 		state := FleetState{Workers: workers, DesiredApps: s.desiredApps(ctx, region)}
 		d := ComputeDecision(state, s.cfg)
-		d = s.applyCooldown(d, lastEvent, time.Now())
-		if d.Action == domain.AutoscaleNoop {
-			continue
-		}
+		d = s.applyCooldown(d, lastEvents[region], time.Now())
 		s.execute(ctx, region, workers, d)
 	}
 }
@@ -245,7 +258,8 @@ func (s *Service) applyCooldown(d Decision, lastEvent *domain.AutoscaleEvent, no
 
 // execute calls the CloudProvider and records the result as an
 // autoscale_events row. Always logs at info (or warn on failure).
-// Mutates lastEvent so the next tick's cooldown check sees this row.
+// Mutates lastEventByRegion[region] so the next tick's cooldown
+// check (per-region) sees this row.
 func (s *Service) execute(ctx context.Context, region string, workers []WorkerHeadroom, d Decision) {
 	ev := &domain.AutoscaleEvent{
 		Region:       region,
@@ -281,7 +295,7 @@ func (s *Service) execute(ctx context.Context, region string, workers []WorkerHe
 		s.log.Error("autoscale: insert event", "region", region, "err", err)
 	}
 	s.mu.Lock()
-	s.lastEvent = ev
+	s.lastEventByRegion[region] = ev
 	s.mu.Unlock()
 
 	if ev.Succeeded {

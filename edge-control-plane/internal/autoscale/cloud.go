@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 )
 
 // CloudProvider is the pluggable surface through which the autoscaler
@@ -88,10 +89,19 @@ func (n *NoopCloudProvider) Deprovision(_ context.Context, region, workerID stri
 // Each method delegates to its function field; unset fields return
 // zero values. Mirrors the pattern at
 // `internal/service/worker_test.go:14-25`.
+//
+// ProvisionCount / DeprovisionCount are atomic counters incremented
+// after the corresponding function-field call returns. Tests that
+// need to wait for activity can poll these directly via
+// ProvisionCalls() / DeprovisionCalls() without resorting to a
+// package-level atomic.
 type MockCloudProvider struct {
 	KindFunc        func() string
 	ProvisionFunc   func(ctx context.Context, region string) (string, error)
 	DeprovisionFunc func(ctx context.Context, region, workerID string) error
+
+	provisionCount     atomic.Int64
+	deprovisionCount   atomic.Int64
 }
 
 func (m *MockCloudProvider) Kind() string {
@@ -102,22 +112,44 @@ func (m *MockCloudProvider) Kind() string {
 }
 
 func (m *MockCloudProvider) Provision(ctx context.Context, region string) (string, error) {
-	if m.ProvisionFunc == nil {
-		return "", nil
+	var (
+		id  string
+		err error
+	)
+	if m.ProvisionFunc != nil {
+		id, err = m.ProvisionFunc(ctx, region)
 	}
-	return m.ProvisionFunc(ctx, region)
+	m.provisionCount.Add(1)
+	return id, err
 }
 
 func (m *MockCloudProvider) Deprovision(ctx context.Context, region, workerID string) error {
-	if m.DeprovisionFunc == nil {
-		return nil
+	var err error
+	if m.DeprovisionFunc != nil {
+		err = m.DeprovisionFunc(ctx, region, workerID)
 	}
-	return m.DeprovisionFunc(ctx, region, workerID)
+	m.deprovisionCount.Add(1)
+	return err
+}
+
+// ProvisionCalls returns the number of times Provision has been
+// invoked. Safe to call from any goroutine.
+func (m *MockCloudProvider) ProvisionCalls() int64 {
+	return m.provisionCount.Load()
+}
+
+// ResetCounters zeroes the Provision / Deprovision counters. Useful
+// when reusing a single MockCloudProvider across subtests.
+func (m *MockCloudProvider) ResetCounters() {
+	m.provisionCount.Store(0)
+	m.deprovisionCount.Store(0)
 }
 
 // NewCloudProvider returns a CloudProvider based on `kind`. Today
-// only "noop" and "mock" are supported; an unknown kind returns an
-// error so the autoscaler refuses to start with a typo'd config.
+// only "noop" is supported; an unknown kind returns an error so the
+// autoscaler refuses to start with a typo'd config (or with
+// "mock", which was an early dev placeholder that never wired up to
+// anything — tests construct MockCloudProvider directly).
 //
 // Future kinds (hetzner, aws, gcp) land in separate follow-up PRs
 // and add a `case` here.
@@ -125,13 +157,7 @@ func NewCloudProvider(kind string, log *slog.Logger) (CloudProvider, error) {
 	switch kind {
 	case "", "noop":
 		return NewNoopCloudProvider(log), nil
-	case "mock":
-		// Tests construct the MockCloudProvider directly so they can
-		// wire their own function fields. We return one here only so
-		// config-driven "provider_kind: mock" compiles in dev; the
-		// returned instance will return zero values from all calls.
-		return &MockCloudProvider{}, nil
 	default:
-		return nil, fmt.Errorf("autoscale: unknown provider_kind %q (supported: noop, mock)", kind)
+		return nil, fmt.Errorf("autoscale: unknown provider_kind %q (supported: noop)", kind)
 	}
 }

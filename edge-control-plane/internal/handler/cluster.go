@@ -42,9 +42,14 @@ func (h *ClusterHandler) Get(w http.ResponseWriter, r *http.Request) {
 // Query parameters:
 //   - `region` (optional): restrict to one region. Empty = all regions.
 //   - `limit`  (optional): 1..500, default 50. Clamped server-side.
+//
+// We intentionally don't share parseLimitParam with the logs handler
+// (handler/logs.go) — that handler surfaces parse errors as 400s,
+// while this one silently substitutes the default. Different
+// contracts; inlining keeps each handler's policy visible.
 func (h *ClusterHandler) Events(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
-	limit := parseLimitQuery(r.URL.Query().Get("limit"), 50)
+	limit := parseEventsLimit(r.URL.Query().Get("limit"), 50)
 	list, err := h.clusterSvc.RecentEvents(r.Context(), region, limit)
 	if err != nil {
 		log.Printf("internal error: %v", err)
@@ -57,11 +62,10 @@ func (h *ClusterHandler) Events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parseLimitQuery parses a `?limit=N` query string. Returns `def` when
-// empty, missing, malformed, negative, or zero. The service layer
-// also clamps to a sane upper bound (500) — parseLimitQuery only
-// handles the "what does the user mean" half of that.
-func parseLimitQuery(raw string, def int) int {
+// parseEventsLimit parses a `?limit=N` query string for the events
+// endpoint. Returns `def` when empty, malformed, negative, or zero.
+// The service layer additionally clamps to [1, 500].
+func parseEventsLimit(raw string, def int) int {
 	if raw == "" {
 		return def
 	}
