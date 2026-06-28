@@ -90,6 +90,110 @@ impl TrafficSplitCache {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_weight_known_deployment() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update(
+            "t1".into(),
+            "app".into(),
+            HashMap::from([("d1".into(), 80u8)]),
+        );
+        assert_eq!(cache.weight("t1", "app", "d1"), Some(80));
+    }
+
+    #[test]
+    fn test_weight_unknown_app() {
+        let cache = TrafficSplitCache::default();
+        assert_eq!(cache.weight("t1", "unknown", "d1"), None);
+    }
+
+    #[test]
+    fn test_weight_unknown_deployment() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update(
+            "t1".into(),
+            "app".into(),
+            HashMap::from([("d1".into(), 50u8)]),
+        );
+        assert_eq!(cache.weight("t1", "app", "missing"), None);
+    }
+
+    #[test]
+    fn test_has_split_fresh() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update("t1".into(), "app".into(), HashMap::new());
+        assert!(cache.has_split("t1", "app"));
+    }
+
+    #[test]
+    fn test_has_split_unknown() {
+        let cache = TrafficSplitCache::default();
+        assert!(!cache.has_split("unknown", "app"));
+    }
+
+    #[test]
+    fn test_update_replaces() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update(
+            "t1".into(),
+            "app".into(),
+            HashMap::from([("d1".into(), 100u8)]),
+        );
+        cache.update(
+            "t1".into(),
+            "app".into(),
+            HashMap::from([("d1".into(), 50u8)]),
+        );
+        assert_eq!(cache.weight("t1", "app", "d1"), Some(50));
+    }
+
+    #[test]
+    fn test_update_also_sets_has_split() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update("t1".into(), "app".into(), HashMap::new());
+        assert!(cache.has_split("t1", "app"));
+    }
+
+    #[test]
+    fn test_evict_stale_keeps_fresh() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update(
+            "t1".into(),
+            "app".into(),
+            HashMap::from([("d1".into(), 80u8)]),
+        );
+        cache.evict_stale();
+        // Fresh entry (30s TTL, test runs in microseconds) survives
+        assert_eq!(cache.weight("t1", "app", "d1"), Some(80));
+    }
+
+    #[test]
+    fn test_known_apps_returns_all() {
+        let mut cache = TrafficSplitCache::default();
+        cache.update("t1".into(), "a".into(), HashMap::new());
+        cache.update("t2".into(), "b".into(), HashMap::new());
+        let mut apps = cache.known_apps();
+        apps.sort();
+        assert_eq!(
+            apps,
+            vec![
+                ("t1".to_string(), "a".to_string()),
+                ("t2".to_string(), "b".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_known_apps_empty() {
+        let cache = TrafficSplitCache::default();
+        assert!(cache.known_apps().is_empty());
+    }
+}
+
 /// Outcome of a single traffic-split fetch. The spawn_fetcher loop uses
 /// `Unauthorized` to flag `EDGE_INTERNAL_TOKEN` misconfiguration: the
 /// ingress can't talk to the control plane's internal endpoints at all,
