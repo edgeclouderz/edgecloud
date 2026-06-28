@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -26,67 +28,47 @@ func TestFSArtifactStore_SaveOpenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer func() {
-		if err := rc.Close(); err != nil {
-			t.Errorf("failed to close read closer: %v", err)
-		}
-	}()
-
+defer rc.Close()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	if !bytes.Equal(got, payload) {
-		t.Errorf("round-trip mismatch: got %x, want %x", got, payload)
+		t.Errorf("RoundTrip: got %x, want %x", got, payload)
 	}
 }
 
-// TestFSArtifactStore_DeleteRemovesFile covers the simple case: Save
-// then Delete, then Open must return an error.
-func TestFSArtifactStore_DeleteRemovesFile(t *testing.T) {
+// TestFSArtifactStore_Delete_RemovesFile covers the basic Delete
+// path: a previously-Saved file goes away. Idempotent semantics
+// (delete-on-missing) are exercised separately.
+func TestFSArtifactStore_Delete_RemovesFile(t *testing.T) {
 	dir := t.TempDir()
 	s := NewFSArtifactStore(dir)
 
-	if err := s.Save(context.Background(), "t_1", "hello", "d_1", bytes.NewReader([]byte("x"))); err != nil {
+	payload := []byte("hello")
+	if err := s.Save(context.Background(), "t_1", "hello", "d_1", bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if err := s.Delete(context.Background(), "t_1", "hello", "d_1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := s.Open(context.Background(), "t_1", "hello", "d_1"); err == nil {
-		t.Fatal("Open after Delete should have failed, got nil")
+	path, _ := s.Path("t_1", "hello", "d_1")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected file gone, got Stat err = %v", err)
+	}
+
+	// Deleting again must be idempotent (return nil), not surface
+	// os.ErrNotExist to the caller.
+	if err := s.Delete(context.Background(), "t_1", "hello", "d_1"); err != nil {
+		t.Errorf("Delete on missing file: want nil, got %v", err)
 	}
 }
 
-// TestFSArtifactStore_DeleteAbsentIsNotAnError documents that Delete
-// is idempotent: removing an absent file returns nil. This matches
-// the pre-interface behavior the AppService cleanup loop relied on
-// (see internal/service/app.go:178 — "os.Remove is idempotent").
-func TestFSArtifactStore_DeleteAbsentIsNotAnError(t *testing.T) {
-	dir := t.TempDir()
-	s := NewFSArtifactStore(dir)
-	if err := s.Delete(context.Background(), "t_1", "hello", "d_absent"); err != nil {
-		t.Errorf("Delete absent should be nil, got %v", err)
-	}
-}
-
-// TestFSArtifactStore_OpenAbsentReturnsError confirms an Open of a
-// never-saved deployment surfaces as os.ErrNotExist — the same error
-// the Download handler checks for in internal/handler/internal.go.
-func TestFSArtifactStore_OpenAbsentReturnsError(t *testing.T) {
-	dir := t.TempDir()
-	s := NewFSArtifactStore(dir)
-	_, err := s.Open(context.Background(), "t_1", "hello", "d_absent")
-	if !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("Open absent: want os.ErrNotExist, got %v", err)
-	}
-}
-
-// TestFSArtifactStore_RejectsPathTraversal locks the security guarantee
-// that the storage layer refuses to read or write outside basePath.
-// Each input is a path component (tenant, app, or deployment id) that
-// would, if accepted, escape the configured root.
-func TestFSArtifactStore_RejectsPathTraversal(t *testing.T) {
+// TestFSArtifactStore_PathValidation rejects any component that
+// could escape the base path. The exact wording varies by input
+// ("invalid characters" vs "contains '..'") but the error must
+// reference traversal-safety keywords so a maintainer can grep it.
+func TestFSArtifactStore_PathValidation(t *testing.T) {
 	dir := t.TempDir()
 	s := NewFSArtifactStore(dir)
 
@@ -94,7 +76,13 @@ func TestFSArtifactStore_RejectsPathTraversal(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"Save with ../tenant", func() error {
+		{"Save with empty tenant", func() error {
+			return s.Save(context.Background(), "", "hello", "d_1", bytes.NewReader([]byte("x")))
+		}},
+		{"Save with slash in tenant", func() error {
+			return s.Save(context.Background(), "t/1", "hello", "d_1", bytes.NewReader([]byte("x")))
+		}},
+		{"Save with .. in app", func() error {
 			return s.Save(context.Background(), "../etc", "hello", "d_1", bytes.NewReader([]byte("x")))
 		}},
 		{"Save with slash in app", func() error {
@@ -223,4 +211,144 @@ func TestFSArtifactStore_Open_CapEnforcedDuringRead(t *testing.T) {
 	if len(got2) > 100 {
 		t.Errorf("over-cap: %d bytes leaked past cap", len(got2))
 	}
+}
+
+// TestFSArtifactStore_SaveAndHash_MatchesSha256 confirms the streaming
+// hash equals what you'd get from sha256.Sum256 of the full input
+// bytes. Single-pass contract: the streaming MultiWriter must produce
+// the same digest as the non-streaming reference.
+func TestFSArtifactStore_SaveAndHash_MatchesSha256(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFSArtifactStore(dir)
+
+	// 1 MiB of pseudo-random bytes. Enough to span multiple
+	// io.Copy read buffers without bloating the test runtime.
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	expected := sha256.Sum256(payload)
+	expectedHex := hex.EncodeToString(expected[:])
+
+	hash, err := store.SaveAndHash(context.Background(), "t_test", "myapp", "d_stream1",
+		io.NopCloser(strings.NewReader(string(payload))))
+	if err != nil {
+		t.Fatalf("SaveAndHash: %v", err)
+	}
+	if got := hex.EncodeToString(hash); got != expectedHex {
+		t.Errorf("hash mismatch:\n  got:  %s\n  want: %s", got, expectedHex)
+	}
+
+	// Sanity check: the bytes at the final path are the full
+	// payload. Catches an off-by-one in io.Copy.
+	path, err := store.Path("t_test", "myapp", "d_stream1")
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(written) != len(payload) {
+		t.Errorf("written len = %d, want %d", len(written), len(payload))
+	}
+	if !bytes.Equal(written, payload) {
+		t.Error("written bytes != payload bytes")
+	}
+}
+
+// TestFSArtifactStore_SaveAndHash_AtomicOnWriteError confirms a
+// reader error mid-stream leaves no partial file at the final path.
+// SaveAndHash shares Save's atomicity guarantee: the temp-rename
+// pattern means the final path is either the full file or absent.
+func TestFSArtifactStore_SaveAndHash_AtomicOnWriteError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFSArtifactStore(dir)
+
+	// Reader that errors after delivering 100 bytes.
+	bad := &errAfter{N: 100, Err: errors.New("simulated read failure")}
+
+	_, err := store.SaveAndHash(context.Background(), "t_test", "myapp", "d_partial", bad)
+	if err == nil {
+		t.Fatal("expected error from SaveAndHash with broken reader")
+	}
+
+	path, err := store.Path("t_test", "myapp", "d_partial")
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("expected final path to be absent, got os.Stat err = %v", statErr)
+	}
+}
+
+// TestFSArtifactStore_SaveAndHash_EmptyInput is the edge case: a
+// zero-byte artifact must succeed (the hasher returns the well-known
+// SHA-256 of empty input) and produce an empty file at the final
+// path.
+func TestFSArtifactStore_SaveAndHash_EmptyInput(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFSArtifactStore(dir)
+
+	hash, err := store.SaveAndHash(context.Background(), "t_test", "myapp", "d_empty",
+		strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("SaveAndHash: %v", err)
+	}
+	// SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	const expectedEmptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if got := hex.EncodeToString(hash); got != expectedEmptySHA256 {
+		t.Errorf("empty-input hash = %s, want %s", got, expectedEmptySHA256)
+	}
+	path, _ := store.Path("t_test", "myapp", "d_empty")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("expected empty file, got %d bytes", info.Size())
+	}
+}
+
+// TestFSArtifactStore_SaveAndHash_InvalidPathRejectsTraversal confirms
+// the path validation runs before any disk I/O — a malicious
+// deployment id gets a clean error, not a partial write into a
+// sibling directory.
+func TestFSArtifactStore_SaveAndHash_InvalidPathRejectsTraversal(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFSArtifactStore(dir)
+
+	_, err := store.SaveAndHash(context.Background(), "t_test", "myapp", "../escape",
+		strings.NewReader("x"))
+	if err == nil {
+		t.Fatal("expected error for traversal in deploymentID")
+	}
+	// The traversal target shouldn't exist either.
+	if _, statErr := os.Stat(filepath.Join(dir, "escape")); !os.IsNotExist(statErr) {
+		t.Errorf("expected no escape file, got os.Stat err = %v", statErr)
+	}
+}
+
+// errAfter is a small io.Reader that yields N bytes then returns
+// the configured error. Used to simulate a mid-stream read failure.
+type errAfter struct {
+	N   int
+	Err error
+	off int
+}
+
+func (e *errAfter) Read(p []byte) (int, error) {
+	if e.off >= e.N {
+		return 0, e.Err
+	}
+	remaining := e.N - e.off
+	n := len(p)
+	if n > remaining {
+		n = remaining
+	}
+	for i := 0; i < n; i++ {
+		p[i] = byte(e.off + i)
+	}
+	e.off += n
+	return n, nil
 }

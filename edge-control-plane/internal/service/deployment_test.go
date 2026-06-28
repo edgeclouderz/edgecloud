@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -33,15 +34,15 @@ func newDeploymentMockDB(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
 // not to validate the full module.
 var validWasmBytes = []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
 
-// TestDeploy_RejectsNonWasmBytes exercises the validateWasm guard added
-// in Commit 4. Without the guard, a non-wasm payload would be hashed,
-// stored on disk, and shipped to workers — failing only at execution
-// time and wasting storage on broken deployments.
+// TestDeploy_RejectsNonWasmBytes exercises the 4-byte magic-byte
+// peek inside the tx callback. Without the peek, a non-wasm payload
+// would be hashed, stored on disk, and shipped to workers — failing
+// only at execution time and wasting storage on broken deployments.
 //
-// The test sets up sqlmock expectations for everything Deploy does up
-// to the validateWasm check (quota lookup, deployment count) and then
-// asserts that the deployment INSERT is NOT issued: the guard fires
-// first, returning a clear error.
+// The test sets up sqlmock expectations for everything Deploy does
+// up to the tx (quota lookup, deployment count, Begin), then asserts
+// that the tx is rolled back (Rollback) and the deployment INSERT is
+// NOT issued: the magic-byte peek fails first, returning ErrInvalidWasm.
 func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	db, mock, cleanup := newDeploymentMockDB(t)
 	defer cleanup()
@@ -54,17 +55,17 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
 
-	// CountByApp is the second DB call. The actual query is
-	// "SELECT COUNT(*) FROM deployments WHERE tenant_id = $1 AND app_name = $2".
+	// CountByApp is the second DB call.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// The deployment INSERT and artifact save MUST NOT be called. If
-	// sqlmock sees an unmatched INSERT, ExpectationsWereMet below will
-	// fail with a clear message.
+	// The tx begins, the magic-byte peek fails, the tx rolls back.
+	mock.ExpectBegin()
+	mock.ExpectRollback()
 
 	svc := &DeploymentService{
+		db:             db, // enable the tx-wrap path
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
@@ -75,22 +76,19 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
-	if !strings.Contains(err.Error(), "magic bytes") {
-		t.Errorf("error %q should mention 'magic bytes'", err.Error())
+	if !errors.Is(err, ErrInvalidWasm) {
+		t.Errorf("err = %v, want errors.Is(err, ErrInvalidWasm) == true", err)
 	}
 
-	// Allow the quota + count queries to be considered "consumed" — the
-	// test cares that the deployment INSERT was NOT issued, not that
-	// the quota/count queries were perfectly matched.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 
 // TestDeploy_AcceptsWasmBytes sanity-checks the happy path: a payload
-// that starts with the wasm magic bytes passes the guard and proceeds
-// to the deployment INSERT. The test does not assert storage behavior
-// beyond the DB call (artifact save writes to t.TempDir()).
+// that starts with the wasm magic bytes passes the peek and proceeds
+// to the deployment INSERT inside the tx. The test asserts the tx
+// commits (Begin + INSERT + Commit).
 func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	db, mock, cleanup := newDeploymentMockDB(t)
 	defer cleanup()
@@ -104,10 +102,13 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	svc := &DeploymentService{
+		db:             db, // enable the tx-wrap path
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
@@ -123,6 +124,9 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 	if !time.Now().After(dep.CreatedAt.Add(-1 * time.Minute)) {
 		t.Errorf("deployment.CreatedAt = %v, want recent", dep.CreatedAt)
+	}
+	if dep.Hash == "" {
+		t.Error("deployment.Hash = \"\", want populated (SaveAndHash should set it)")
 	}
 }
 
@@ -264,10 +268,13 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	svc := &DeploymentService{
+		db:             db, // enable the tx-wrap path
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
@@ -288,5 +295,130 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 	}
 	if dep == nil || !strings.HasPrefix(dep.ID, "d_") {
 		t.Errorf("deployment.ID = %v, want prefix 'd_'", dep)
+	}
+}
+
+// TestDeploy_ArtifactSaveFailure_TxRollsBack verifies that when the
+// artifact save fails inside the tx callback, the deployment row
+// INSERT is never issued — the tx rolls back, which is the only
+// rollback needed. The pre-Commit-2 compensating DELETE FROM
+// deployments is no longer required.
+//
+// Order inside the tx callback: peek magic → SaveAndHash → Create.
+// SaveAndHash fails (MkdirAll: parent is a file), so Create never
+// runs. The tx aborts and the deployment row is implicitly gone —
+// there was never a row to compensate.
+func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	// Quota lookup happens first.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// Tx begins; SaveAndHash fails; tx rolls back. NO INSERT INTO
+	// deployments — the failure happens before Create is reached.
+	mock.ExpectBegin()
+	mock.ExpectRollback()
+
+	// Artifact store pointed at a path that does not exist and
+	// cannot be created (parent is a file, not a directory).
+	tmpDir := t.TempDir()
+	blocker := tmpDir + "/blocker"
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	badDir := blocker + "/subdir"
+
+	svc := &DeploymentService{
+		db:             db, // enable the tx-wrap path
+		deploymentRepo: repository.NewDeploymentRepository(db),
+		quotaRepo:      repository.NewQuotaRepository(db),
+		artifactStore:  storage.NewFSArtifactStore(badDir),
+	}
+
+	good := bytes.NewReader(validWasmBytes)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	if err == nil {
+		t.Fatal("expected Deploy to fail when artifact save fails")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow pins the
+// Commit-3 invariant: when SaveAndHash fails inside the tx, the
+// apps row inserted by CreateIfNotExists must also be cleaned up
+// (best-effort, guarded by NOT EXISTS to be safe under concurrent
+// deploys). Without this, a failed first deploy would orphan the
+// apps row forever, counting against the tenant's max_apps quota.
+//
+// sqlmock expectations in order:
+//   1. CreateIfNotExists: SELECT COUNT(*) FROM apps + INSERT INTO apps
+//   2. Deploy: SELECT quota + SELECT count
+//   3. Tx: Begin; SaveAndHash fails; Rollback
+//   4. POST-tx apps-row cleanup: DELETE FROM apps (NOT EXISTS guard)
+func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	// CreateIfNotExists: count-by-tenant (under the SELECT FOR UPDATE tx).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"xmax"}).AddRow(true))
+
+	// DeploymentService.Deploy: quota + count lookups, then tx begins.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// Tx begins; SaveAndHash fails; tx rolls back.
+	mock.ExpectBegin()
+	mock.ExpectRollback()
+	// Apps-row cleanup AFTER the failed tx — guarded DELETE with
+	// NOT EXISTS subquery. The repo uses GetContext with
+	// `RETURNING true`, so this is a Query, not an Exec.
+	mock.ExpectQuery(regexp.QuoteMeta(`DELETE FROM apps`)).
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+
+	// Artifact save fails at MkdirAll because the parent is a file.
+	tmpDir := t.TempDir()
+	blocker := tmpDir + "/blocker"
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	badDir := blocker + "/subdir"
+
+	appSvc := &AppService{
+		appRepo:   repository.NewAppRepository(db),
+		quotaRepo: &mockQuotaRepoForApps{},
+	}
+
+	svc := &DeploymentService{
+		db:             db, // enable the tx-wrap path
+		deploymentRepo: repository.NewDeploymentRepository(db),
+		quotaRepo:      repository.NewQuotaRepository(db),
+		artifactStore:  storage.NewFSArtifactStore(badDir),
+		appSvc:         appSvc,
+	}
+
+	good := bytes.NewReader(validWasmBytes)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	if err == nil {
+		t.Fatal("expected Deploy to fail when artifact save fails")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (apps-row cleanup may be missing): %v", err)
 	}
 }
