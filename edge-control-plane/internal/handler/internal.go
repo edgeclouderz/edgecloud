@@ -260,7 +260,9 @@ func (h *InternalHandler) ListDomains(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(domains)
+	if err := json.NewEncoder(w).Encode(domains); err != nil {
+		log.Printf("ListDomains: failed to encode response: %v", err)
+	}
 }
 
 // TlsAllowed handles GET /api/internal/tls-allowed?fqdn=X — Caddy's
