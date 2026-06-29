@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 use std::sync::Mutex as StdMutex;
+#[cfg(feature = "filesystem")]
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 pub struct RuntimeState {
     pub http_client: http_client::HttpClient,
@@ -66,6 +68,24 @@ pub struct RuntimeState {
     /// `next_outgoing_rep` (which misleadingly suggested outgoing-only).
     #[cfg(any(feature = "http-client", feature = "http-server"))]
     pub next_stream_rep: AtomicU32,
+    /// WASI resource handle table required by wasmtime_wasi::WasiView.
+    #[cfg(feature = "filesystem")]
+    pub wasi_table: ResourceTable,
+    /// WASI context holding preopened directories and stdio config.
+    /// Built per-tenant in `make_wasi_ctx_for_tenant`; empty when
+    /// `EDGE_FS_SCRATCH_PATH` is unset.
+    #[cfg(feature = "filesystem")]
+    pub wasi_ctx: WasiCtx,
+}
+
+#[cfg(feature = "filesystem")]
+impl WasiView for RuntimeState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.wasi_table
+    }
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi_ctx
+    }
 }
 
 impl RuntimeState {
@@ -97,6 +117,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table: ResourceTable::new(),
+            #[cfg(feature = "filesystem")]
+            wasi_ctx: WasiCtxBuilder::new().build(),
         }
     }
 
@@ -125,6 +149,8 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "filesystem")]
+        let (wasi_table, wasi_ctx) = Self::make_wasi_ctx_for_tenant(&tenant_id);
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -144,6 +170,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table,
+            #[cfg(feature = "filesystem")]
+            wasi_ctx,
         }
     }
 
@@ -170,6 +200,8 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "filesystem")]
+        let (wasi_table, wasi_ctx) = Self::make_wasi_ctx_for_tenant(&tenant_id);
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -189,6 +221,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table,
+            #[cfg(feature = "filesystem")]
+            wasi_ctx,
         }
     }
 
@@ -241,6 +277,44 @@ impl RuntimeState {
                 Arc::new(cache::Cache::new(1000))
             }
         }
+    }
+
+    /// Build a WasiCtx with a per-tenant preopened scratch directory.
+    /// Reads `EDGE_FS_SCRATCH_PATH` from the host environment; falls back to
+    /// an empty context (no preopens) when the var is absent or the directory
+    /// cannot be opened.  The caller already validated `tenant_id` via
+    /// `is_safe_tenant_id` before constructing `RuntimeState`.
+    #[cfg(feature = "filesystem")]
+    fn make_wasi_ctx_for_tenant(tenant_id: &str) -> (ResourceTable, WasiCtx) {
+        use crate::interfaces::filesystem::scratch_dir_for_tenant;
+        use wasmtime_wasi::{DirPerms, FilePerms};
+
+        let table = ResourceTable::new();
+        let scratch = match scratch_dir_for_tenant(tenant_id) {
+            Ok(Some(path)) => Some(path),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(
+                    tenant_id,
+                    "filesystem preopen unavailable, guest will see empty FS: {}",
+                    e
+                );
+                None
+            }
+        };
+        let mut builder = WasiCtxBuilder::new();
+        if let Some(path) = scratch {
+            // preopened_dir(host_path, guest_path, dir_perms, file_perms)
+            if let Err(e) = builder.preopened_dir(&path, "/", DirPerms::all(), FilePerms::all()) {
+                tracing::error!(
+                    tenant_id,
+                    "failed to configure tenant scratch dir {:?}: {}",
+                    path,
+                    e
+                );
+            }
+        }
+        (table, builder.build())
     }
 
     /// Returns `Some(code)` if the guest WASM component called `process.exit(code)`,
