@@ -46,7 +46,7 @@
 //! is documented as a future enhancement. For a log pipeline
 //! duplicate lines are far less harmful than lost ones.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -225,6 +225,13 @@ pub struct LogForwarder {
     /// batches are dropped (FIFO) to make room for new failures.
     /// Default 1 GiB; overridden by `Config::spool_max_bytes`.
     spool_max_bytes: u64,
+    /// Counts body-drain failures (network reset during body read,
+    /// timeout). Operators correlate this with reqwest pool-exhaustion
+    /// metrics and sustained 5xx storms.
+    // TODO: plumb drain_failures_total into the heartbeat payload so
+    // operators see the counter without grepping logs. Tracking as a
+    // follow-up issue.
+    drain_failures_total: AtomicU64,
 }
 
 impl LogForwarder {
@@ -257,6 +264,7 @@ impl LogForwarder {
             flush_in_flight: AtomicBool::new(false),
             spool,
             spool_max_bytes,
+            drain_failures_total: AtomicU64::new(0),
         });
 
         // Drain any batches that the previous worker instance left on
@@ -521,11 +529,32 @@ impl LogForwarder {
                 // metrics. The connection may not return to the pool
                 // cleanly, defeating the original pool-exhaustion fix
                 // (commit d7cf342) under network-partition conditions.
-                if let Err(e) = resp.bytes().await {
-                    tracing::warn!(
-                        err = %e,
-                        "log_forwarder: failed to drain response body; connection may be leaked"
-                    );
+                // PR #165 review finding F4: bound the body drain with a 5s timeout
+                // so a hung server can't block the flush loop. Increment
+                // `drain_failures_total` on either an IO error or a
+                // timeout — operators correlate with reqwest pool
+                // exhaustion under sustained 5xx / network partition.
+                // The connection may not return to the pool cleanly in
+                // either case (commit d7cf342 closed the common path;
+                // this is the residual edge case).
+                const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+                match tokio::time::timeout(DRAIN_TIMEOUT, resp.bytes()).await {
+                    Ok(Ok(_)) => { /* drained cleanly */ }
+                    Ok(Err(e)) => {
+                        self.drain_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            err = %e,
+                            "log_forwarder: failed to drain response body; connection may be leaked"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        self.drain_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "log_forwarder: response body drain timed out after 5s; connection likely leaked"
+                        );
+                    }
                 }
                 if status.is_success() {
                     tracing::debug!(count, status = status.as_u16(), "logs flushed");
@@ -650,6 +679,14 @@ impl LogForwarder {
                 }
             }
         }
+    }
+
+    /// Test-only accessor for the body-drain failure counter.
+    /// Surfaced as a heartbeat field is a follow-up (see the field
+    /// doc comment).
+    #[cfg(test)]
+    pub(crate) fn drain_failures(&self) -> u64 {
+        self.drain_failures_total.load(Ordering::Relaxed)
     }
 }
 
@@ -2003,6 +2040,161 @@ mod tests {
         // but `drain` returned the contents — nothing to do here).
         // The tempdir is dropped at the end of the test; the spool
         // file is gone, so no leak.
+        std::mem::forget(dir);
+    }
+
+    #[tokio::test]
+    async fn flush_now_response_body_drain_times_out_on_hung_server() {
+        // PR #165 review finding F4: a hung server (headers sent but
+        // body never arrives) must not block the flush loop forever.
+        // The 5s body-drain timeout must fire and the counter must
+        // increment. We use a raw tokio TCP listener so we can send
+        // the response headers but never the body.
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Spawn a task that accepts one connection, reads the
+        // request, sends headers, and never sends the body.
+        let server_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            // Read until we see the end of headers (\r\n\r\n).
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Send headers that promise a body that will never arrive.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write headers");
+            // Keep the connection open but write nothing else.
+            // The tokio task sleeps to avoid the test closing the
+            // socket on drop; then it exits after 30s (much longer
+            // than the 5s drain timeout).
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = sock.shutdown().await;
+        });
+
+        // Build a client WITHOUT the test_client's 5s overall
+        // timeout — otherwise reqwest cancels before the drain code
+        // runs.
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("test reqwest client (no timeout)"),
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(
+            &format!("http://{addr}"),
+            "w_test",
+            "test-region",
+            signer,
+            client,
+            spool,
+            1u64 << 30,
+        )
+        .await;
+
+        f.push(record(LogLevel::Info, "x"), ctx());
+        assert_eq!(f.drain_failures(), 0);
+
+        // The drain timeout is 5s; flush_now must return well within
+        // 8s. We use 9s as the outer bound to keep CI stable.
+        let started = std::time::Instant::now();
+        let flush_result = tokio::time::timeout(Duration::from_secs(9), f.flush_now()).await;
+        let elapsed = started.elapsed();
+
+        let _ = flush_result; // flush_now returns Ok(()) regardless
+        assert!(
+            elapsed < Duration::from_secs(9),
+            "flush_now took {elapsed:?} — drain timeout (5s) did not fire"
+        );
+        assert!(
+            f.drain_failures() >= 1,
+            "drain_failures_total must increment on drain timeout"
+        );
+
+        server_task.abort();
+        std::mem::forget(dir);
+    }
+
+    #[tokio::test]
+    async fn flush_now_response_body_drain_counts_io_error() {
+        // PR #165 review finding F4: an IO error during body read must
+        // also increment the counter (not just timeouts). Use a raw
+        // TCP listener that closes the connection mid-body so
+        // resp.bytes() returns an IO error.
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Send headers advertising a 1MB body, send a few bytes,
+            // then RST the connection.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nhello",
+            )
+            .await
+            .expect("write headers");
+            sock.flush().await.ok();
+            // Drop the socket without a clean shutdown — TCP RST mid-body.
+            drop(sock);
+        });
+
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("test reqwest client"),
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(
+            &format!("http://{addr}"),
+            "w_test",
+            "test-region",
+            signer,
+            client,
+            spool,
+            1u64 << 30,
+        )
+        .await;
+
+        f.push(record(LogLevel::Info, "x"), ctx());
+        let _ = tokio::time::timeout(Duration::from_secs(5), f.flush_now()).await;
+        assert!(
+            f.drain_failures() >= 1,
+            "drain_failures_total must increment on body read IO error"
+        );
+
+        server_task.abort();
         std::mem::forget(dir);
     }
 }
