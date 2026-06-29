@@ -6,9 +6,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 )
 
@@ -33,6 +35,17 @@ func syncHandler(worker *domain.Worker, workerErr error, builder *fakeSyncBuilde
 		h.SetSyncBuilder(builder)
 	}
 	return h
+}
+
+// withSyncJWTTenant mirrors withWorkerCtx in internal_register_test.go:
+// attaches a worker-tenant-id to the request context the same way
+// middleware.WorkerAuth would after validating a real JWT. Tests that
+// drive the handler past the new cross-tenant authorization check
+// (e.g. the populated/empty/builder-error cases that actually reach
+// BuildFullSync) need this populated; tests that 4xx/5xx before that
+// check (nil-builder, missing-workerID, not-found, db-error) don't.
+func withSyncJWTTenant(r *http.Request, tenantID string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), middleware.WorkerTenantIDKey, tenantID))
 }
 
 // fakeWorkerSvcForSync is a separate type from the RegisterWorker
@@ -119,6 +132,7 @@ func TestSync_BuilderError_Returns500(t *testing.T) {
 	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"}, nil, &fakeSyncBuilder{err: errors.New("repo gone")})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWTTenant(req, "t_1")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -136,6 +150,7 @@ func TestSync_EmptyApps_ReturnsFullSyncEnvelopeWithEmptyMap(t *testing.T) {
 	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"}, nil, &fakeSyncBuilder{apps: nil})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWTTenant(req, "t_1")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -180,6 +195,7 @@ func TestSync_PopulatedApps_ReturnsPayload(t *testing.T) {
 	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "us-east"}, nil, &fakeSyncBuilder{apps: want})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWTTenant(req, "t_1")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -212,5 +228,66 @@ func TestSync_PopulatedApps_ReturnsPayload(t *testing.T) {
 	}
 	if parsed.DeploymentID != "d_1" || parsed.DeploymentHash != "abc" {
 		t.Errorf("parsed=%+v", parsed)
+	}
+}
+
+// TestSync_WrongTenant_Returns404 pins the cross-tenant
+// authorization check (review of PR #166, finding #1): a worker
+// authenticated as tenant A must NOT be able to fetch /sync for a
+// worker_id belonging to tenant B. Without this check, a compromised
+// worker JWT could enumerate other tenant workerIDs (they follow
+// the documented w_<region>_<n> prefix and are visible in
+// heartbeats) and pull tenant B's full app set — deployment IDs,
+// hashes, env vars, allowlists.
+//
+// Returns 404 (not 403) with the same body as the "worker not found"
+// branch so an attacker can't enumerate workerIDs by comparing
+// differential responses.
+func TestSync_WrongTenant_Returns404(t *testing.T) {
+	// workerSvc.Get returns a worker belonging to tenant B...
+	worker := &domain.Worker{ID: "w_B", TenantID: "t_B", Region: "global"}
+	h := syncHandler(worker, nil, &fakeSyncBuilder{})
+
+	// ...but the JWT is for tenant A.
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_B/sync", nil)
+	req.SetPathValue("workerID", "w_B")
+	req = withSyncJWTTenant(req, "t_A")
+	rr := httptest.NewRecorder()
+
+	h.Sync(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want 404 (cross-tenant request denied as not-found)", rr.Code)
+	}
+	// Body matches the "worker not found" branch so an attacker can't
+	// distinguish "real worker, wrong tenant" from "no such worker".
+	expected := `{"error": "worker not found"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != expected {
+		t.Errorf("body=%q, want %q", got, expected)
+	}
+}
+
+// TestSync_SameTenant_Allowed pins the positive path of finding #1:
+// a worker whose JWT matches the worker_id's tenant gets the
+// payload. (Two tests below exercise the wrong-tenant branch and
+// the unknown-worker branch; this one locks "same tenant, request
+// succeeds".)
+func TestSync_SameTenant_Allowed(t *testing.T) {
+	want := map[string]nats.AppConfig{
+		"myapp": {DeploymentID: "d_1", DeploymentHash: "abc"},
+	}
+	h := syncHandler(
+		&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"},
+		nil, &fakeSyncBuilder{apps: want},
+	)
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
+	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWTTenant(req, "t_1")
+	rr := httptest.NewRecorder()
+
+	h.Sync(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (same tenant allowed); body=%s", rr.Code, rr.Body.String())
 	}
 }
