@@ -43,6 +43,8 @@ pub fn is_safe_tenant_id(id: &str) -> bool {
 
 #[cfg(feature = "cache")]
 pub mod cache;
+#[cfg(feature = "filesystem")]
+pub mod filesystem;
 #[cfg(feature = "networking")]
 pub mod dns;
 #[cfg(feature = "http-client")]
