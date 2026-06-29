@@ -323,29 +323,51 @@ fn parse_env_string(name: &str) -> Option<String> {
 /// misconfigured test environment wants to see the worker start
 /// and log a clear failure rather than have it refuse to boot.
 fn parse_env_string_with_psk_check(name: &str) -> Option<String> {
-    let value = parse_env_string(name);
-    if let Some(psk) = &value {
-        let psk_len = psk.len();
-        if psk_len < MIN_BOOTSTRAP_PSK_BYTES {
-            // Bind the field values to locals so the format-string
-            // interpolation can reference them. `tracing::warn!` is
-            // happy with named local variables in the format string as
-            // long as a matching field is supplied — we do both for
-            // structured-log consumers.
-            let min_bytes = MIN_BOOTSTRAP_PSK_BYTES;
-            let env_var = name;
-            tracing::warn!(
-                bytes = psk_len,
-                min_bytes,
-                env_var,
-                "WORKER_BOOTSTRAP_PSK is shorter than the server-side \
-                 minimum ({min_bytes} bytes); every bootstrap POST will \
-                 return 401. Set {env_var} to a value of at least \
-                 {min_bytes} bytes.",
-            );
-        }
+    // F7 (PR #165 review): PSKs are commonly pasted from password
+    // managers, K8s Secrets, or shell heredocs and frequently pick
+    // up a stray leading/trailing newline or space. The server is
+    // strict-by-design — a one-byte mismatch is a 401 with a generic
+    // error message. Trim silently so the operator gets a working
+    // config, but warn loudly so the source of the mismatch is
+    // traceable from the worker logs.
+    let raw = parse_env_string(name)?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        // Whitespace-only — treat the same as "not configured".
+        return None;
     }
-    value
+    let original_len = raw.len();
+    let trimmed_len = trimmed.len();
+    let env_var = name;
+    if original_len != trimmed_len {
+        tracing::warn!(
+            original_len,
+            trimmed_len,
+            env_var,
+            "{env_var} contained leading/trailing whitespace; the \
+             trimmed value is being used for HMAC. Fix the env \
+             var to silence this warning.",
+        );
+    }
+    if trimmed_len < MIN_BOOTSTRAP_PSK_BYTES {
+        // Bind the field values to locals so the format-string
+        // interpolation can reference them. `tracing::warn!` is
+        // happy with named local variables in the format string as
+        // long as a matching field is supplied — we do both for
+        // structured-log consumers.
+        let min_bytes = MIN_BOOTSTRAP_PSK_BYTES;
+        let psk_len = trimmed_len;
+        tracing::warn!(
+            bytes = psk_len,
+            min_bytes,
+            env_var,
+            "WORKER_BOOTSTRAP_PSK is shorter than the server-side \
+             minimum ({min_bytes} bytes); every bootstrap POST will \
+             return 401. Set {env_var} to a value of at least \
+             {min_bytes} bytes.",
+        );
+    }
+    Some(trimmed)
 }
 
 #[cfg(test)]
@@ -970,6 +992,61 @@ mod tests {
             captured.last_level.is_none(),
             "32-byte PSK must NOT produce a warn event; got {:?}",
             captured.last_level
+        );
+    }
+
+    /// F7 (PR #165 review): the helper must trim leading/trailing
+    /// whitespace from the PSK without changing the wire contract.
+    /// PSKs are commonly pasted from password managers, K8s Secrets,
+    /// or shell heredocs and frequently pick up a stray newline or
+    /// space. Without trimming the worker would 401 against the
+    /// server forever; with silent trimming the operator can't tell
+    /// the source of the mismatch, so we emit a tracing::warn! when
+    /// trimming changed bytes.
+    #[test]
+    fn worker_bootstrap_psk_trims_leading_trailing_whitespace() {
+        let raw = "  0123456789abcdef0123456789abcdef  ";
+        let _env = EnvGuard::set("WORKER_BOOTSTRAP_PSK", raw);
+        let sink = Arc::new(StdMutex::new(CapturedWarn::default()));
+        let layer = CaptureLayer {
+            sink: Arc::clone(&sink),
+        };
+        let subscriber = Registry::default().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK")
+        });
+        assert_eq!(
+            result.as_deref(),
+            Some("0123456789abcdef0123456789abcdef"),
+            "trimmed PSK must be returned verbatim for HMAC"
+        );
+        let captured = sink.lock().unwrap().clone();
+        assert_eq!(
+            captured.last_level,
+            Some(tracing::Level::WARN),
+            "trimming whitespace must emit a WARN so operators can \
+             trace the source of the mismatch"
+        );
+        let msg = captured.last_message.unwrap_or_default();
+        assert!(
+            msg.contains("whitespace") || msg.contains("trimmed"),
+            "warn message should mention whitespace or trimming; got {msg:?}"
+        );
+    }
+
+    /// F7: whitespace-only input is not a PSK — treat it the same as
+    /// "not configured" (return None). This matches the existing
+    /// `parse_env_string` semantics for empty strings and avoids
+    /// opening a 401-loop with a 0-byte PSK.
+    #[test]
+    fn worker_bootstrap_psk_whitespace_only_is_none() {
+        let _env = EnvGuard::set("WORKER_BOOTSTRAP_PSK", "   \t\n  ");
+        let result = parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK");
+        assert!(
+            result.is_none(),
+            "whitespace-only PSK must be treated as not configured; \
+             got {:?}",
+            result
         );
     }
 }
