@@ -141,6 +141,7 @@ impl RuntimeState {
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
+        let deployment_id = app_ctx.deployment_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
@@ -150,7 +151,22 @@ impl RuntimeState {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
         #[cfg(feature = "filesystem")]
-        let (wasi_table, wasi_ctx) = Self::make_wasi_ctx_for_tenant(&tenant_id);
+        let (wasi_table, wasi_ctx) = match Self::make_wasi_ctx_for_deployment(
+            &tenant_id,
+            &deployment_id,
+            &env,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(
+                    tenant_id,
+                    deployment_id,
+                    "filesystem preopen failed, guest will see empty FS: {}",
+                    e
+                );
+                (ResourceTable::new(), WasiCtxBuilder::new().build())
+            }
+        };
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -192,6 +208,7 @@ impl RuntimeState {
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
+        let deployment_id = app_ctx.deployment_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
@@ -201,7 +218,19 @@ impl RuntimeState {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
         #[cfg(feature = "filesystem")]
-        let (wasi_table, wasi_ctx) = Self::make_wasi_ctx_for_tenant(&tenant_id);
+        let (wasi_table, wasi_ctx) =
+            match Self::make_wasi_ctx_for_deployment(&tenant_id, &deployment_id, &env) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(
+                        tenant_id,
+                        deployment_id,
+                        "filesystem preopen failed, guest will see empty FS: {}",
+                        e
+                    );
+                    (ResourceTable::new(), WasiCtxBuilder::new().build())
+                }
+            };
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -284,37 +313,29 @@ impl RuntimeState {
     /// an empty context (no preopens) when the var is absent or the directory
     /// cannot be opened.  The caller already validated `tenant_id` via
     /// `is_safe_tenant_id` before constructing `RuntimeState`.
+    /// Build a `(ResourceTable, WasiCtx)` for a specific deployment.
+    ///
+    /// - Reads `EDGE_FS_SCRATCH_PATH` to find the per-deployment scratch root.
+    /// - Forwards `env` into `wasi:cli/environment` so `std::env::var` works in guests.
+    /// - Propagates errors so callers can log and fall back to an empty context.
     #[cfg(feature = "filesystem")]
-    fn make_wasi_ctx_for_tenant(tenant_id: &str) -> (ResourceTable, WasiCtx) {
-        use crate::interfaces::filesystem::scratch_dir_for_tenant;
+    fn make_wasi_ctx_for_deployment(
+        tenant_id: &str,
+        deployment_id: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<(ResourceTable, WasiCtx)> {
+        use crate::interfaces::filesystem::scratch_dir_for_deployment;
         use wasmtime_wasi::{DirPerms, FilePerms};
 
         let table = ResourceTable::new();
-        let scratch = match scratch_dir_for_tenant(tenant_id) {
-            Ok(Some(path)) => Some(path),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!(
-                    tenant_id,
-                    "filesystem preopen unavailable, guest will see empty FS: {}",
-                    e
-                );
-                None
-            }
-        };
+        let scratch = scratch_dir_for_deployment(tenant_id, deployment_id)?;
         let mut builder = WasiCtxBuilder::new();
+        let env_pairs: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        builder.envs(&env_pairs);
         if let Some(path) = scratch {
-            // preopened_dir(host_path, guest_path, dir_perms, file_perms)
-            if let Err(e) = builder.preopened_dir(&path, "/", DirPerms::all(), FilePerms::all()) {
-                tracing::error!(
-                    tenant_id,
-                    "failed to configure tenant scratch dir {:?}: {}",
-                    path,
-                    e
-                );
-            }
+            builder.preopened_dir(&path, "/", DirPerms::all(), FilePerms::all())?;
         }
-        (table, builder.build())
+        Ok((table, builder.build()))
     }
 
     /// Returns `Some(code)` if the guest WASM component called `process.exit(code)`,
