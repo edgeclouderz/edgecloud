@@ -77,17 +77,38 @@ type StreamConfig struct {
 	Replicas  int
 }
 
+// applyTypeOverride returns a *TaskMessage with the given `type` field
+// set, preserving every other field from the input. Both the real
+// NATSPublisher and the MockPublisher call this so the wire shape is
+// guaranteed identical regardless of which publisher the operator
+// configured — and so the wire-format invariant has a single source of
+// truth (the override logic was previously only in
+// NATSPublisher.publishTaskMessage, and the mock printed whatever the
+// caller passed in; the two would diverge if a caller accidentally set
+// `Type: "task_update"` and called PublishFullSync through the mock).
+//
+// We snapshot rather than mutate so callers who hold a TaskMessage
+// pointer don't see their struct modified by the publish call.
+func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
+	return &TaskMessage{
+		Type:      typeField,
+		Timestamp: msg.Timestamp,
+		TenantID:  msg.TenantID,
+		Apps:      msg.Apps,
+	}
+}
+
 // MockPublisher is a no-op publisher for development.
 type MockPublisher struct{}
 
 func (p *MockPublisher) PublishTaskUpdate(region string, msg *TaskMessage) error {
-	data, _ := json.Marshal(msg)
+	data, _ := json.Marshal(applyTypeOverride(msg, "task_update"))
 	fmt.Printf("[NATS MOCK] Publish to edgecloud.tasks.%s: %s\n", region, string(data))
 	return nil
 }
 
 func (p *MockPublisher) PublishFullSync(region string, msg *TaskMessage) error {
-	data, _ := json.Marshal(msg)
+	data, _ := json.Marshal(applyTypeOverride(msg, "full_sync"))
 	fmt.Printf("[NATS MOCK] Publish to edgecloud.tasks.%s: %s\n", region, string(data))
 	return nil
 }
@@ -199,20 +220,11 @@ func (p *NATSPublisher) PublishFullSync(region string, msg *TaskMessage) error {
 }
 
 // publishTaskMessage marshals and publishes a TaskMessage, overriding the
-// `type` field. Pulled out of PublishTaskUpdate/PublishFullSync so the
-// subject+marshal+publish sequence is identical between the two and any
-// future stream shape change touches one place.
+// `type` field via applyTypeOverride (shared with MockPublisher so the
+// wire shape is identical regardless of which publisher the operator
+// configured).
 func (p *NATSPublisher) publishTaskMessage(subject string, msg *TaskMessage, typeField string) error {
-	// Snapshot the incoming type so we don't mutate the caller's struct
-	// (a future caller could legitimately hold a TaskMessage with
-	// Type="task_update" and pass it to PublishFullSync).
-	msg = &TaskMessage{
-		Type:      typeField,
-		Timestamp: msg.Timestamp,
-		TenantID:  msg.TenantID,
-		Apps:      msg.Apps,
-	}
-	data, err := json.Marshal(msg)
+	data, err := json.Marshal(applyTypeOverride(msg, typeField))
 	if err != nil {
 		return fmt.Errorf("marshaling task message: %w", err)
 	}
