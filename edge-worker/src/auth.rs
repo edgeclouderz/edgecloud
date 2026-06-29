@@ -250,8 +250,23 @@ impl WorkerJwtSigner {
             TokenSource::Callback(fetch) => {
                 let bundle = fetch()?;
                 let token: String = bundle.token;
+                // Mirror `with_seeded_token` (line ~184): do NOT fall back
+                // to `now + self.ttl` when the server returns an
+                // already-past `expires_at_unix`. Caching the expired
+                // token for ~23h would mask the server bug (or extreme
+                // clock skew) as persistent 401s on every WorkerAuth
+                // call, which downstream consumers treat as a generic
+                // retryable failure. Fail fast so the operator sees
+                // the cause.
                 let expires_at = bootstrap::derive_expires_at_instant(bundle.expires_at_unix)
-                    .unwrap_or(now + self.ttl);
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "WorkerJwtSigner: server returned JWT with \
+                             already-past expires_at_unix={}; treating as \
+                             server bug or extreme clock skew",
+                            bundle.expires_at_unix,
+                        )
+                    })?;
                 (token, expires_at)
             }
         };
@@ -554,6 +569,67 @@ mod tests {
             "expired seed must not stick; callback must fire"
         );
         assert_eq!(t, "callback-token-1");
+    }
+
+    #[test]
+    fn new_with_callback_errors_when_server_returns_past_expiry() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = WorkerJwtSigner::new_with_callback(
+            "edgecloud",
+            "w_fra_abc123",
+            "fra",
+            "t_tenant1",
+            {
+                let counter = counter.clone();
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(JwtBundle {
+                        token: "expired-token".to_string(),
+                        // 1970 — already past.
+                        expires_at_unix: 1_000,
+                    })
+                }
+            },
+        );
+        let err = s.sign().expect_err("must error on already-past expiry");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already-past"),
+            "error must mention already-past; got: {msg}"
+        );
+        assert!(
+            msg.contains("expires_at_unix"),
+            "error must mention the field name; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_with_callback_does_not_cache_when_server_returns_past_expiry() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = WorkerJwtSigner::new_with_callback(
+            "edgecloud",
+            "w_fra_abc123",
+            "fra",
+            "t_tenant1",
+            {
+                let counter = counter.clone();
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(JwtBundle {
+                        token: "expired-token".to_string(),
+                        expires_at_unix: 1_000,
+                    })
+                }
+            },
+        );
+        let _ = s.sign().expect_err("sign1 must error");
+        let _ = s.sign().expect_err("sign2 must error");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "no caching on past-expiry: callback must fire on every sign()"
+        );
     }
 
     // ----- Concurrency (finding B1) -----------------------------------
