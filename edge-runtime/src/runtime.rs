@@ -93,7 +93,7 @@ impl RuntimeState {
     /// unrestricted egress policy regardless of env vars.
     #[cfg(test)]
     pub fn new() -> Self {
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
@@ -142,7 +142,7 @@ impl RuntimeState {
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
         let deployment_id = app_ctx.deployment_id.clone();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -209,7 +209,7 @@ impl RuntimeState {
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
         let deployment_id = app_ctx.deployment_id.clone();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -308,16 +308,6 @@ impl RuntimeState {
         }
     }
 
-    /// Build a WasiCtx with a per-tenant preopened scratch directory.
-    /// Reads `EDGE_FS_SCRATCH_PATH` from the host environment; falls back to
-    /// an empty context (no preopens) when the var is absent or the directory
-    /// cannot be opened.  The caller already validated `tenant_id` via
-    /// `is_safe_tenant_id` before constructing `RuntimeState`.
-    /// Build a `(ResourceTable, WasiCtx)` for a specific deployment.
-    ///
-    /// - Reads `EDGE_FS_SCRATCH_PATH` to find the per-deployment scratch root.
-    /// - Forwards `env` into `wasi:cli/environment` so `std::env::var` works in guests.
-    /// - Propagates errors so callers can log and fall back to an empty context.
     #[cfg(feature = "filesystem")]
     fn make_wasi_ctx_for_deployment(
         tenant_id: &str,
@@ -339,10 +329,10 @@ impl RuntimeState {
     }
 
     /// Returns `Some(code)` if the guest WASM component called `process.exit(code)`,
-    /// `None` if no exit was requested.
+    /// `None` if no exit was requested. u32::MAX is the "never called" sentinel.
     pub fn exit_requested(&self) -> Option<u32> {
         let code = self.exit_code.load(Ordering::SeqCst);
-        if code == 0 {
+        if code == u32::MAX {
             None
         } else {
             Some(code)
