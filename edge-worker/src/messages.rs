@@ -96,7 +96,14 @@ pub struct AppSpec {
 }
 
 /// HeartbeatMessage: published to `edgecloud.heartbeats.<region>` every 30s.
+///
+/// `#[non_exhaustive]` blocks external crates from constructing this via
+/// struct literal — they must use [`HeartbeatMessage::new`] (or, for tests,
+/// the in-crate test helpers). Without this attribute, adding new fields
+/// would trip `cargo-semver-checks`' `constructible_struct_adds_field`
+/// rule. `#[non_exhaustive]` is the documented carve-out for that rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HeartbeatMessage {
     #[serde(rename = "type")]
     pub msg_type: String,

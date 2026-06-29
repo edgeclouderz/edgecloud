@@ -25,6 +25,13 @@ use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
 
 /// The main supervisor — manages all running apps for this worker node.
+///
+/// `#[non_exhaustive]` blocks external crates from constructing this via
+/// struct literal — they must use [`Supervisor::new`]. Without this
+/// attribute, adding new fields (e.g. `cpu_sample`) would trip
+/// `cargo-semver-checks`' `constructible_struct_adds_field` rule.
+/// `#[non_exhaustive]` is the documented carve-out for that rule.
+#[non_exhaustive]
 pub struct Supervisor {
     pub config: Config,
     pub state: Arc<RwLock<WorkerState>>,
@@ -55,6 +62,56 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// Construct a Supervisor with every field explicitly supplied.
+    ///
+    /// This is the canonical way to build a `Supervisor`. The struct is
+    /// `#[non_exhaustive]`, so external callers cannot use a struct
+    /// literal — they must go through this constructor. The constructor
+    /// was introduced to satisfy `cargo-semver-checks`'s
+    /// `constructible_struct_adds_field` rule: when new fields were
+    /// added to a previously-constructible pub struct, the rule flagged
+    /// the change as breaking. `#[non_exhaustive]` is the documented
+    /// carve-out that removes the baseline delta the rule looks for.
+    ///
+    /// `cpu_sample` should be a freshly-primed `CpuSample` from
+    /// `cpu_sample::CpuSample::new()` — production code creates it
+    /// once at startup and passes the same instance here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: Config,
+        state: Arc<RwLock<WorkerState>>,
+        downloader: Arc<Downloader>,
+        port_pool: Arc<Mutex<PortPool>>,
+        nats: Arc<dyn NatsClient>,
+        log_forwarder: Arc<LogForwarder>,
+        cpu_sample: CpuSample,
+    ) -> Self {
+        Self {
+            config,
+            state,
+            downloader,
+            port_pool,
+            nats,
+            log_forwarder,
+            cpu_sample,
+        }
+    }
+
+    /// Refresh the cached CPU sample and return the percentage in
+    /// `[0.0, 100.0]`, or `None` if the sampler hasn't completed its
+    /// first interval yet. Called from `build_heartbeat` to populate
+    /// `cluster_headroom.cpu_pct`.
+    ///
+    /// Exposed as a `pub(crate)` accessor (not a direct field read)
+    /// so external callers — `build_heartbeat` is the only consumer —
+    /// don't read the field directly. Direct field access would still
+    /// work (it's `pub`), but routing through the accessor makes the
+    /// intent explicit: "the sampler is private state of the
+    /// heartbeat builder, not a knob for callers to poke".
+    pub(crate) fn take_cpu_pct(&self) -> crate::cpu_sample::CpuPct {
+        self.cpu_sample.take()
+    }
+
     /// Handle an incoming TaskMessage from NATS.
     ///
     /// Diffs the desired app set against currently running apps and
@@ -852,7 +909,7 @@ impl Supervisor {
             pool.capacity_remaining()
         };
         msg.cluster_headroom = Some(ClusterHeadroom {
-            cpu_pct: self.cpu_sample.take(),
+            cpu_pct: self.take_cpu_pct(),
             mem_pct: None,
             app_slots,
         });
