@@ -219,6 +219,16 @@ impl Spool {
         // the file degenerates to "drain everything".
         let effective_limit = limit_bytes.filter(|n| *n > 0 && *n < total);
 
+        // F5 fix: the limited-drain branch captures both halves of a
+        // straddling line so the next drain reconstructs the original
+        // line. `dropped_head_suffix` holds the head half (dropped
+        // because `head_end` is line-aligned, truncating the partial
+        // line) and `dropped_tail_prefix` holds the tail half (dropped
+        // because the tail slice's first line is partial). Both are
+        // appended back to the head file after the rename.
+        let mut dropped_head_suffix: Vec<u8> = Vec::new();
+        let mut dropped_tail_prefix: Vec<u8> = Vec::new();
+
         let raw = if let Some(limit) = effective_limit {
             // Copy the head (the bytes we're NOT returning) back to
             // the active file via streaming copy. The active file
@@ -242,6 +252,41 @@ impl Spool {
             // batch's bytes in the tail slice will be the partial
             // first line and get dropped there.
             let head_end = find_last_newline_in_range(&mut head_src, head_bytes).await?;
+            // F5 fix: when the boundary lands mid-line, `head_end <
+            // head_bytes` — the bytes `[head_end..head_bytes]` are
+            // the HEAD half of the straddling line. The TAIL half is
+            // captured below as `dropped_tail_prefix`. We need both
+            // halves to reconstruct the line on the next drain.
+            //
+            // `find_last_newline_in_range` leaves `head_src`
+            // positioned at `head_bytes` (its internal `take` consumed
+            // exactly that many bytes), so seek back to `head_end`
+            // before reading the dropped head suffix.
+            dropped_head_suffix = if head_end < head_bytes {
+                head_src
+                    .seek(SeekFrom::Start(head_end))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "seek to head_end {} for dropped head suffix: {}",
+                            head_end,
+                            draining.display()
+                        )
+                    })?;
+                let mut buf = vec![0u8; (head_bytes - head_end) as usize];
+                head_src
+                    .read_exact(&mut buf)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "read dropped head suffix [{}, {}): {}",
+                            head_end, head_bytes, draining.display()
+                        )
+                    })?;
+                buf
+            } else {
+                Vec::new()
+            };
             // Rewind head_src to the start of the file so the
             // streaming copy below reads bytes 0..head_end.
             head_src
@@ -342,11 +387,23 @@ impl Spool {
             };
             if !at_line_boundary {
                 if let Some(skip) = buf.iter().position(|&b| b == b'\n').map(|i| i + 1) {
+                    // F5 fix: capture the dropped partial-line bytes
+                    // so we can write them back to the active file
+                    // (append, after the rename). The head file holds
+                    // `[0..head_end]` which is line-aligned; the tail
+                    // slice's dropped prefix is the FIRST part of the
+                    // straddling line. Appending it to the head file
+                    // reconstructs the original line for the next
+                    // drain. Prepending would break byte order — must
+                    // be append.
+                    dropped_tail_prefix = buf[..skip].to_vec();
                     buf.drain(..skip);
                 } else {
                     // No newline at all in the tail slice (limit < one
-                    // line). Emit nothing for this drain — the next
-                    // full drain will pick the line up.
+                    // line). The tail IS one partial line; keep it as
+                    // the dropped prefix so the next drain
+                    // reconstructs the full line.
+                    dropped_tail_prefix = buf.clone();
                     buf.clear();
                 }
             }
@@ -364,6 +421,53 @@ impl Spool {
                 }
             }
         };
+
+        // F5 fix: if the limited drain dropped halves of a straddling
+        // line (one from the head truncation, one from the tail
+        // prefix), append both back to the now-active spool file in
+        // their original byte order. The head file holds
+        // `[0..head_end]` (line-aligned); appending head-then-tail
+        // reconstructs the original line on the next drain.
+        // Prepending would break byte order — must be append.
+        if !dropped_head_suffix.is_empty() || !dropped_tail_prefix.is_empty() {
+            let mut append = tokio::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(&self.inner.path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "open active spool for dropped-suffix append: {}",
+                        self.inner.path.display()
+                    )
+                })?;
+            if !dropped_head_suffix.is_empty() {
+                tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_head_suffix)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "append head suffix to active spool: {}",
+                            self.inner.path.display()
+                        )
+                    })?;
+            }
+            if !dropped_tail_prefix.is_empty() {
+                tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_tail_prefix)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "append tail prefix to active spool: {}",
+                            self.inner.path.display()
+                        )
+                    })?;
+            }
+            tokio::io::AsyncWriteExt::flush(&mut append).await.with_context(|| {
+                format!(
+                    "flush active spool after dropped-suffix append: {}",
+                    self.inner.path.display()
+                )
+            })?;
+        }
 
         // Best-effort unlink. If this fails (e.g. transient I/O), the
         // file is still consumed and the next drain sees a missing
@@ -721,15 +825,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_with_limit_drops_line_that_straddles_split() {
+    async fn drain_with_limit_preserves_straddling_line_on_next_drain() {
+        // PR #165 review finding F5: the limited drain must capture
+        // the partial-line bytes that straddle the split and append
+        // them back to the active spool. The next drain then
+        // reconstructs the full line (head body = line-aligned prefix;
+        // appended bytes = dropped tail prefix; together they form
+        // the original line in byte order).
         let (_dir, spool) = fresh_spool().await;
 
-        // 5 batches of ~1 KiB each ≈ 5 KiB total. Use limit that
-        // puts the split mid-line on the 4th batch — bytes
-        // 0..head_bytes complete lines 0..2 (3 lines), bytes
-        // head_bytes..total contains line 3 (partial), line 4
-        // (complete). Tail slice returns line 4 only; line 3 is
-        // dropped because it straddles the split.
+        // 5 batches of ~1 KiB each ≈ 5 KiB total. The limit is sized
+        // to land 100 bytes BEFORE the end of line 3, so:
+        //   - head body is lines 0..2 (line-aligned at last newline)
+        //   - tail slice contains the tail end of line 3, then "\n",
+        //     then line 4
+        //   - dropped_tail_prefix = tail end of line 3 + "\n"
+        //   - returned slice = line 4 only
+        // On the next drain(None), the active file = head body ++
+        // dropped_tail_prefix, which concatenates to lines 0..3 (the
+        // original straddling line 3 is now complete).
         let representative = json!({
             "entries": [{"id": 0, "msg": "x".repeat(1024)}],
         });
@@ -745,10 +859,6 @@ mod tests {
         }
         let total = spool.size();
 
-        // Limit sized to land 100 bytes BEFORE the end of line 3.
-        // The tail slice's first 100 bytes are the tail end of
-        // line 3 (which gets dropped — it's a partial first line).
-        // Line 4 sits entirely after the split and survives.
         let limit = total - (3 * line_size as u64) - (line_size as u64 - 100);
         let drained = spool
             .drain(Some(limit))
@@ -757,20 +867,27 @@ mod tests {
         assert_eq!(
             drained.len(),
             1,
-            "tail slice has line 4 (the only fully-tail line); line 3 dropped"
+            "tail slice has line 4 (the only fully-tail line); line 3 \
+             straddles and its tail-end is captured for the next drain"
         );
         assert_eq!(drained[0], all[4], "line 4 is the only survivor");
 
-        // The head file now contains lines 0..2 (3 complete lines).
-        // Line 3's first part (bytes 3*line_size..4*line_size - 100)
-        // is also in the head bytes 0..head_end, but head_end
-        // truncates at the last newline (end of line 2). So line 3's
-        // first part is also dropped — the alternative would be to
-        // keep a partial line that fails to parse.
+        // F5: the next drain reconstructs the straddling line. The
+        // active file = head (lines 0..2) ++ dropped_tail_prefix
+        // (tail end of line 3 + newline). Together they form
+        // lines 0..3 in original byte order.
         let rest = spool.drain(None).await.expect("drain head");
-        assert_eq!(rest.len(), 3, "lines 0..2 must survive on disk");
-        for i in 0..3 {
-            assert_eq!(rest[i], all[i], "head order preserved");
+        assert_eq!(
+            rest.len(),
+            4,
+            "next drain must return lines 0..3 — the straddling line 3 \
+             is reconstructed from the head + appended dropped prefix"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                rest[i], all[i],
+                "line {i} must match the original; byte order preserved"
+            );
         }
     }
 
