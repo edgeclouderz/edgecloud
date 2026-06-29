@@ -1585,16 +1585,20 @@ async fn test_handle_task_message_bumps_last_task_received_at_inner() -> anyhow:
     )
     .await?;
 
-    // Pre-condition: freshly constructed supervisor has last_task_received_at = None.
+    // Pre-condition: freshly constructed supervisor seeds
+    // last_task_received_at to Some(construction_instant) — see
+    // WorkerState::new and the boot-herd fix in commit F of PR
+    // #166's review follow-up. The watchdog must NOT treat a
+    // freshly-booted worker as infinitely stale.
     {
         let state = harness.state.read().await;
-        let pre = *state
+        let pre_seed = *state
             .last_task_received_at
             .lock()
             .expect("last_task_received_at mutex poisoned");
         assert!(
-            pre.is_none(),
-            "expected last_task_received_at=None initially"
+            pre_seed.is_some(),
+            "expected last_task_received_at=Some after construction (boot herd fix)"
         );
     }
 

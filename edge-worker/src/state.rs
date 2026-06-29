@@ -64,11 +64,13 @@ pub struct WorkerState {
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
     /// Wall-clock instant of the most recent TaskMessage (any variant)
-    /// successfully applied. Read by the heartbeat-loop watchdog to
-    /// decide when to fall back to the HTTP /sync endpoint (issue #53).
-    /// None means "we've never received a task message" — the watchdog
-    /// treats that as "infinitely stale" so the first heartbeat tick
-    /// after boot pulls /sync.
+    /// parsed by handle_task_message. Read by the heartbeat-loop
+    /// watchdog to decide when to fall back to the HTTP /sync endpoint
+    /// (issue #53). Seeded to `Some(Instant::now())` at construction so
+    /// the first heartbeat tick after boot doesn't fire /sync on its
+    /// own — the periodic control-plane sweep (RECONCILE_INTERVAL,
+    /// 5min default) is the durable safety net for a worker that
+    /// never hears from NATS.
     pub last_task_received_at: Mutex<Option<Instant>>,
 }
 
@@ -77,7 +79,16 @@ impl WorkerState {
         Self {
             apps: HashMap::new(),
             engine,
-            last_task_received_at: Mutex::new(None),
+            // Seed with the construction instant so the heartbeat-loop
+            // watchdog's first measurement (at T≈heartbeat_interval
+            // after boot) sees "time since boot" rather than "infinitely
+            // stale". Without the seed, every worker that boots at the
+            // same moment would fetch /sync on its first heartbeat tick
+            // — a thundering herd against the CP at fleet scale.
+            //
+            // The first NATS TaskMessage that arrives will overwrite
+            // this seed via handle_task_message's bump (commit C).
+            last_task_received_at: Mutex::new(Some(Instant::now())),
         }
     }
 }
