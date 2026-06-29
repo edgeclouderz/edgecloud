@@ -191,7 +191,11 @@ mod tests {
         let process = Process::with_env_and_exit_code(env, exit_code.clone());
         assert_eq!(process.exit_requested(), None, "before exit");
         process.exit(0);
-        assert_eq!(process.exit_requested(), Some(0), "exit(0) must be Some(0), not None");
+        assert_eq!(
+            process.exit_requested(),
+            Some(0),
+            "exit(0) must be Some(0), not None"
+        );
     }
 
     #[test]
