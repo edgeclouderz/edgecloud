@@ -61,6 +61,7 @@ tracing = "0.1"
 wiremock = "0.6"
 wat = "1"
 tempfile = "3"
+serial_test = "3"
 
 [features]
 default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking", "filesystem"]

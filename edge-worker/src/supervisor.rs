@@ -370,7 +370,7 @@ impl Supervisor {
             state.apps.get(key).cloned()
         };
 
-        let (port, handle, ticker) = if let Some(inst) = instance {
+        let (port, handle, ticker, tenant_id, deployment_id) = if let Some(inst) = instance {
             // Extract port, handle, ticker, and sender while locked.
             let mut inst = inst.lock().unwrap();
             inst.status = AppInstanceStatus::Stopping;
@@ -378,11 +378,13 @@ impl Supervisor {
             let handle = inst.handle.clone();
             let ticker = inst.ticker.take();
             let tx = inst.shutdown_tx.take();
+            let tenant_id = inst.tenant_id.clone();
+            let deployment_id = inst.deployment_id.clone();
             drop(inst); // release lock before sending
             if let Some(tx) = tx {
                 let _ = tx.send(());
             }
-            (port, handle, ticker)
+            (port, handle, ticker, tenant_id, deployment_id)
         } else {
             return Ok(()); // already gone
         };
@@ -395,6 +397,14 @@ impl Supervisor {
             let mut pool = self.port_pool.lock().await;
             pool.release(port);
         }
+
+        // Clean up the per-deployment WASI scratch directory so files written
+        // by this deployment do not persist into future deployments or leak
+        // data to the next invocation.
+        edge_runtime::interfaces::filesystem::cleanup_scratch_dir_for_deployment(
+            &tenant_id,
+            &deployment_id,
+        );
 
         // Abort the epoch ticker so the engine clock stops advancing for
         // this app. The ticker's task is a tight loop that holds a clone
@@ -699,22 +709,32 @@ impl Supervisor {
             .get_typed_func::<(), ()>(&mut store, "_start")
             .is_ok();
 
-        if has_start {
+        let call_result = if has_start {
             instance
                 .get_typed_func::<(), ()>(&mut store, "_start")?
-                .call(&mut store, ())?;
+                .call(&mut store, ())
         } else {
             instance
                 .get_typed_func::<(), ()>(&mut store, "handle")?
-                .call(&mut store, ())?;
-        }
+                .call(&mut store, ())
+        };
 
         // Check if the guest called process.exit — the flag is set by the host call
         // before the wasmtime trap is raised, so we see it here on a successful return.
         if let Some(code) = store.data().exit_requested() {
-            tracing::info!(code, "guest called process.exit");
+            tracing::info!(code, "guest called edge:process.exit");
             return Ok(false);
         }
+
+        // wasi:cli/exit raises I32Exit — a guest calling std::process::exit()
+        // is a clean shutdown, not a crash, regardless of the exit code.
+        if let Err(ref e) = call_result {
+            if e.downcast_ref::<wasmtime_wasi::I32Exit>().is_some() {
+                tracing::info!("guest called wasi:cli/exit");
+                return Ok(false);
+            }
+        }
+        call_result?;
 
         // Component returned normally — it wants to keep running.
         Ok(true)
