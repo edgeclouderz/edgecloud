@@ -499,7 +499,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {
@@ -785,7 +785,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {
@@ -854,7 +854,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 
 		msg := &nats.TaskMessage{
 			Type:      "task_update",
-			Timestamp: time.Now(),
+			Timestamp: time.Now().UTC(),
 			TenantID:  tenantID,
 			Apps: map[string]nats.AppConfig{
 				ad.AppName: {
