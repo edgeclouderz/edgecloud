@@ -2,6 +2,9 @@ package nats
 
 import (
 	"encoding/json"
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,5 +123,109 @@ func TestMockPublisher_PublishHeartbeat(t *testing.T) {
 	}
 	if err := p.PublishHeartbeat("global", msg); err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of fn and returns
+// whatever was written. Tests use this to assert the [NATS MOCK] log
+// line emitted by MockPublisher actually contains the wire-format
+// overrides (applyTypeOverride is called by both MockPublisher and
+// NATSPublisher.publishTaskMessage; these tests pin the mock side).
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	fn()
+
+	w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured stdout: %v", err)
+	}
+	return string(out)
+}
+
+// TestMockPublisher_PublishFullSync_EmitsFullSyncTypeEvenIfCallerSetsOther
+// pins the wire-format contract for the mock: a caller passing a
+// TaskMessage with Type="task_update" to PublishFullSync must see
+// "full_sync" on the wire — same as the production NATSPublisher.
+//
+// Without this test (and the applyTypeOverride extraction in commit
+// G), the previous MockPublisher printed whatever the caller passed
+// in — so a dev-mode integration that happened to call
+// PublishFullSync with a stale TaskMessage would log the wrong type
+// and operators couldn't trust the dev log to mirror production.
+func TestMockPublisher_PublishFullSync_EmitsFullSyncTypeEvenIfCallerSetsOther(t *testing.T) {
+	out := captureStdout(t, func() {
+		p := &MockPublisher{}
+		err := p.PublishFullSync("fra", &TaskMessage{
+			Type:      "task_update", // wrong on purpose
+			Timestamp: time.Now().UTC(),
+			TenantID:  "t_test",
+			Apps:      map[string]AppConfig{},
+		})
+		if err != nil {
+			t.Fatalf("PublishFullSync: %v", err)
+		}
+	})
+	if !strings.Contains(out, `"type":"full_sync"`) {
+		t.Errorf("mock didn't override type; stdout=%s", out)
+	}
+	if strings.Contains(out, `"type":"task_update"`) {
+		t.Errorf("mock printed the caller's (wrong) type; stdout=%s", out)
+	}
+}
+
+// TestMockPublisher_PublishTaskUpdate_EmitsTaskUpdateType pins the
+// other half of the override contract: PublishTaskUpdate must emit
+// "task_update" on the wire even if the caller set Type to something
+// else. The applyTypeOverride helper (commit G) makes both publishers
+// use the same code path.
+func TestMockPublisher_PublishTaskUpdate_EmitsTaskUpdateType(t *testing.T) {
+	out := captureStdout(t, func() {
+		p := &MockPublisher{}
+		err := p.PublishTaskUpdate("global", &TaskMessage{
+			Type:      "full_sync", // wrong on purpose
+			Timestamp: time.Now().UTC(),
+			TenantID:  "t_test",
+			Apps:      map[string]AppConfig{},
+		})
+		if err != nil {
+			t.Fatalf("PublishTaskUpdate: %v", err)
+		}
+	})
+	if !strings.Contains(out, `"type":"task_update"`) {
+		t.Errorf("mock didn't override type; stdout=%s", out)
+	}
+	if strings.Contains(out, `"type":"full_sync"`) {
+		t.Errorf("mock printed the caller's (wrong) type; stdout=%s", out)
+	}
+}
+
+// TestMockPublisher_DoesNotMutateCallerStruct locks the snapshot
+// semantics promised by applyTypeOverride: the caller can re-use
+// their TaskMessage struct after publish without seeing an
+// unexpected Type change.
+func TestMockPublisher_DoesNotMutateCallerStruct(t *testing.T) {
+	msg := &TaskMessage{
+		Type:      "task_update",
+		Timestamp: time.Now().UTC(),
+		TenantID:  "t_test",
+		Apps:      map[string]AppConfig{},
+	}
+	_ = captureStdout(t, func() {
+		p := &MockPublisher{}
+		if err := p.PublishFullSync("global", msg); err != nil {
+			t.Fatalf("PublishFullSync: %v", err)
+		}
+	})
+	if msg.Type != "task_update" {
+		t.Errorf("mock mutated caller struct: type=%q, want task_update", msg.Type)
 	}
 }
