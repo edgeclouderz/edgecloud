@@ -398,13 +398,15 @@ impl Supervisor {
             pool.release(port);
         }
 
-        // Clean up the per-deployment WASI scratch directory so files written
-        // by this deployment do not persist into future deployments or leak
-        // data to the next invocation.
-        edge_runtime::interfaces::filesystem::cleanup_scratch_dir_for_deployment(
-            &tenant_id,
-            &deployment_id,
-        );
+        // Clean up the per-deployment WASI scratch directory. Uses spawn_blocking
+        // to avoid blocking a tokio thread on potentially large remove_dir_all.
+        let t = tenant_id.clone();
+        let d = deployment_id.clone();
+        tokio::task::spawn_blocking(move || {
+            edge_runtime::interfaces::filesystem::cleanup_scratch_dir_for_deployment(&t, &d);
+        })
+        .await
+        .ok();
 
         // Abort the epoch ticker so the engine clock stops advancing for
         // this app. The ticker's task is a tight loop that holds a clone
@@ -541,6 +543,14 @@ impl Supervisor {
                                         inst.status = AppInstanceStatus::Crashed { restart_count };
                                     }
                                 }
+                                // Clean up the WASI scratch dir so orphaned files
+                                // don't accumulate when the app never reaches stop_app.
+                                let t = tenant_id.clone();
+                                let d = deployment_id.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    edge_runtime::interfaces::filesystem::cleanup_scratch_dir_for_deployment(&t, &d);
+                                }).await.ok();
+
                                 // Best-effort auto-rollback: signal the
                                 // control plane so it can swap the active
                                 // deployment back to last_good. We do NOT
@@ -601,6 +611,13 @@ impl Supervisor {
                                     let mut inst = inst.lock().unwrap();
                                     inst.status = AppInstanceStatus::Hung;
                                 }
+                                // Same cleanup as the Crashed branch.
+                                let t = tenant_id.clone();
+                                let d = deployment_id.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    edge_runtime::interfaces::filesystem::cleanup_scratch_dir_for_deployment(&t, &d);
+                                }).await.ok();
+
                                 // Same auto-rollback as the Crashed
                                 // branch above — Hung means the guest
                                 // stopped yielding (vs Crashed which
