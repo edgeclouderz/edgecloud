@@ -1612,6 +1612,83 @@ async fn test_handle_task_message_bumps_last_task_received_at_inner() -> anyhow:
     Ok(())
 }
 
+// test_handle_task_message_bumps_timestamp_on_partial_diff_failure
+// covers the fix from review of PR #166, finding #3: the watchdog
+// timer must reflect "we heard from NATS" (or HTTP), not "the diff
+// fully applied". The previous implementation bumped the timer at
+// the END of handle_task_message — so a diff that failed to apply
+// (e.g. downloader rejection, hash mismatch, port exhaustion) left
+// the timer untouched, and the heartbeat-loop watchdog would
+// trigger /sync anyway. That amplification (combined with the
+// boot-time fetch herd from finding #6) would convert a partial
+// outage into a thundering-herd against the /sync endpoint.
+//
+// The diff is forced to fail by including an app whose deployment
+// hash is malformed — the downloader's pre-check rejects non-hex
+// hashes without ever making the HTTP fetch, so the test stays
+// hermetic (no real CP server required).
+async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
+) -> anyhow::Result<()> {
+    let harness = build_supervisor_only_with_cp(
+        "test-worker",
+        "test-region",
+        "t_test",
+        "http://localhost:9999",
+    )
+    .await?;
+
+    // Force a diff-failure path: deployment_hash is shorter than the
+    // 64-char SHA-256 length, so downloader::verify_hash bails at the
+    // pre-check before any network call.
+    let bad_app = AppSpec {
+        deployment_id: "d_broken".to_string(),
+        deployment_hash: "tooshort".to_string(), // not 64 hex chars
+        routes: None,
+        env: HashMap::new(),
+        allowlist: None,
+        max_memory_mb: 256,
+    };
+    let mut apps = HashMap::new();
+    apps.insert("myapp".to_string(), bad_app);
+
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-20T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps,
+    };
+
+    // handle_task_message itself returns Ok — it logs start_app
+    // failures and continues. The watchdog bump must still have
+    // happened.
+    harness.handle_task_message(msg).await?;
+
+    let state = harness.state.read().await;
+    let post = *state
+        .last_task_received_at
+        .lock()
+        .expect("last_task_received_at mutex poisoned");
+    assert!(
+        post.is_some(),
+        "expected last_task_received_at=Some even when diff fails to apply (fix for PR #166 finding #3)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(
+        HARNESS_STARTUP_TIMEOUT,
+        test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(),
+    )
+    .await
+    .expect("test_handle_task_message_bumps_timestamp_on_partial_diff_failure timed out")
+    .expect("test_handle_task_message_bumps_timestamp_on_partial_diff_failure failed");
+}
+
 // fetch_sync / handle_task_message wiring tests only need a Supervisor
 // with a real engine + a mock CP URL — they don't need NATS. Build a
 // minimal Supervisor on its own (without the full harness's container)

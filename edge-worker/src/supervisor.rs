@@ -78,6 +78,20 @@ impl Supervisor {
             }
         };
 
+        // Bump the watchdog timer the moment we've parsed a message —
+        // not after we apply the diff. The watchdog's job is to catch
+        // *silence* (NATS hasn't spoken in N seconds); a hash mismatch,
+        // port-pool exhaustion, or transient downloader failure in the
+        // diff loop doesn't change the fact that NATS just spoke.
+        // Bumping at the end (the previous behaviour) meant a worker
+        // whose diff could only partially apply would see the
+        // watchdog fire /sync anyway — which is harmless in isolation
+        // but, combined with the boot-herd bug (commit F), would
+        // amplify a partial-outage into a full-outage storm.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(Instant::now());
+        }
+
         // Compute the set of (app_name, deployment_id) keys currently running,
         // and look up the deployment_id for each key so we can detect changes.
         let (current_keys, current_deployment_ids): (
@@ -181,14 +195,6 @@ impl Supervisor {
                     tracing::error!(app_name = %entry.app_name, deployment_id = %key.1, err = %e, "failed to start app");
                 }
             }
-        }
-
-        // Record that we just applied a TaskMessage — both event-driven
-        // TaskUpdate and periodic FullSync reset the watchdog timer.
-        // Issue #53: the heartbeat task reads this to decide when to
-        // fall back to GET /api/internal/workers/{workerID}/sync.
-        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
-            *guard = Some(Instant::now());
         }
 
         Ok(())
