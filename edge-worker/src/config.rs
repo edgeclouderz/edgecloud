@@ -191,7 +191,22 @@ impl Config {
             queue_group: std::env::var("EDGE_QUEUE_GROUP")
                 .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
             consumer_name,
-            nats_max_deliver: parse_env_u64("NATS_MAX_DELIVER", 20)? as i64,
+            nats_max_deliver: {
+                let n = parse_env_u64("NATS_MAX_DELIVER", 20)?;
+                // JetStream treats `max_deliver=0` as "unlimited
+                // redelivery" — a worker that crashes mid-ack
+                // would loop forever, never advancing past the
+                // stuck message. Fail-fast at startup rather than
+                // silently operationalize the wrong semantic.
+                if n == 0 {
+                    anyhow::bail!(
+                        "NATS_MAX_DELIVER must be a positive integer; \
+                         JetStream treats max_deliver=0 as 'unlimited \
+                         redelivery'. Set to a value >= 1 (default is 20)."
+                    );
+                }
+                n as i64
+            },
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             worker_addr: std::env::var("EDGE_WORKER_ADDR").context("EDGE_WORKER_ADDR not set")?,
@@ -591,6 +606,53 @@ mod tests {
             cfg.nats_max_deliver, 20,
             "default nats_max_deliver must be 20; got {}",
             cfg.nats_max_deliver
+        );
+    }
+
+    /// F3 (PR #165 review): `NATS_MAX_DELIVER=0` must be rejected at
+    /// startup. JetStream treats `max_deliver=0` as "unlimited
+    /// redelivery" — a worker that crashes mid-ack would loop forever
+    /// past the stuck message, never advancing. Fail-fast with a
+    /// clear error rather than silently operationalizing the wrong
+    /// semantic.
+    #[test]
+    fn nats_max_deliver_zero_rejected() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("NATS_MAX_DELIVER", Some("0")),
+        ]);
+        let err = Config::from_env()
+            .expect_err("NATS_MAX_DELIVER=0 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("NATS_MAX_DELIVER") && msg.contains("unlimited"),
+            "error must mention NATS_MAX_DELIVER and 'unlimited'; got: {msg}"
+        );
+    }
+
+    /// F3: boundary check — any positive value (including 1) is
+    /// accepted. JetStream's documented range for `max_deliver` is
+    /// `1..=2^31-1`; we don't try to encode the upper bound here,
+    /// the runtime will reject absurd values. The point of this
+    /// test is to pin that we don't over-restrict.
+    #[test]
+    fn nats_max_deliver_one_accepted() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("NATS_MAX_DELIVER", Some("1")),
+        ]);
+        let cfg = Config::from_env().expect("NATS_MAX_DELIVER=1 must be accepted");
+        assert_eq!(
+            cfg.nats_max_deliver, 1,
+            "nats_max_deliver must round-trip the parsed value"
         );
     }
 
