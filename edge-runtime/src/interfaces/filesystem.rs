@@ -40,7 +40,9 @@ pub fn scratch_dir_for_deployment(
         return Err(FilesystemError::InvalidTenantId(tenant_id.to_string()));
     }
     if !super::is_safe_tenant_id(deployment_id) {
-        return Err(FilesystemError::InvalidDeploymentId(deployment_id.to_string()));
+        return Err(FilesystemError::InvalidDeploymentId(
+            deployment_id.to_string(),
+        ));
     }
     let base = PathBuf::from(&base_str);
     if !base.is_absolute() {
@@ -133,7 +135,9 @@ mod tests {
         env::remove_var(ENV_FS_SCRATCH_PATH);
         // Empty IDs should also return None when env unset (no path to build).
         assert!(scratch_dir_for_deployment("", "").unwrap().is_none());
-        assert!(scratch_dir_for_deployment("t_abc", "d_001").unwrap().is_none());
+        assert!(scratch_dir_for_deployment("t_abc", "d_001")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -153,7 +157,10 @@ mod tests {
         env::set_var(ENV_FS_SCRATCH_PATH, tmp.path());
         let result = scratch_dir_for_deployment("t_abc", "../evil");
         env::remove_var(ENV_FS_SCRATCH_PATH);
-        assert!(matches!(result, Err(FilesystemError::InvalidDeploymentId(_))));
+        assert!(matches!(
+            result,
+            Err(FilesystemError::InvalidDeploymentId(_))
+        ));
     }
 
     #[test]
@@ -242,7 +249,8 @@ mod tests {
         env::remove_var(ENV_FS_MAX_MB);
         assert!(
             matches!(result, Err(FilesystemError::QuotaExceeded(_))),
-            "2.7 MB across 3 subdirs must be caught by 1 MB quota, got: {:?}", result
+            "2.7 MB across 3 subdirs must be caught by 1 MB quota, got: {:?}",
+            result
         );
     }
 }
