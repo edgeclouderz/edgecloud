@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -196,5 +197,61 @@ func TestBootstrapHandler_InvalidJSON(t *testing.T) {
 func TestNewBootstrapHandler_NilMinterReturnsNil(t *testing.T) {
 	if got := NewBootstrapHandler(nil); got != nil {
 		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+// F8 (PR #165 review): the bootstrap handler reached WITHOUT
+// PSKAuth (i.e. server-side misconfiguration: the route was
+// wired to MintToken directly) must return 503 — NOT 500. 503
+// distinguishes operator-fixable misconfiguration from genuine
+// runtime faults; 500 is reserved for `minter.Mint` failures.
+func TestBootstrapHandler_NoPSKAuth_Returns503(t *testing.T) {
+	h, _ := newTestBootstrap(t) // unwrapped — direct MintToken call
+	body, _ := json.Marshal(map[string]string{
+		"worker_id": "w_fra_abc",
+		"region":    "fra",
+		"tenant_id": "t_tenant1",
+	})
+	req := httptest.NewRequest("POST", "/api/internal/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.MintToken(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (no PSKAuth context → server misconfiguration), got %d body=%s",
+			rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+	if resp.Error.Code != "SERVICE_UNAVAILABLE" {
+		t.Errorf("error.code = %q, want SERVICE_UNAVAILABLE", resp.Error.Code)
+	}
+	if resp.Error.Message == "" {
+		t.Error("error.message must not be empty for 5xx-with-details responses")
+	}
+}
+
+// F8: partial context (only some of worker_id/region/tenant_id
+// populated) must also surface as 503 — the same root cause
+// (handler reached without PSKAuth) covers every variant.
+func TestBootstrapHandler_PartialContext_Returns503(t *testing.T) {
+	h, _ := newTestBootstrap(t)
+	body, _ := json.Marshal(map[string]string{})
+	req := httptest.NewRequest("POST", "/api/internal/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Inject only workerID; leave region/tenantID empty.
+	ctx := context.WithValue(req.Context(), middleware.BootstrapWorkerIDKey, "w_fra_abc")
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+	h.MintToken(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for partial bootstrap context, got %d body=%s",
+			rr.Code, rr.Body.String())
 	}
 }

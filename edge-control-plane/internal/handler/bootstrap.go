@@ -56,9 +56,15 @@ func NewBootstrapHandler(minter *service.WorkerJWTMinter) *BootstrapHandler {
 //     JSON, missing fields, identity format violation). The signature
 //     payload includes tenant_id (finding A1), so a forged body
 //     tenant_id cannot pass signature verification.
+//   - 503 SERVICE_UNAVAILABLE — handler reached without PSKAuth
+//     middleware populating the bootstrap context (a server-side
+//     misconfiguration, not a client problem). 503 is the
+//     "temporarily cannot serve" code and matches the existing
+//     PSK-not-configured path; the worker correctly retries.
 //   - 500 INTERNAL_ERROR — `minter.Mint` failure (e.g. HMAC key
 //     zero-length, which would be a config bug caught at startup
-//     but guarded here defensively).
+//     but guarded here defensively). 500 is reserved for genuine
+//     runtime errors, distinct from the misconfiguration class.
 func (h *BootstrapHandler) MintToken(w http.ResponseWriter, r *http.Request) {
 	// PSKAuth has already validated the signature and placed
 	// worker_id + region + tenant_id into the request context.
@@ -71,9 +77,12 @@ func (h *BootstrapHandler) MintToken(w http.ResponseWriter, r *http.Request) {
 	if workerID == "" || region == "" || tenantID == "" {
 		// PSKAuth should have populated these; if not, the route
 		// was wired wrong (e.g. handler reached without
-		// middleware). Surface as a 500 because it's a server
-		// configuration bug, not a client problem.
-		httperror.InternalErrorCtx(w, r)
+		// middleware). This is a server-side misconfiguration,
+		// not a client error. 503 distinguishes the class
+		// (operator must fix the deploy) from a genuine 500
+		// (something in-process blew up). F8 (PR #165 review).
+		httperror.WriteCtx(w, r, http.StatusServiceUnavailable,
+			"bootstrap handler reached without PSKAuth middleware")
 		return
 	}
 
