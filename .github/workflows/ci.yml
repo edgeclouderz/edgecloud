@@ -12,9 +12,9 @@ env:
 
 jobs:
   # ============================================================
-  # FMT — rustfmt on all crates
+  # VALIDATE-RUST — Consolidated Rust validation per crate
   # ============================================================
-  fmt:
+  validate-rust:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,108 +22,59 @@ jobs:
         crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies (edge-migrate only)
+        if: matrix.crate == 'edge-migrate'
+        run: sudo apt-get update && sudo apt-get install -y clang
 
       - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
+        run: cargo generate-lockfile --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/
+          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.crate }}/target/
+          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install rustfmt
         run: rustup component add rustfmt
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Run rustfmt
         run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml --all
-
-  # ============================================================
-  # CLIPPY — clippy on all crates
-  # ============================================================
-  clippy:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
 
       - name: Install clippy
         run: rustup component add clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Run clippy
         run: cargo clippy --manifest-path ${{ matrix.crate }}/Cargo.toml -- -D warnings
 
-  # ============================================================
-  # AUDIT — cargo audit on all crates (cached binary)
-  # ============================================================
-  audit:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          command: check
+          manifest-path: ${{ matrix.crate }}/Cargo.toml
 
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-semver-checks
+        if: matrix.crate != 'edge-cli'
+        uses: taiki-e/install-action@cargo-semver-checks
+
+      - name: Run cargo-semver-checks
+        if: matrix.crate != 'edge-cli'
+        run: cargo semver-checks check-release --manifest-path ${{ matrix.crate }}/Cargo.toml --baseline-rev origin/main
 
       - name: Cache cargo-audit binary
         id: cache-audit
@@ -141,197 +92,27 @@ jobs:
       - name: Run cargo audit
         run: cargo audit --manifest-path ${{ matrix.crate }}/Cargo.toml || true
 
-  # ============================================================
-  # TEST — cargo test on all crates
-  # ============================================================
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
+      - name: Run cargo test
         run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
 
-  # ============================================================
-  # TEST-EDGE-WORKER — integration tests for edge-worker (skipped in CI)
-  # ============================================================
-  test-edge-worker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Install Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-udeps
+        uses: taiki-e/install-action@cargo-udeps
+
+      - name: Run cargo-udeps
+        run: cargo +nightly udeps --manifest-path ${{ matrix.crate }}/Cargo.toml --all-targets
+
+      - name: Install cargo-geiger
+        uses: taiki-e/cache-cargo-install-action@v2
         with:
-          fetch-depth: 0
+          tool: cargo-geiger
 
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests (skips integration tests in CI)
-        run: |
-          SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-worker/Cargo.toml
+      - name: Run cargo-geiger
+        run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
 
   # ============================================================
-  # TEST-EDGE-INGRESS — integration tests for edge-ingress (skipped in CI)
-  # ============================================================
-  test-edge-ingress:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests (skips integration tests in CI)
-        run: |
-          SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-ingress/Cargo.toml
-
-  # ============================================================
-  # TEST-EDGE-MIGRATE-LIB — unit tests for edge-migrate-lib
-  # ============================================================
-  test-edge-migrate-lib:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml || true
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-edge-migrate-lib-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      # TODO: once a wasi-sdk CI image is available, install clang + wasi-sdk
-      # and set `EDGE_TEST_CLANG=1` so the new `test_transform_e2e_wasi_stubs_compile`
-      # regression net runs end-to-end on every PR. Tracked as a follow-up.
-      - name: Run tests
-        run: cargo test --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml
-
-  # ============================================================
-  # TEST-EDGE-MIGRATE-BIN — integration tests for edge-migrate binary
-  # ============================================================
-  test-edge-migrate-bin:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml || true
-
-      - name: Install system clang
-        # System clang is sufficient for the bin's preprocessor test
-        # skip path; EDGE_TEST_CLANG stays unset so the lib's gated
-        # regression net is a no-op here.
-        run: sudo apt-get update && sudo apt-get install -y clang
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-edge-migrate-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
-        run: cargo test --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml
   # OPENAPI-VALIDATE — verify all mux routes are covered by the spec
   # ============================================================
   openapi-validate:
@@ -449,24 +230,6 @@ jobs:
           path: cover.out
 
   # ============================================================
-  # CARGO-DENY — check Rust dependency licenses & advisories
-  # ============================================================
-  cargo-deny:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          manifest-path: ${{ matrix.crate }}/Cargo.toml
-
-  # ============================================================
   # TYPOS — spell check source files
   # ============================================================
   typos:
@@ -476,87 +239,6 @@ jobs:
 
       - name: Check for typos
         uses: crate-ci/typos@v1
-
-  # ============================================================
-  # SEMVER-CHECKS — check public API backward compatibility
-  # ============================================================
-  semver-checks:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
-
-      - name: Run cargo-semver-checks
-        run: cargo semver-checks check-release --manifest-path ${{ matrix.crate }}/Cargo.toml --baseline-rev origin/main
-
-  # ============================================================
-  # UDEPS — check for unused dependencies
-  # ============================================================
-  udeps:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
-
-      - name: Install Rust Nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Install cargo-udeps
-        uses: taiki-e/install-action@cargo-udeps
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: target/
-          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo-udeps
-        run: cargo +nightly udeps --manifest-path ${{ matrix.crate }}/Cargo.toml --all-targets
-
-  # ============================================================
-  # GEIGER — analyze unsafe code usage
-  # ============================================================
-  geiger:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cargo-geiger
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: cargo-geiger
-
-      - name: Run cargo-geiger
-        run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
 
   # ============================================================
   # COVERAGE-RUST — cargo-llvm-cov for all crates
@@ -583,10 +265,16 @@ jobs:
           path: ~/.cargo/registry/index/
           key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cache target dir
+      - name: Cache target dirs
         uses: actions/cache@v4
         with:
-          path: target/
+          path: |
+            edge-config/target/
+            edge-cli/target/
+            edge-worker/target/
+            edge-ingress/target/
+            edge-migrate/target/
+            edge-runtime/target/
           key: cargo-target-coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run coverage
