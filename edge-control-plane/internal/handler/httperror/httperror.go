@@ -11,15 +11,16 @@ import (
 type ErrorCode string
 
 const (
-	CodeBadRequest      ErrorCode = "BAD_REQUEST"
-	CodeUnauthorized    ErrorCode = "UNAUTHORIZED"
-	CodeForbidden       ErrorCode = "FORBIDDEN"
-	CodeNotFound        ErrorCode = "NOT_FOUND"
-	CodeConflict        ErrorCode = "CONFLICT"
-	CodeQuotaExceeded   ErrorCode = "QUOTA_EXCEEDED"
-	CodeInternalError   ErrorCode = "INTERNAL_ERROR"
-	CodeBadGateway      ErrorCode = "BAD_GATEWAY"
-	CodePayloadTooLarge ErrorCode = "PAYLOAD_TOO_LARGE"
+	CodeBadRequest         ErrorCode = "BAD_REQUEST"
+	CodeUnauthorized       ErrorCode = "UNAUTHORIZED"
+	CodeForbidden          ErrorCode = "FORBIDDEN"
+	CodeNotFound           ErrorCode = "NOT_FOUND"
+	CodeConflict           ErrorCode = "CONFLICT"
+	CodeQuotaExceeded      ErrorCode = "QUOTA_EXCEEDED"
+	CodeInternalError      ErrorCode = "INTERNAL_ERROR"
+	CodeBadGateway         ErrorCode = "BAD_GATEWAY"
+	CodePayloadTooLarge    ErrorCode = "PAYLOAD_TOO_LARGE"
+	CodeServiceUnavailable ErrorCode = "SERVICE_UNAVAILABLE"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -203,7 +204,7 @@ func WriteCtx(w http.ResponseWriter, r *http.Request, httpStatus int, message st
 	case http.StatusTooManyRequests:
 		code = CodeQuotaExceeded
 	case http.StatusServiceUnavailable:
-		code = "SERVICE_UNAVAILABLE"
+		code = CodeServiceUnavailable
 	default:
 		code = CodeInternalError
 	}
