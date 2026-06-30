@@ -45,9 +45,17 @@ func (f *fakeSyncRequester) callsCopy() []syncCall {
 
 // fakeWorkerSvc is the test double for the workerRegisterer
 // interface. By default Register returns nil (success); individual
-// tests can swap in a stub that returns an error.
+// tests can swap in a stub that returns an error. Also covers the
+// Sync endpoint's worker lookup — see worker/getErr fields.
+//
+// RegisterWorker tests leave worker/getErr at their zero values
+// (worker=nil, getErr=nil), and the RegisterWorker code path only
+// reads Register; the unused fields are harmless on that path.
+// Sync tests inject worker + getErr to drive the cross-tenant check.
 type fakeWorkerSvc struct {
 	registerErr error
+	worker      *domain.Worker // returned by Get; nil means (nil, nil)
+	getErr      error
 }
 
 func (f *fakeWorkerSvc) Register(_ context.Context, _ string, _ *domain.RegisterWorkerRequest) error {
@@ -59,7 +67,7 @@ func (f *fakeWorkerSvc) ListByTenant(_ context.Context, _ string) ([]domain.Work
 }
 
 func (f *fakeWorkerSvc) Get(_ context.Context, _ string) (*domain.Worker, error) {
-	return nil, nil
+	return f.worker, f.getErr
 }
 
 // withWorkerCtx returns a copy of the request with the worker tenant
@@ -76,7 +84,7 @@ func TestRegisterWorker_TriggersRequestSync(t *testing.T) {
 	// tenantID and region. The call is fire-and-forget so we wait
 	// briefly for the goroutine to land.
 	syncer := &fakeSyncRequester{}
-	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer)
+	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer, nil)
 
 	body, _ := json.Marshal(domain.RegisterWorkerRequest{
 		WorkerID: "w_us-east_1",
@@ -115,7 +123,7 @@ func TestRegisterWorker_NilSyncer_DoesNotPanic(t *testing.T) {
 	// When reconcileSvc is nil (e.g. test stubs that don't wire the
 	// sync hook) the handler must still return 201 and skip the sync.
 	// The periodic timer in cmd/api/main.go is the durable safety net.
-	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, nil)
+	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, nil, nil)
 
 	body, _ := json.Marshal(domain.RegisterWorkerRequest{
 		WorkerID: "w_us-east_1",
@@ -141,7 +149,7 @@ func TestRegisterWorker_FailedRegister_DoesNotTriggerSync(t *testing.T) {
 	syncer := &fakeSyncRequester{}
 	// Exercise the missing-field validation path, which is the most
 	// common "register fails" scenario in production.
-	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer)
+	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer, nil)
 
 	body, _ := json.Marshal(domain.RegisterWorkerRequest{
 		WorkerID: "w_us-east_1",
@@ -163,7 +171,7 @@ func TestRegisterWorker_FailedRegister_DoesNotTriggerSync(t *testing.T) {
 
 func TestRegisterWorker_InvalidBody_DoesNotTriggerSync(t *testing.T) {
 	syncer := &fakeSyncRequester{}
-	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer)
+	h := NewInternalHandler(nil, &fakeWorkerSvc{}, nil, nil, syncer, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/internal/workers", bytes.NewReader([]byte("{not json")))
 	req = withWorkerCtx(req, "t_test")
@@ -186,7 +194,7 @@ func TestRegisterWorker_RegisterError_DoesNotTriggerSync(t *testing.T) {
 	// invariant as the validation path.
 	syncer := &fakeSyncRequester{}
 	worker := &fakeWorkerSvc{registerErr: service.ErrQuotaExceeded}
-	h := NewInternalHandler(nil, worker, nil, nil, syncer)
+	h := NewInternalHandler(nil, worker, nil, nil, syncer, nil)
 
 	body, _ := json.Marshal(domain.RegisterWorkerRequest{
 		WorkerID: "w_us-east_1",

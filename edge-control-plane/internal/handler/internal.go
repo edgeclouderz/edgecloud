@@ -128,6 +128,7 @@ func NewInternalHandler(
 	domainSvc InternalDomainServiceInterface,
 	logEntryRepo logEntryRepo,
 	reconcileSvc syncRequester,
+	syncBuilder syncPayloadBuilder,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
@@ -135,16 +136,8 @@ func NewInternalHandler(
 		domainSvc:     domainSvc,
 		logEntryRepo:  logEntryRepo,
 		reconcileSvc:  reconcileSvc,
+		syncBuilder:   syncBuilder,
 	}
-}
-
-// SetSyncBuilder wires the /sync HTTP fallback endpoint's payload
-// builder. Kept separate from NewInternalHandler because the builder
-// is optional (when nil, /sync returns 501) and adding it as a 6th
-// constructor arg would force every existing test stub to pass nil
-// in a new position.
-func (h *InternalHandler) SetSyncBuilder(b syncPayloadBuilder) {
-	h.syncBuilder = b
 }
 
 // Download serves Wasm artifacts to authenticated workers.
