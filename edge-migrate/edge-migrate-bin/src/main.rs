@@ -26,7 +26,17 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
+use futures_util::StreamExt;
+
 const DEFAULT_API_URL: &str = "https://api.edgecloud.dev";
+
+/// Maximum bytes of a SUCCESS response body the bin will buffer
+/// before failing the parse. Distinct from [`MAX_ERR_BODY`] because
+/// success bodies are typed payloads (`MigrationReport`,
+/// `TreeMigrationReport`). Mirrors `edge-cli/src/api/client.rs::
+/// MAX_SUCCESS_BODY`. Sized to comfortably exceed the largest
+/// realistic migration report with headroom. Issue #109 follow-up.
+const MAX_SUCCESS_BODY: usize = 8 * 1024 * 1024;
 
 /// Maximum bytes of a server error body the CLI will keep in memory
 /// before truncating. Same value as
@@ -52,6 +62,64 @@ fn truncate_body(s: &str) -> String {
     out.push_str(&s[..end]);
     out.push_str("... [truncated]");
     out
+}
+
+/// Cap an async response body at `max` bytes by streaming chunks
+/// until the cap is hit, then discarding the rest. Returns the
+/// accumulated bytes as a `String` (lossy UTF-8 decode). Avoids the
+/// unbounded `response.text().await` pattern that OOMs on multi-GB
+/// bodies. Issue #109 follow-up.
+///
+/// Reads `max + 1` bytes — one more than the cap — so the
+/// downstream [`truncate_body`] can tell "body fit" (buf.len() <=
+/// max) apart from "we hit the cap" (buf.len() == max + 1). Without
+/// the +1, a 5 KiB error body would silently round-trip a 4 KiB
+/// slice with no `... [truncated]` marker. The extra byte is
+/// discarded by `truncate_body` either way.
+async fn read_capped_body(response: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    let limit = max + 1;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                // Handle a single chunk larger than `limit`:
+                // take only what fits, then stop.
+                let room = limit.saturating_sub(buf.len());
+                let take = room.min(bytes.len());
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= limit {
+                    break;
+                }
+            }
+            Err(_) => break, // severed connection mid-read — partial body, same as text().await.unwrap_or_default()
+        }
+    }
+    truncate_body(&String::from_utf8_lossy(&buf))
+}
+
+/// Cap a response body at `max` bytes and parse as JSON. Used on
+/// the success path where the body IS the data (`MigrationReport`
+/// / `TreeMigrationReport`). Larger cap than the error path
+/// because the payload is typed and bounded; mirrors
+/// `edge-cli/src/api/client.rs::MAX_SUCCESS_BODY`. Issue #109
+/// follow-up.
+async fn read_capped_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    max: usize,
+) -> Result<T> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading response chunk")?;
+        let room = max.saturating_sub(buf.len());
+        let take = room.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if buf.len() >= max {
+            break;
+        }
+    }
+    serde_json::from_slice(&buf).context("parsing capped response body as JSON")
 }
 
 /// Output format for `--transform`. `text` (default) writes raw WASI C
@@ -408,14 +476,11 @@ async fn upload_to_edgecloud(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = truncate_body(&response.text().await.unwrap_or_default());
+        let body = read_capped_body(response, MAX_ERR_BODY).await;
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
-    let report: MigrationReport = response
-        .json()
-        .await
-        .context("Failed to parse server response")?;
+    let report: MigrationReport = read_capped_json(response, MAX_SUCCESS_BODY).await?;
 
     Ok(report)
 }
@@ -526,14 +591,69 @@ async fn upload_tree_to_edgecloud(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = truncate_body(&response.text().await.unwrap_or_default());
+        let body = read_capped_body(response, MAX_ERR_BODY).await;
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
-    let report: edge_migrate_lib::TreeMigrationReport = response
-        .json()
-        .await
-        .context("Failed to parse server response")?;
+    let report: edge_migrate_lib::TreeMigrationReport =
+        read_capped_json(response, MAX_SUCCESS_BODY).await?;
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_body, MAX_ERR_BODY};
+
+    // Mirrors edge-cli/src/api/client.rs::tests — four tests pin the
+    // truncate_body contract end-to-end so a wire-format regression
+    // in one crate is caught by the other's tests too. Issue #109
+    // follow-up.
+
+    #[test]
+    fn truncate_body_short_input_returned_unchanged() {
+        let s = "invalid key".to_string();
+        assert_eq!(truncate_body(&s), s);
+    }
+
+    #[test]
+    fn truncate_body_exact_cap_returned_unchanged() {
+        let s = "a".repeat(MAX_ERR_BODY);
+        // Equal to cap → no truncation, no marker.
+        assert_eq!(truncate_body(&s), s);
+        assert!(!truncate_body(&s).contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_body_over_cap_gets_marker_and_larger_bytes_pre_counted() {
+        let s = "A".repeat(8 * 1024);
+        let out = truncate_body(&s);
+        assert!(out.starts_with(&"A".repeat(MAX_ERR_BODY)));
+        assert!(out.ends_with("... [truncated]"));
+        assert!(out.len() <= MAX_ERR_BODY + "... [truncated]".len());
+        // The original 8 KiB body must not survive verbatim.
+        assert!(!out.starts_with(&"A".repeat(MAX_ERR_BODY + 1)));
+    }
+
+    #[test]
+    fn truncate_body_walks_down_to_utf8_char_boundary() {
+        // MAX_ERR_BODY - 1 'a' bytes + a 3-byte UTF-8 char (U+3000)
+        // → total MAX_ERR_BODY + 2 bytes. The function must not
+        // panic mid-multibyte-char and must end on a char boundary.
+        let mut s: String = "a".repeat(MAX_ERR_BODY - 1);
+        s.push('\u{3000}');
+        assert!(s.len() > MAX_ERR_BODY);
+        let out = truncate_body(&s);
+        assert!(out.is_char_boundary(out.find("... [truncated]").unwrap()));
+        assert!(out.ends_with("... [truncated]"));
+    }
+
+    /// Pin the constant value locally. The cross-crate parity
+    /// with `edge-cli/src/api/client.rs::MAX_ERR_BODY` is enforced
+    /// by doc-comment review only — this test catches a drift in
+    /// *this* crate if a contributor bumps the value.
+    #[test]
+    fn max_err_body_is_4_kib() {
+        assert_eq!(MAX_ERR_BODY, 4 * 1024);
+    }
 }
