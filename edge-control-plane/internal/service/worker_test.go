@@ -22,6 +22,7 @@ type mockWorkerRepo struct {
 	upsertStatusFunc         func(ctx context.Context, ws *domain.WorkerStatus) error
 	listRunningAppTargetFunc func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 	getAppStatusFunc         func(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
+	getByIDFunc              func(ctx context.Context, id string) (*domain.Worker, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -59,6 +60,12 @@ func (m *mockWorkerRepo) GetAppStatus(ctx context.Context, tenantID, appName str
 		return nil, nil
 	}
 	return m.getAppStatusFunc(ctx, tenantID, appName)
+}
+func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker, error) {
+	if m.getByIDFunc == nil {
+		return nil, nil
+	}
+	return m.getByIDFunc(ctx, id)
 }
 
 // mockQuotaRepo implements quotaRepoInterface for testing.

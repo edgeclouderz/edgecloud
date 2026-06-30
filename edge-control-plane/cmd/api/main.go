@@ -138,6 +138,14 @@ func main() {
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
+	// ReconcileService is constructed here (alongside the other
+	// services) because InternalHandler needs a reference for the
+	// RegisterWorker hook (issue #53 on-register sync). The
+	// background loop is started later in runServer so the cancel
+	// from rootCancel actually tears it down.
+	reconcileSvc := service.NewReconcileService(
+		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+	)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	// Custom-domain service (issue #83). The migration from
@@ -160,7 +168,12 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc)
+	// Wire the read-only side of ReconcileService so the /sync HTTP
+	// fallback endpoint (issue #53) can return the same payload the
+	// periodic loop publishes. Done separately from NewInternalHandler
+	// so the constructor stays compact for tests.
+	internalHandler.SetSyncBuilder(reconcileSvc)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -388,6 +401,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
+	internalMux.HandleFunc("GET /api/internal/workers/{workerID}/sync", internalHandler.Sync)
 	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// Worker-driven auto-rollback: an edge-worker POSTs here when its
 	// supervisor exhausts the restart cap on a tenant app. The
@@ -502,6 +516,14 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	logGCInterval := parseDurationEnv("LOG_GC_INTERVAL", time.Hour)
 	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
 	go logGC.Run(rootCtx, logGCInterval, logRetention)
+
+	// Start periodic full-state reconcile (issue #53). Tunable via
+	// RECONCILE_INTERVAL; default 5min. The first sweep fires
+	// immediately so a fresh boot catches up workers that missed
+	// messages, then ticks on the configured interval. Idempotent —
+	// the worker-side diff treats identical AppConfig as a no-op.
+	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
+	go reconcileSvc.Run(rootCtx, reconcileInterval)
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use edge_runtime::linker::create_component_linker;
@@ -11,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
+use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -32,6 +34,19 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
+    /// JWT signer used by `fetch_sync` to authenticate the HTTP /sync
+    /// fallback request. Issue #53. Cached internally so each call is
+    /// cheap; reused across all fallback attempts.
+    pub jwt_signer: Arc<WorkerJwtSigner>,
+    /// Shared HTTP client. Constructed once at startup so its TLS
+    /// connection pool survives across every /sync fallback tick
+    /// (issue #53 perf: rebuilding a fresh `reqwest::Client` per
+    /// `fetch_sync` call meant a brand-new TLS handshake every 30s
+    /// during a sustained NATS outage). The underlying client is
+    /// internally `Arc`-backed, so cloning is cheap — but a shared
+    /// instance also lets the connection pool coalesce concurrent
+    /// fallback requests to the same control-plane host.
+    pub http: reqwest::Client,
 }
 
 impl Supervisor {
@@ -40,13 +55,51 @@ impl Supervisor {
     /// Diffs the desired app set against currently running apps and
     /// starts/stops apps accordingly. Supports canary/blue-green: when
     /// `spec.routes` is Some, all listed deployments run concurrently.
+    ///
+    /// Both `TaskUpdate` (event-driven, from activate/rollback) and
+    /// `FullSync` (periodic reconciliation + on-registration, issue #53)
+    /// share the same diff logic — the supervisor's contract is
+    /// "the apps map is the entire desired state". The CP publishes
+    /// `FullSync` with the worker's full active app set, so the worker's
+    /// diff against its current state naturally: stops apps no longer in
+    /// the set, starts missing, restarts on `deployment_id` mismatch.
+    /// The variant distinction exists only for observability so an
+    /// operator can tell event-driven updates from scheduled syncs in
+    /// metrics and logs.
     #[allow(clippy::type_complexity)]
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
-        let TaskMessage::TaskUpdate {
-            tenant_id,
-            apps: desired_apps,
-            ..
-        } = msg;
+        let (tenant_id, desired_apps) = match msg {
+            TaskMessage::TaskUpdate {
+                tenant_id, apps, ..
+            } => {
+                tracing::debug!(tenant_id = %tenant_id, apps = apps.len(), "task_update received");
+                (tenant_id, apps)
+            }
+            TaskMessage::FullSync {
+                tenant_id, apps, ..
+            } => {
+                // FullSync is the periodic safety net (issue #53). Same
+                // diff logic — workers don't need to know whether a
+                // message is event-driven or scheduled. The log line is
+                // the operator's signal that a reconcile fired.
+                tracing::info!(tenant_id = %tenant_id, apps = apps.len(), "full_sync received");
+                (tenant_id, apps)
+            }
+        };
+
+        // Bump the watchdog timer the moment we've parsed a message —
+        // not after we apply the diff. The watchdog's job is to catch
+        // *silence* (NATS hasn't spoken in N seconds); a hash mismatch,
+        // port-pool exhaustion, or transient downloader failure in the
+        // diff loop doesn't change the fact that NATS just spoke.
+        // Bumping at the end (the previous behaviour) meant a worker
+        // whose diff could only partially apply would see the
+        // watchdog fire /sync anyway — which is harmless in isolation
+        // but, combined with the boot-herd bug (commit F), would
+        // amplify a partial-outage into a full-outage storm.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(Instant::now());
+        }
 
         // Compute the set of (app_name, deployment_id) keys currently running,
         // and look up the deployment_id for each key so we can detect changes.
@@ -154,6 +207,62 @@ impl Supervisor {
         }
 
         Ok(())
+    }
+
+    /// Pull the current desired-state snapshot from the control plane
+    /// via the HTTP /sync fallback endpoint and return it as a
+    /// `TaskMessage` so the caller can apply it via
+    /// `handle_task_message` (issue #53).
+    ///
+    /// Used by the heartbeat-task watchdog when NATS has been silent
+    /// for longer than `EDGE_WORKER_SYNC_THRESHOLD_SECS`. The returned
+    /// message always has `type: "full_sync"` — the CP enforces that
+    /// on the wire — so the worker's existing handler applies it
+    /// identically to a NATS-delivered FullSync.
+    ///
+    /// Errors are NOT propagated as `Err` for transient failures
+    /// (network blip, 5xx); we return `Ok(None)` so the caller can
+    /// simply log and wait for the next heartbeat tick. A persistent
+    /// CP outage surfaces as repeated `warn!` log lines — the operator
+    /// signal that "NATS is silent AND the HTTP fallback is failing".
+    pub async fn fetch_sync(&self) -> anyhow::Result<Option<TaskMessage>> {
+        let url = format!(
+            "{}/api/internal/workers/{}/sync",
+            self.config.control_plane_url, self.config.worker_id
+        );
+        // Use the shared HTTP client (constructed once in main.rs)
+        // so its connection pool — and any open TLS sessions — are
+        // reused across every fallback tick. Building a fresh
+        // reqwest::Client per call would discard the pool and force
+        // a fresh TLS handshake on every 30s heartbeat.
+        let resp = match self
+            .http
+            .get(&url)
+            .bearer_auth(self.jwt_signer.sign())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(err = %e, url = %url, "sync fallback: GET failed");
+                return Ok(None);
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                url = %url,
+                "sync fallback: non-2xx response"
+            );
+            return Ok(None);
+        }
+        match resp.json::<TaskMessage>().await {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                tracing::warn!(err = %e, "sync fallback: deserialize failed");
+                Ok(None)
+            }
+        }
     }
 
     /// Start a new app or restart a changed one.

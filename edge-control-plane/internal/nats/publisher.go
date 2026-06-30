@@ -17,6 +17,12 @@ const TaskStreamName = "edgecloud-tasks"
 // Publisher defines the interface for NATS publishing.
 type Publisher interface {
 	PublishTaskUpdate(region string, msg *TaskMessage) error
+	// PublishFullSync publishes the full desired-state snapshot for a
+	// (tenant, region). Workers treat it as authoritative: stop any app
+	// not in the set, start any missing, restart any whose deployment_id
+	// doesn't match. Published periodically by ReconcileService (issue #53)
+	// and on worker registration so cold-start is instant.
+	PublishFullSync(region string, msg *TaskMessage) error
 	PublishHeartbeat(region string, msg *HeartbeatMessage) error
 	EnsureStream(cfg StreamConfig) error
 }
@@ -71,11 +77,38 @@ type StreamConfig struct {
 	Replicas  int
 }
 
+// applyTypeOverride returns a *TaskMessage with the given `type` field
+// set, preserving every other field from the input. Both the real
+// NATSPublisher and the MockPublisher call this so the wire shape is
+// guaranteed identical regardless of which publisher the operator
+// configured — and so the wire-format invariant has a single source of
+// truth (the override logic was previously only in
+// NATSPublisher.publishTaskMessage, and the mock printed whatever the
+// caller passed in; the two would diverge if a caller accidentally set
+// `Type: "task_update"` and called PublishFullSync through the mock).
+//
+// We snapshot rather than mutate so callers who hold a TaskMessage
+// pointer don't see their struct modified by the publish call.
+func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
+	return &TaskMessage{
+		Type:      typeField,
+		Timestamp: msg.Timestamp,
+		TenantID:  msg.TenantID,
+		Apps:      msg.Apps,
+	}
+}
+
 // MockPublisher is a no-op publisher for development.
 type MockPublisher struct{}
 
 func (p *MockPublisher) PublishTaskUpdate(region string, msg *TaskMessage) error {
-	data, _ := json.Marshal(msg)
+	data, _ := json.Marshal(applyTypeOverride(msg, "task_update"))
+	fmt.Printf("[NATS MOCK] Publish to edgecloud.tasks.%s: %s\n", region, string(data))
+	return nil
+}
+
+func (p *MockPublisher) PublishFullSync(region string, msg *TaskMessage) error {
+	data, _ := json.Marshal(applyTypeOverride(msg, "full_sync"))
 	fmt.Printf("[NATS MOCK] Publish to edgecloud.tasks.%s: %s\n", region, string(data))
 	return nil
 }
@@ -171,7 +204,27 @@ func equalSubjects(a, b []string) bool {
 // PublishTaskUpdate publishes a task update to edgecloud.tasks.<region>.
 func (p *NATSPublisher) PublishTaskUpdate(region string, msg *TaskMessage) error {
 	subject := "edgecloud.tasks." + region
-	data, err := json.Marshal(msg)
+	return p.publishTaskMessage(subject, msg, "task_update")
+}
+
+// PublishFullSync publishes a full-state sync to edgecloud.tasks.<region>.
+// Wire format is identical to PublishTaskUpdate except the `type` field is
+// "full_sync" so the worker can distinguish a scheduled reconcile from an
+// event-driven update in metrics/logs. Used by:
+//   - ReconcileService.Run — periodic safety net (RECONCILE_INTERVAL, default 5min)
+//   - ReconcileService.RequestSync — on worker registration
+//   - InternalHandler.Sync — HTTP fallback when NATS is silent > N seconds
+func (p *NATSPublisher) PublishFullSync(region string, msg *TaskMessage) error {
+	subject := "edgecloud.tasks." + region
+	return p.publishTaskMessage(subject, msg, "full_sync")
+}
+
+// publishTaskMessage marshals and publishes a TaskMessage, overriding the
+// `type` field via applyTypeOverride (shared with MockPublisher so the
+// wire shape is identical regardless of which publisher the operator
+// configured).
+func (p *NATSPublisher) publishTaskMessage(subject string, msg *TaskMessage, typeField string) error {
+	data, err := json.Marshal(applyTypeOverride(msg, typeField))
 	if err != nil {
 		return fmt.Errorf("marshaling task message: %w", err)
 	}

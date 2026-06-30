@@ -91,6 +91,7 @@ fn test_config(
         control_plane_url,
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
         heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
@@ -356,6 +357,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
         heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
@@ -400,8 +402,12 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
-        jwt_signer,
+        jwt_signer.clone(),
     );
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
 
     let supervisor = Arc::new(Supervisor {
         config,
@@ -410,6 +416,8 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         port_pool,
         nats,
         log_forwarder,
+        jwt_signer,
+        http,
     });
 
     // Build and publish a heartbeat manually
@@ -518,6 +526,7 @@ async fn build_supervisor(
         control_plane_url: control_plane_url.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
@@ -558,8 +567,11 @@ async fn build_supervisor(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
-        jwt_signer,
+        jwt_signer.clone(),
     );
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     Ok(Arc::new(Supervisor {
         config,
         state,
@@ -567,6 +579,8 @@ async fn build_supervisor(
         port_pool,
         nats,
         log_forwarder,
+        jwt_signer,
+        http,
     }))
 }
 
@@ -1399,4 +1413,375 @@ async fn test_emit_log_reaches_ingest_within_5s() {
     // is about to drop; the in-flight task gets cancelled along
     // with the rest of the tokio runtime when the test fn returns.
     drop(shutdown_tx);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP /sync fallback (issue #53)
+//
+// fetch_sync is the worker's HTTP escape hatch when NATS has been silent
+// for longer than `worker_sync_threshold_secs`. These tests pin the wire
+// contract: the GET path, the Bearer auth, the response shape, and the
+// failure modes (non-2xx, malformed body). The actual diff application
+// is already covered by handle_task_message tests above; we only need to
+// prove fetch_sync decodes the wire correctly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_fetch_sync_happy_path() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(HARNESS_STARTUP_TIMEOUT, test_fetch_sync_happy_path_inner())
+        .await
+        .expect("test_fetch_sync_happy_path timed out")
+        .expect("test_fetch_sync_happy_path failed");
+}
+
+async fn test_fetch_sync_happy_path_inner() -> anyhow::Result<()> {
+    let mock_server = MockServer::start().await;
+    let supervisor =
+        build_supervisor_only_with_cp("test-worker", "test-region", "t_test", &mock_server.uri())
+            .await?;
+
+    // Mock the CP /sync response. The CP returns a TaskMessage with
+    // type="full_sync" (set by the ReconcileService.BuildFullSync
+    // envelope) and one app in the apps map.
+    let body = serde_json::json!({
+        "type": "full_sync",
+        "timestamp": "2026-06-20T00:00:00Z",
+        "tenant_id": "t_test",
+        "apps": {
+            "sync-fallback-app": {
+                "deployment_id": "d_sync_1",
+                "deployment_hash": "deadbeef".repeat(8),
+                "env": {},
+                "allowlist": [],
+                "max_memory_mb": 256,
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/internal/workers/test-worker/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock_server)
+        .await;
+
+    let msg = supervisor
+        .fetch_sync()
+        .await
+        .expect("fetch_sync")
+        .expect("fetch_sync returned None on happy path");
+
+    // Wire shape lock — workers fail to deserialize if the type field
+    // isn't "full_sync" (issue #53).
+    match msg {
+        TaskMessage::FullSync {
+            tenant_id, apps, ..
+        } => {
+            assert_eq!(tenant_id, "t_test");
+            assert_eq!(apps.len(), 1);
+            assert!(apps.contains_key("sync-fallback-app"));
+        }
+        TaskMessage::TaskUpdate { .. } => {
+            panic!("fetch_sync returned TaskUpdate; expected FullSync")
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fetch_sync_non_2xx_returns_none() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(
+        HARNESS_STARTUP_TIMEOUT,
+        test_fetch_sync_non_2xx_returns_none_inner(),
+    )
+    .await
+    .expect("test_fetch_sync_non_2xx_returns_none timed out")
+    .expect("test_fetch_sync_non_2xx_returns_none failed");
+}
+
+async fn test_fetch_sync_non_2xx_returns_none_inner() -> anyhow::Result<()> {
+    let mock_server = MockServer::start().await;
+    let supervisor =
+        build_supervisor_only_with_cp("test-worker", "test-region", "t_test", &mock_server.uri())
+            .await?;
+    Mock::given(method("GET"))
+        .and(path("/api/internal/workers/test-worker/sync"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let msg = supervisor.fetch_sync().await.expect("fetch_sync");
+    assert!(
+        msg.is_none(),
+        "non-2xx response must surface as None, not error"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fetch_sync_malformed_body_returns_none() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(
+        HARNESS_STARTUP_TIMEOUT,
+        test_fetch_sync_malformed_body_returns_none_inner(),
+    )
+    .await
+    .expect("test_fetch_sync_malformed_body timed out")
+    .expect("test_fetch_sync_malformed_body failed");
+}
+
+async fn test_fetch_sync_malformed_body_returns_none_inner() -> anyhow::Result<()> {
+    let mock_server = MockServer::start().await;
+    let supervisor =
+        build_supervisor_only_with_cp("test-worker", "test-region", "t_test", &mock_server.uri())
+            .await?;
+    Mock::given(method("GET"))
+        .and(path("/api/internal/workers/test-worker/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&mock_server)
+        .await;
+
+    let msg = supervisor.fetch_sync().await.expect("fetch_sync");
+    assert!(
+        msg.is_none(),
+        "malformed JSON must surface as None, not propagate"
+    );
+    Ok(())
+}
+
+// last_task_received_at wiring (issue #53 watchdog). After
+// handle_task_message succeeds the timestamp must be Some(Instant::now())
+// so the heartbeat-task watchdog knows to skip the HTTP /sync fallback.
+#[tokio::test]
+async fn test_handle_task_message_bumps_last_task_received_at() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(
+        HARNESS_STARTUP_TIMEOUT,
+        test_handle_task_message_bumps_last_task_received_at_inner(),
+    )
+    .await
+    .expect("test_handle_task_message_bumps_last_task_received_at timed out")
+    .expect("test_handle_task_message_bumps_last_task_received_at failed");
+}
+
+async fn test_handle_task_message_bumps_last_task_received_at_inner() -> anyhow::Result<()> {
+    let harness = build_supervisor_only_with_cp(
+        "test-worker",
+        "test-region",
+        "t_test",
+        "http://localhost:9999",
+    )
+    .await?;
+
+    // Pre-condition: freshly constructed supervisor seeds
+    // last_task_received_at to Some(construction_instant) — see
+    // WorkerState::new and the boot-herd fix in commit F of PR
+    // #166's review follow-up. The watchdog must NOT treat a
+    // freshly-booted worker as infinitely stale.
+    {
+        let state = harness.state.read().await;
+        let pre_seed = *state
+            .last_task_received_at
+            .lock()
+            .expect("last_task_received_at mutex poisoned");
+        assert!(
+            pre_seed.is_some(),
+            "expected last_task_received_at=Some after construction (boot herd fix)"
+        );
+    }
+
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-20T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::new(),
+    };
+    harness
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    // Post-condition: Some(Instant) regardless of variant.
+    let state = harness.state.read().await;
+    let post = *state
+        .last_task_received_at
+        .lock()
+        .expect("last_task_received_at mutex poisoned");
+    assert!(
+        post.is_some(),
+        "expected last_task_received_at=Some after handle_task_message"
+    );
+    Ok(())
+}
+
+// test_handle_task_message_bumps_timestamp_on_partial_diff_failure
+// covers the fix from review of PR #166, finding #3: the watchdog
+// timer must reflect "we heard from NATS" (or HTTP), not "the diff
+// fully applied". The previous implementation bumped the timer at
+// the END of handle_task_message — so a diff that failed to apply
+// (e.g. downloader rejection, hash mismatch, port exhaustion) left
+// the timer untouched, and the heartbeat-loop watchdog would
+// trigger /sync anyway. That amplification (combined with the
+// boot-time fetch herd from finding #6) would convert a partial
+// outage into a thundering-herd against the /sync endpoint.
+//
+// The diff is forced to fail by including an app whose deployment
+// hash is malformed — the downloader's pre-check rejects non-hex
+// hashes without ever making the HTTP fetch, so the test stays
+// hermetic (no real CP server required).
+async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
+) -> anyhow::Result<()> {
+    let harness = build_supervisor_only_with_cp(
+        "test-worker",
+        "test-region",
+        "t_test",
+        "http://localhost:9999",
+    )
+    .await?;
+
+    // Force a diff-failure path: deployment_hash is shorter than the
+    // 64-char SHA-256 length, so downloader::verify_hash bails at the
+    // pre-check before any network call.
+    let bad_app = AppSpec {
+        deployment_id: "d_broken".to_string(),
+        deployment_hash: "tooshort".to_string(), // not 64 hex chars
+        routes: None,
+        env: HashMap::new(),
+        allowlist: None,
+        max_memory_mb: 256,
+    };
+    let mut apps = HashMap::new();
+    apps.insert("myapp".to_string(), bad_app);
+
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-20T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps,
+    };
+
+    // handle_task_message itself returns Ok — it logs start_app
+    // failures and continues. The watchdog bump must still have
+    // happened.
+    harness.handle_task_message(msg).await?;
+
+    let state = harness.state.read().await;
+    let post = *state
+        .last_task_received_at
+        .lock()
+        .expect("last_task_received_at mutex poisoned");
+    assert!(
+        post.is_some(),
+        "expected last_task_received_at=Some even when diff fails to apply (fix for PR #166 finding #3)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+    timeout(
+        HARNESS_STARTUP_TIMEOUT,
+        test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(),
+    )
+    .await
+    .expect("test_handle_task_message_bumps_timestamp_on_partial_diff_failure timed out")
+    .expect("test_handle_task_message_bumps_timestamp_on_partial_diff_failure failed");
+}
+
+// fetch_sync / handle_task_message wiring tests only need a Supervisor
+// with a real engine + a mock CP URL — they don't need NATS. Build a
+// minimal Supervisor on its own (without the full harness's container)
+// so the assertion stays focused. NATS is still required because
+// NatsClientImpl::connect is part of Supervisor construction; the
+// fetch_sync tests below skip the NATS subscription and only inspect
+// the HTTP response.
+//
+// `control_plane_url` must be the wiremock server URI for fetch_sync
+// tests. Tests construct it themselves.
+async fn build_supervisor_only_with_cp(
+    worker_id: &str,
+    region: &str,
+    tenant_id: &str,
+    control_plane_url: &str,
+) -> anyhow::Result<Arc<Supervisor>> {
+    let (container, nats_url) = nats_container().await;
+    std::mem::forget(container);
+
+    let config = Config {
+        worker_id: worker_id.to_string(),
+        region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
+        nats_url,
+        control_plane_url: control_plane_url.to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-sync-test-cache"),
+        heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 19_500,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: "test-sync-group".to_string(),
+        consumer_name: "test-sync-consumer".to_string(),
+        worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: tenant_id.to_string(),
+    };
+
+    let engine = edge_runtime::create_engine().context("create engine")?;
+    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
+    let downloader = Arc::new(Downloader::new(
+        config.control_plane_url.clone(),
+        config.cache_dir.clone(),
+        jwt_signer.clone(),
+    ));
+    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
+        config.starting_port,
+        config.port_cooldown_secs,
+    )));
+    let nats =
+        Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn NatsClientTrait>;
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer.clone(),
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    Ok(Arc::new(Supervisor {
+        config,
+        state,
+        downloader,
+        port_pool,
+        nats,
+        log_forwarder,
+        jwt_signer,
+        http,
+    }))
 }

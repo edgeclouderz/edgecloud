@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
@@ -51,11 +53,24 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // 501. `logEntryRepo` is the worker log ingest path (issue #76);
 // required by AutoRollback's audit trail and any future log-bearing
 // endpoint.
+//
+// `reconcileSvc` is the on-demand full_sync publisher used by
+// RegisterWorker (issue #53). When nil, registration does not trigger
+// a sync — the periodic timer in cmd/api/main.go will catch up
+// within RECONCILE_INTERVAL. Set via NewInternalHandler. Tests pass
+// nil so they don't have to wire a publisher.
 type InternalHandler struct {
 	deploymentSvc autoRollbacker
-	workerSvc     *service.WorkerService
+	workerSvc     workerRegisterer
 	domainSvc     InternalDomainServiceInterface
 	logEntryRepo  logEntryRepo
+	reconcileSvc  syncRequester
+	// syncBuilder is the read-only side of the ReconcileService — it
+	// computes the per-region AppConfig map without publishing, so the
+	// HTTP /sync fallback endpoint (issue #53) can return the exact
+	// payload the periodic loop would publish. Tests inject a stub.
+	// nil-safe: when nil, the Sync endpoint returns 501.
+	syncBuilder syncPayloadBuilder
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -69,18 +84,67 @@ type autoRollbacker interface {
 	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
 }
 
+// workerRegisterer is the narrow contract the RegisterWorker endpoint
+// needs. Holding the concrete *service.WorkerService made it
+// impossible to test the success path without standing up the full
+// worker service (DB + NATS conn + metrics aggregator). Production
+// caller (cmd/api/main.go) still passes *service.WorkerService, which
+// satisfies the interface. ListWorkers isn't covered here because no
+// other endpoint currently exercises the worker service — if a future
+// endpoint needs ListByTenant, add it to this interface.
+type workerRegisterer interface {
+	Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	// Get resolves a worker_id (from the URL path of /api/internal/workers/{workerID}/sync)
+	// to a *domain.Worker so the handler can scope the sync payload to
+	// that worker's (tenant, region). Issue #53.
+	Get(ctx context.Context, workerID string) (*domain.Worker, error)
+}
+
+// syncRequester is the narrow contract RegisterWorker uses to trigger
+// an on-register full_sync (issue #53). Defining it as an interface
+// (instead of taking *service.ReconcileService directly) keeps handler
+// tests mockable without standing up the full ReconcileService — the
+// only production caller is `*service.ReconcileService`, set in
+// cmd/api/main.go.
+//
+// nil means "no on-register sync" — tests pass nil, the periodic
+// timer in cmd/api/main.go is the durable safety net.
+type syncRequester interface {
+	RequestSync(ctx context.Context, tenantID, region string)
+}
+
+// syncPayloadBuilder is the read-only counterpart: it computes the
+// per-region AppConfig map without publishing, so the HTTP /sync
+// fallback endpoint (issue #53) can return the same payload the
+// periodic loop would publish. *service.ReconcileService satisfies it.
+type syncPayloadBuilder interface {
+	BuildFullSync(ctx context.Context, tenantID, region string) (map[string]nats.AppConfig, error)
+}
+
 func NewInternalHandler(
 	deploymentSvc autoRollbacker,
-	workerSvc *service.WorkerService,
+	workerSvc workerRegisterer,
 	domainSvc InternalDomainServiceInterface,
 	logEntryRepo logEntryRepo,
+	reconcileSvc syncRequester,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
 		domainSvc:     domainSvc,
 		logEntryRepo:  logEntryRepo,
+		reconcileSvc:  reconcileSvc,
 	}
+}
+
+// SetSyncBuilder wires the /sync HTTP fallback endpoint's payload
+// builder. Kept separate from NewInternalHandler because the builder
+// is optional (when nil, /sync returns 501) and adding it as a 6th
+// constructor arg would force every existing test stub to pass nil
+// in a new position.
+func (h *InternalHandler) SetSyncBuilder(b syncPayloadBuilder) {
+	h.syncBuilder = b
 }
 
 // Download serves Wasm artifacts to authenticated workers.
@@ -146,6 +210,26 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+
+	// Fire-and-forget full_sync so the worker comes up populated
+	// immediately instead of waiting up to RECONCILE_INTERVAL (issue #53).
+	// Best-effort: the periodic timer is the durable safety net, so a
+	// publish failure here is logged and dropped — the worker's next
+	// reconcile sweep (or the on-register fallback in cmd/api/main.go's
+	// process restart) catches up.
+	//
+	// We capture (tenantID, region) and use a fresh background ctx with
+	// a short deadline because r.Context() is cancelled the moment
+	// WriteHeader returns, and we don't want the publish to inherit
+	// that cancellation. NATS publishes have their own internal
+	// timeout; the 5s cap here just bounds the goroutine lifetime.
+	if h.reconcileSvc != nil {
+		go func(t, region string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			h.reconcileSvc.RequestSync(ctx, t, region)
+		}(tenantID, req.Region)
+	}
 }
 
 // ListWorkers handles GET /api/internal/workers — list workers for the authenticated tenant.
@@ -263,6 +347,95 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 		"deployment_id": newID,
 	}); err != nil {
 		log.Printf("AutoRollback: failed to encode response: %v", err)
+	}
+}
+
+// Sync handles GET /api/internal/workers/{workerID}/sync — HTTP
+// fallback for when a worker hasn't received any NATS message on
+// edgecloud.tasks.<region> for > N seconds (the worker's own
+// watchdog decides when to call; this endpoint just answers).
+//
+// Worker-authenticated: any valid worker JWT works, BUT the URL-path
+// workerID must belong to the JWT's tenant — otherwise a worker
+// registered for tenant A could enumerate workerIDs (they follow the
+// documented `w_<region>_<n>` prefix, also visible in heartbeats)
+// and read tenant B's full app set (deployment IDs, hashes, env
+// vars, allowlists). tenant_id is derived from the JWT claim, never
+// from the URL.
+//
+// Returns the same TaskMessage payload the periodic full_sync
+// publish would emit, so the worker's existing handle_task_message
+// can apply it without any new logic. The wire type is "full_sync"
+// so the worker can log/metric it distinctly from event-driven
+// task_update messages.
+//
+// 501 when the control plane was built without the sync builder
+// wired in (tests, or an operator who explicitly disabled the
+// fallback). 404 when the workerID isn't registered OR doesn't
+// belong to the authenticated tenant (the same response in both
+// cases prevents workerID enumeration via differential responses).
+// 500 on a DB error from workerSvc.Get or syncBuilder.BuildFullSync.
+func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
+	if h.syncBuilder == nil {
+		http.Error(w, "sync fallback not enabled", http.StatusNotImplemented)
+		return
+	}
+	workerID := r.PathValue("workerID")
+	if workerID == "" {
+		http.Error(w, "worker_id path parameter required", http.StatusBadRequest)
+		return
+	}
+
+	worker, err := h.workerSvc.Get(r.Context(), workerID)
+	if err != nil {
+		log.Printf("Sync(%s): %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if worker == nil {
+		// Don't distinguish "not registered" from "belongs to a
+		// different tenant" — both return 404 with the same body so
+		// an attacker can't enumerate workerIDs belonging to other
+		// tenants.
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Cross-tenant authorization check: a worker authenticated as
+	// tenant A cannot read tenant B's app set via /sync. Without
+	// this, any compromised worker JWT could enumerate other
+	// tenant workerIDs and pull deployment metadata + env vars.
+	// Same response shape as the "worker not found" branch above.
+	jwtTenantID := middleware.GetWorkerTenantID(r.Context())
+	if worker.TenantID != jwtTenantID {
+		log.Printf("Sync(%s): JWT tenant=%s != worker tenant=%s; denying",
+			workerID, jwtTenantID, worker.TenantID)
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
+
+	apps, err := h.syncBuilder.BuildFullSync(r.Context(), worker.TenantID, worker.Region)
+	if err != nil {
+		log.Printf("Sync(%s): build: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if apps == nil {
+		// BuildFullSync is documented to return an empty map, not nil,
+		// when there's nothing to publish. Defensively normalize so the
+		// worker's JSON deserializer never sees `"apps": null`.
+		apps = map[string]nats.AppConfig{}
+	}
+
+	payload := map[string]interface{}{
+		"type":      "full_sync",
+		"timestamp": time.Now().UTC(),
+		"tenant_id": worker.TenantID,
+		"apps":      apps,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Sync(%s): encode: %v", workerID, err)
 	}
 }
 

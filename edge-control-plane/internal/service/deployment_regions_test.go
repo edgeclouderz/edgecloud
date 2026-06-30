@@ -61,6 +61,17 @@ func (p *RecordingPublisher) PublishHeartbeat(string, *nats.HeartbeatMessage) er
 	return nil
 }
 
+// PublishFullSync records the call but is not exercised by the fan-out
+// tests (those only assert on ActivateDeployment's per-region
+// task_update publishes). failFor semantics are NOT honored here — a
+// FullSync publish failure during a test would surface as the test
+// crashing, not as a "region failed" event, since FullSync is a
+// scheduled reconcile, not an event-driven activation.
+func (p *RecordingPublisher) PublishFullSync(region string, msg *nats.TaskMessage) error {
+	p.calls = append(p.calls, recordedPublish{region: region, msg: msg})
+	return nil
+}
+
 func (p *RecordingPublisher) EnsureStream(nats.StreamConfig) error { return nil }
 
 // activateSvcForTest wires a DeploymentService with sqlmock-backed
