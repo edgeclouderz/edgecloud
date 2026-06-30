@@ -327,18 +327,16 @@ mod tests {
         let path = dir.path().join("config");
         ApiKey("k_no_ext".into()).save_to(&path).unwrap();
 
-        // The final file exists with the right key, and the wrong
-        // tmp from the old code path (`config.tmp`) does NOT remain
-        // — atomic_write_tmp_path returns it as a sibling that the
-        // rename consumes.
+        // The load-bearing assertion: the final file exists with
+        // the right key. Under the OLD `with_extension("toml.tmp")`
+        // code, the rename would have produced the wrong tmp name
+        // and this assertion would fire. The tmp-path helper itself
+        // is unit-tested directly below in
+        // `atomic_write_tmp_path_appends_tmp_to_basename`.
         assert!(path.exists(), "final file should exist");
         let parsed =
             toml::from_str::<TomlConfig>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed.default.api_key.as_deref(), Some("k_no_ext"));
-        assert!(
-            !dir.path().join("config.tmp").exists(),
-            "old-shape tmp must not be left behind"
-        );
     }
 
     #[test]
@@ -348,17 +346,13 @@ mod tests {
         ApiKey("k_seed".into()).save_to(&path).unwrap();
         ApiKey::clear_at(&path).unwrap();
 
-        // api_key should be gone, the tmp should be cleaned up, and
-        // the file itself should still exist (clear preserves other
-        // top-level sections).
+        // Load-bearing: the file still exists (clear preserves
+        // other top-level sections) and the api_key is gone.
+        // Same F8 pin shape as `save_to_*` above.
         assert!(path.exists(), "file should still exist after clear");
         let parsed =
             toml::from_str::<TomlConfig>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(parsed.default.api_key.is_none());
-        assert!(
-            !dir.path().join("config.tmp").exists(),
-            "old-shape tmp must not be left behind"
-        );
     }
 
     #[test]

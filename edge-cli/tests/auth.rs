@@ -1191,17 +1191,17 @@ async fn rejected_response_with_huge_body_truncates_in_stderr() {
 
     // The marker must appear AND the full 16 KiB must NOT — caps
     // memory at MAX_ERR_BODY and pins the contract end-to-end.
-    cmd.assert()
+    // Single chain (`.assert()` once) with `.get_output()` at the
+    // tail so we capture stderr from the same invocation the
+    // predicates ran against — no redundant second `.assert()`.
+    let assert = cmd
+        .assert()
         .failure()
         .code(1)
         .stderr(predicate::str::contains("... [truncated]"))
         .stderr(predicate::str::contains("rejected"));
-
-    // Independently verify the truncation marker bytes appear in
-    // stderr (the predicate::str::contains above is substring-level;
-    // this is belt-and-suspenders for the bit-pattern sanity).
-    let output = cmd.assert().failure();
-    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains(&big_body),
         "stderr leaked the full 16 KiB body to the user"
