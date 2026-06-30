@@ -1901,9 +1901,7 @@ fn is_websocket_upgrade(headers: &[(String, String)]) -> bool {
             {
                 has_upgrade_conn = true;
             }
-        } else if k.eq_ignore_ascii_case("upgrade")
-            && v.trim().eq_ignore_ascii_case("websocket")
-        {
+        } else if k.eq_ignore_ascii_case("upgrade") && v.trim().eq_ignore_ascii_case("websocket") {
             has_websocket_upgrade = true;
         }
     }
