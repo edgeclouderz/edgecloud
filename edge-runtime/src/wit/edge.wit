@@ -174,6 +174,7 @@ interface http-server {
     headers: list<tuple<string, string>>,
     body: body-source,
     trace: option<trace-context>,
+    is-websocket-upgrade: bool,
     // Inbound body framing accepted by the host:
     // - Content-Length declared: body is buffered or streamed per the
     //   host's `stream_threshold`.
@@ -204,6 +205,48 @@ interface http-server {
   stop: func();
 }
 
+interface websocket {
+  variant ws-event {
+    connected(ws-connection-info),
+    text-message(ws-message),
+    binary-message(ws-message),
+    ping(list<u8>),
+    closed(ws-close-event),
+    error(ws-error-event),
+  }
+
+  record ws-connection-info {
+    conn-id: u64,
+    path: string,
+    headers: list<tuple<string, string>>,
+    query: option<string>,
+  }
+
+  record ws-message {
+    conn-id: u64,
+    data: list<u8>,
+  }
+
+  record ws-close-event {
+    conn-id: u64,
+    code: u16,
+    reason: string,
+  }
+
+  record ws-error-event {
+    conn-id: u64,
+    message: string,
+  }
+
+  accept-websocket: func(request-id: u64) -> result<u64, string>;
+  reject-websocket: func(request-id: u64, status: u32, reason: string);
+  ws-poll: func() -> result<option<ws-event>, string>;
+  ws-send-text: func(conn-id: u64, data: string) -> result<_, string>;
+  ws-send-binary: func(conn-id: u64, data: list<u8>) -> result<_, string>;
+  ws-close: func(conn-id: u64, code: u16, reason: string);
+  ws-connection-count: func() -> u32;
+}
+
 world edge-runtime {
   import http-client;
   import networking;
@@ -214,4 +257,5 @@ world edge-runtime {
   import scheduling;
   import process;
   import http-server;
+  import websocket;
 }

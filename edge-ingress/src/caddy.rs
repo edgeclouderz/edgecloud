@@ -230,6 +230,7 @@ pub fn render_routes(
                         "handle": [{
                             "handler": "reverse_proxy",
                             "upstreams": upstreams,
+                            "stream_close_delay": "5m",
                             "health_checks": {
                                 "active": {"uri": "/", "expect_status": 2}
                             }
@@ -275,6 +276,7 @@ pub fn render_routes(
                     "handle": [{
                         "handler": "reverse_proxy",
                         "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
+                        "stream_close_delay": "5m",
                         // Same liveness probe as the synthetic-host
                         // route above: without it, Caddy only marks
                         // the upstream unhealthy when an active

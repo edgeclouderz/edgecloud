@@ -18,6 +18,8 @@ use crate::edge::cloud::time::Host as TimeHost;
 use crate::egress::EgressPolicy;
 #[cfg(feature = "http-server")]
 use crate::interfaces::http_server::BodySource as HttpServerInternalBodySource;
+#[cfg(feature = "websocket")]
+use crate::interfaces::websocket;
 use crate::interfaces::{
     cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
 };
@@ -39,6 +41,8 @@ pub struct RuntimeState {
     pub process: process::Process,
     pub networking: networking::NetworkingState,
     pub http_server: http_server::HttpServer,
+    #[cfg(feature = "websocket")]
+    pub websocket: websocket::WebSocketState,
     /// Tenant that owns this runtime instance. Used to scope persisted stores
     /// to per-tenant directories so one tenant's data cannot be accessed by another.
     pub tenant_id: String,
@@ -75,6 +79,13 @@ impl RuntimeState {
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
+        #[cfg(feature = "websocket")]
+        let websocket = websocket::WebSocketState::new();
+        let mut http_server = http_server::HttpServer::new();
+        #[cfg(feature = "websocket")]
+        {
+            http_server.pending_upgrades = websocket.pending_upgrades.clone();
+        }
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Arc::new(kv_store::KvStore::new()),
@@ -87,7 +98,9 @@ impl RuntimeState {
                 exit_code.clone(),
             ),
             networking,
-            http_server: http_server::HttpServer::new(),
+            http_server,
+            #[cfg(feature = "websocket")]
+            websocket,
             tenant_id: String::new(),
             egress: Arc::new(EgressPolicy::allow_all()),
             exit_code,
@@ -125,6 +138,13 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "websocket")]
+        let websocket = websocket::WebSocketState::new();
+        let mut http_server = http_server::HttpServer::new();
+        #[cfg(feature = "websocket")]
+        {
+            http_server.pending_upgrades = websocket.pending_upgrades.clone();
+        }
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -134,7 +154,9 @@ impl RuntimeState {
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
-            http_server: http_server::HttpServer::new(),
+            http_server,
+            #[cfg(feature = "websocket")]
+            websocket,
             tenant_id,
             egress,
             exit_code,
@@ -170,6 +192,13 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "websocket")]
+        let websocket = websocket::WebSocketState::new();
+        let mut http_server = http_server::HttpServer::with_meter(meter);
+        #[cfg(feature = "websocket")]
+        {
+            http_server.pending_upgrades = websocket.pending_upgrades.clone();
+        }
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -179,7 +208,9 @@ impl RuntimeState {
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
-            http_server: http_server::HttpServer::with_meter(meter),
+            http_server,
+            #[cfg(feature = "websocket")]
+            websocket,
             tenant_id,
             egress,
             exit_code,
@@ -666,6 +697,7 @@ impl HttpServerHost for RuntimeState {
                             traceparent: tc.traceparent,
                             tracestate: tc.tracestate,
                         }),
+                    is_websocket_upgrade: req.is_websocket_upgrade,
                 }
             })
         })
@@ -844,6 +876,31 @@ mod streams_impl {
 
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 impl StreamsHost for RuntimeState {}
+
+#[cfg(feature = "websocket")]
+impl crate::edge::cloud::websocket::Host for RuntimeState {
+    fn accept_websocket(&mut self, request_id: u64) -> Result<u64, String> {
+        self.websocket.accept_websocket(request_id)
+    }
+    fn reject_websocket(&mut self, request_id: u64, status: u32, reason: String) -> () {
+        let _ = self.websocket.reject_websocket(request_id, status, reason);
+    }
+    fn ws_poll(&mut self) -> Result<Option<crate::edge::cloud::websocket::WsEvent>, String> {
+        self.websocket.ws_poll()
+    }
+    fn ws_send_text(&mut self, conn_id: u64, data: String) -> Result<(), String> {
+        self.websocket.ws_send_text(conn_id, data)
+    }
+    fn ws_send_binary(&mut self, conn_id: u64, data: Vec<u8>) -> Result<(), String> {
+        self.websocket.ws_send_binary(conn_id, data)
+    }
+    fn ws_close(&mut self, conn_id: u64, code: u16, reason: String) -> () {
+        let _ = self.websocket.ws_close(conn_id, code, reason);
+    }
+    fn ws_connection_count(&mut self) -> u32 {
+        self.websocket.ws_connection_count()
+    }
+}
 
 // ── Egress integration tests ────────────────────────────────────────────────
 
