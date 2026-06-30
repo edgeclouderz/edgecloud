@@ -4,6 +4,7 @@ use anyhow::Result;
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 use crate::config::ApiKey;
 
@@ -65,17 +66,31 @@ impl From<serde_json::Error> for ApiError {
 /// `Tenants`, `Keys`, etc.) can reuse the same 2xx/4xx/5xx split
 /// instead of hand-rolling `if !status.is_success()` per method.
 ///
-/// The error body is capped at [`MAX_ERR_BODY`] bytes via
-/// [`truncate_body`] before being plumbed into either the
-/// `Rejected` arm or the `Transient` anyhow! arm, so a misbehaving
+/// The error body is read with a [`std::io::Read::take`] cap at
+/// [`MAX_ERR_BODY`] bytes — the underlying HTTP body itself is
+/// bounded, not just the post-allocation string — so a misbehaving
 /// control plane returning a multi-GB 4xx/5xx body can't OOM the
-/// CLI. Issue #109 F9.
+/// CLI. The accumulated bytes then flow through [`truncate_body`]
+/// for the UTF-8 char-boundary walk before being plumbed into
+/// either the `Rejected` arm or the `Transient` anyhow! arm.
+/// Issue #109 F9 + follow-up.
 pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = truncate_body(&resp.text().unwrap_or_default());
+    // Read at most MAX_ERR_BODY + 1 bytes from the response stream
+    // — one more than the cap so `truncate_body` can tell "body fit"
+    // (buf.len() <= MAX_ERR_BODY) apart from "we hit the cap"
+    // (buf.len() == MAX_ERR_BODY + 1). `Take::read_to_end` is a hard
+    // cap: a multi-GB body is discarded by reqwest after the first
+    // MAX_ERR_BODY + 1 bytes. Discarded Result matches the prior
+    // `unwrap_or_default()` semantics for a severed connection
+    // mid-read.
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut resp.take((MAX_ERR_BODY + 1) as u64), &mut buf);
+    let body = truncate_body(&String::from_utf8_lossy(&buf));
     if status.is_client_error() {
         Err(ApiError::Rejected { status, body })
     } else {
@@ -93,6 +108,22 @@ pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
 /// Issue #109 F9. Kept in sync with the same constant in
 /// `edge-migrate/edge-migrate-bin/src/main.rs`.
 const MAX_ERR_BODY: usize = 4 * 1024;
+
+/// Maximum bytes of a SUCCESS response body the CLI will buffer
+/// into memory before failing the parse. Distinct from
+/// [`MAX_ERR_BODY`] because success bodies are bulk endpoints —
+/// `Logs::list` returns up to 1000 records (`logs::list` doc)
+/// where each `LogEntry` averages ~300 bytes and can be multi-KiB
+/// with verbose messages. 4 KiB is correct for diagnostics but
+/// wrong for data: 1000 × 5 KiB ≈ 5 MiB is a realistic worst
+/// case. 8 MiB gives ~50% headroom while bounding the process at
+/// 8 MiB per request (the CLI is single-threaded, so the bound
+/// is global).
+///
+/// Allocated up-front as a `Vec<u8>` capacity hint on every
+/// success-path call. Fine for a one-request-at-a-time CLI; a
+/// future concurrent refactor should revisit. Issue #109 follow-up.
+const MAX_SUCCESS_BODY: u64 = 8 * 1024 * 1024;
 
 /// Cap a server response body at [`MAX_ERR_BODY`] bytes. Real
 /// server error JSON is 100-500 bytes; RFC 7807 problem-detail
@@ -359,7 +390,7 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
         let resp = check_response(resp)?;
-        serde_json::from_str(&resp.text()?).map_err(ApiError::from)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(ApiError::from)
     }
 
     /// Helper for the GET endpoints that surface as `anyhow::Error`
@@ -501,7 +532,7 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
 
-        let body: DeployResponse = serde_json::from_str(&resp.text()?)?;
+        let body: DeployResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(body)
     }
 
@@ -635,7 +666,7 @@ impl ApiClient {
             }
             ApiError::Transient { source } => source,
         })?;
-        let v: TrafficResponse = serde_json::from_str(&resp.text()?)?;
+        let v: TrafficResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(v.splits
             .into_iter()
             .map(|s| (s.deployment_id, s.weight))
@@ -662,7 +693,7 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
 
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
     /// List all deployments for an app.
@@ -717,7 +748,7 @@ impl<'a> Tenants<'a> {
             }
             ApiError::Transient { source } => source,
         })?;
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 }
 
@@ -755,7 +786,7 @@ impl<'a> Keys<'a> {
             }
             ApiError::Transient { source } => source,
         })?;
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
     /// GET `/api/v1/keys` — list all API keys for the caller's tenant.
@@ -775,7 +806,7 @@ impl<'a> Keys<'a> {
             }
             ApiError::Transient { source } => source,
         })?;
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
     /// DELETE `/api/v1/keys/{id}` — hard-delete the key with the given
