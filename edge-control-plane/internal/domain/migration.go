@@ -6,7 +6,18 @@ type MigrationStatus string
 const (
 	MigrationStatusSuccess = MigrationStatus("success") // all patterns auto-transformed
 	MigrationStatusPartial = MigrationStatus("partial") // some require manual review
-	MigrationStatusFailed  = MigrationStatus("failed")  // untransformable patterns detected
+	// MigrationStatusFailed is returned when migration could not produce a
+	// runnable artifact. Two cases both surface as Failed:
+	//   1. The analyzer classified every detected pattern as
+	//      NotTransformable (Rust side: `Failed` here, never `Success`).
+	//   2. The toolchain (clang / rustc) refused to compile the
+	//      transformed source. Other artifact-validation failures
+	//      produced by code paths below — the resulting wasm
+	//      exceeding MaxArtifactSize, or failing the 4-byte
+	//      wasm magic-number check — also surface as Failed, since
+	//      no runnable artifact was produced.
+	// Tenants should read the Errors[] array for the cause.
+	MigrationStatusFailed  = MigrationStatus("failed")
 )
 
 // MigrateEnvelopeVersion is the wire-format version of the
