@@ -16,9 +16,9 @@ const P1_EPOCH_DEADLINE_TICKS: u64 = 100;
 
 /// Create a linker for core wasm modules (WASI Preview 1).
 ///
-/// Registers all `wasi_snapshot_preview1` and `wasi_unstable` host functions so
-/// that P1 modules can call them without trapping.  The store data type must be
-/// [`WasiP1Ctx`]; build one with [`build_wasi_p1_ctx`].
+/// Registers all `wasi_snapshot_preview1` host functions so that P1 modules
+/// whose imports use that namespace can call them without trapping.  The store
+/// data type must be [`WasiP1Ctx`]; build one with [`build_wasi_p1_ctx`].
 #[cfg(feature = "wasi-preview1")]
 pub fn create_linker(engine: &Engine) -> Result<Linker<wasmtime_wasi::preview1::WasiP1Ctx>> {
     let mut linker: Linker<wasmtime_wasi::preview1::WasiP1Ctx> = Linker::new(engine);
