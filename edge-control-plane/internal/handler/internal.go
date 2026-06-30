@@ -367,7 +367,15 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 // fallback). 404 when the workerID isn't registered OR doesn't
 // belong to the authenticated tenant (the same response in both
 // cases prevents workerID enumeration via differential responses).
-// 500 on a DB error from workerSvc.Get or syncBuilder.BuildFullSync.
+// 500 on a DB error from syncBuilder.BuildFullSync.
+//
+// Cross-tenant authorization: a worker authenticated as tenant A cannot
+// read tenant B's app set via /sync. The URL-path workerID must equal
+// the JWT's worker_id claim — both "no worker_id claim" and "URL
+// mismatch" return 404 with the same body so an attacker can't
+// enumerate workerIDs belonging to other tenants. The JWT's worker_id
+// is the caller's own (signed by the CP at registration); a worker
+// cannot request /sync for any worker other than itself.
 func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	if h.syncBuilder == nil {
 		http.Error(w, "sync fallback not enabled", http.StatusNotImplemented)
@@ -379,35 +387,22 @@ func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	worker, err := h.workerSvc.Get(r.Context(), workerID)
-	if err != nil {
-		log.Printf("Sync(%s): %v", workerID, err)
-		httperror.InternalErrorCtx(w, r)
-		return
-	}
-	if worker == nil {
-		// Don't distinguish "not registered" from "belongs to a
-		// different tenant" — both return 404 with the same body so
-		// an attacker can't enumerate workerIDs belonging to other
-		// tenants.
+	jwtWorkerID := middleware.GetWorkerID(r.Context())
+	if jwtWorkerID == "" || jwtWorkerID != workerID {
+		// Same response shape as the (no-longer-existing) "worker
+		// not found" branch — a malformed/missing worker_id claim
+		// is indistinguishable from a URL mismatch from the
+		// attacker's vantage point.
+		log.Printf("Sync(%s): jwt worker_id=%q does not match URL; denying",
+			workerID, jwtWorkerID)
 		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
 		return
 	}
 
-	// Cross-tenant authorization check: a worker authenticated as
-	// tenant A cannot read tenant B's app set via /sync. Without
-	// this, any compromised worker JWT could enumerate other
-	// tenant workerIDs and pull deployment metadata + env vars.
-	// Same response shape as the "worker not found" branch above.
 	jwtTenantID := middleware.GetWorkerTenantID(r.Context())
-	if worker.TenantID != jwtTenantID {
-		log.Printf("Sync(%s): JWT tenant=%s != worker tenant=%s; denying",
-			workerID, jwtTenantID, worker.TenantID)
-		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
-		return
-	}
+	jwtRegion := middleware.GetWorkerRegion(r.Context())
 
-	apps, err := h.syncBuilder.BuildFullSync(r.Context(), worker.TenantID, worker.Region)
+	apps, err := h.syncBuilder.BuildFullSync(r.Context(), jwtTenantID, jwtRegion)
 	if err != nil {
 		log.Printf("Sync(%s): build: %v", workerID, err)
 		httperror.InternalErrorCtx(w, r)
@@ -423,7 +418,7 @@ func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]interface{}{
 		"type":      "full_sync",
 		"timestamp": time.Now().UTC(),
-		"tenant_id": worker.TenantID,
+		"tenant_id": jwtTenantID,
 		"apps":      apps,
 	}
 	w.Header().Set("Content-Type", "application/json")

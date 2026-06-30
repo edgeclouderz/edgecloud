@@ -28,13 +28,24 @@ func (f *fakeSyncBuilder) BuildFullSync(_ context.Context, _, _ string) (map[str
 // syncHandler builds a minimal InternalHandler with just the
 // dependencies the Sync endpoint touches. Other fields stay nil — the
 // handler must not call them on this code path.
-func syncHandler(worker *domain.Worker, workerErr error, builder *fakeSyncBuilder) *InternalHandler {
+//
+// `worker` and `workerErr` are accepted only for legacy call-site
+// compatibility; since PR #166 follow-up #6 the Sync endpoint no
+// longer calls workerSvc.Get (it derives tenant/region from the
+// JWT). Tests that want to assert "Get was NOT called" pass a
+// non-nil worker pointer (which would be read if Get fired) — see
+// TestSync_JWTWorkerIDMatchesURL_SkipsWorkerSvcGet.
+//
+// `builder` is the syncPayloadBuilder interface (not *fakeSyncBuilder)
+// so tests that need to record BuildFullSync arguments can substitute
+// their own type — see recordingSyncBuilder.
+func syncHandler(worker *domain.Worker, workerErr error, builder syncPayloadBuilder) *InternalHandler {
 	workerSvc := &fakeWorkerSvc{worker: worker, getErr: workerErr}
-	// Pass an untyped nil when builder is nil. A typed nil
-	// (*fakeSyncBuilder)(nil) boxed into the syncPayloadBuilder
-	// interface is NOT == nil — Go's classic interface-nil gotcha
-	// — so the handler's nil check would falsely see a non-nil
-	// builder and skip the 501 short-circuit.
+	// Pass an untyped nil when builder is nil. A typed nil boxed
+	// into the syncPayloadBuilder interface is NOT == nil — Go's
+	// classic interface-nil gotcha — so the handler's nil check
+	// would falsely see a non-nil builder and skip the 501
+	// short-circuit.
 	var b syncPayloadBuilder
 	if builder != nil {
 		b = builder
@@ -42,21 +53,31 @@ func syncHandler(worker *domain.Worker, workerErr error, builder *fakeSyncBuilde
 	return NewInternalHandler(nil, workerSvc, nil, nil, nil, b)
 }
 
-// withSyncJWTTenant mirrors withWorkerCtx in internal_register_test.go:
-// attaches a worker-tenant-id to the request context the same way
-// middleware.WorkerAuth would after validating a real JWT. Tests that
-// drive the handler past the new cross-tenant authorization check
-// (e.g. the populated/empty/builder-error cases that actually reach
-// BuildFullSync) need this populated; tests that 4xx/5xx before that
-// check (nil-builder, missing-workerID, not-found, db-error) don't.
+// withSyncJWT attaches the same context values middleware.WorkerAuth
+// would after validating a real worker JWT: worker_id, tenant_id, and
+// region. The Sync endpoint derives all three from the JWT (not from
+// the workerSvc DB lookup, which PR #166 follow-up #6 removed). Tests
+// that drive the handler past the worker_id-mismatch check need all
+// three populated; tests that 4xx/5xx before that check
+// (nil-builder, missing-workerID) don't.
+func withSyncJWT(r *http.Request, workerID, tenantID, region string) *http.Request {
+	ctx := r.Context()
+	ctx = context.WithValue(ctx, middleware.WorkerIDKey, workerID)
+	ctx = context.WithValue(ctx, middleware.WorkerTenantIDKey, tenantID)
+	ctx = context.WithValue(ctx, middleware.WorkerRegionKey, region)
+	return r.WithContext(ctx)
+}
+
+// withSyncJWTTenant (kept for callers that only care about the tenant
+// claim — same as withSyncJWT with workerID="" and region="").
 func withSyncJWTTenant(r *http.Request, tenantID string) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), middleware.WorkerTenantIDKey, tenantID))
+	return withSyncJWT(r, "", tenantID, "")
 }
 
 // --- Sync ---------------------------------------------------------
 
 func TestSync_NilBuilder_Returns501(t *testing.T) {
-	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"}, nil, nil)
+	h := syncHandler(nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	rr := httptest.NewRecorder()
 
@@ -70,7 +91,7 @@ func TestSync_NilBuilder_Returns501(t *testing.T) {
 func TestSync_MissingWorkerID_Returns400(t *testing.T) {
 	// Path param missing — handled by the mux normally, but the
 	// handler must also defend against empty input.
-	h := syncHandler(&domain.Worker{}, nil, &fakeSyncBuilder{})
+	h := syncHandler(nil, nil, &fakeSyncBuilder{})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers//sync", nil)
 	// Simulate empty path value.
 	req.SetPathValue("workerID", "")
@@ -83,41 +104,101 @@ func TestSync_MissingWorkerID_Returns400(t *testing.T) {
 	}
 }
 
-func TestSync_WorkerNotFound_Returns404(t *testing.T) {
-	// workerSvc.Get returns (nil, nil) when no row exists (mirrors the
-	// (nil, nil) contract on Repository.GetByID). Handler maps that to
-	// 404, not 500, so the worker can distinguish "deleted me" from
-	// "db is on fire".
-	h := syncHandler(nil, nil, &fakeSyncBuilder{})
-	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_missing/sync", nil)
-	req.SetPathValue("workerID", "w_missing")
+// TestSync_URLWorkerIDMismatchWithJWT_Returns404 pins the new
+// cross-tenant defense (PR #166 follow-up #6, replacing the prior
+// workerSvc.Get DB lookup): a worker whose JWT has worker_id="w_A"
+// must NOT be able to fetch /sync for "w_B" — even if "w_B" is a real
+// registered worker. Without this check, a compromised worker JWT
+// could enumerate other workerIDs and pull their full app set.
+//
+// Returns 404 (not 403) with the same body as the previous "worker
+// not found" branch so an attacker can't enumerate workerIDs by
+// comparing differential responses.
+func TestSync_URLWorkerIDMismatchWithJWT_Returns404(t *testing.T) {
+	// fakeWorkerSvc is configured to panic if Get is called — the new
+	// handler must never invoke it on this code path.
+	h := syncHandler(&domain.Worker{ /* unused; panic below if read */ }, nil, &fakeSyncBuilder{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_B/sync", nil)
+	req.SetPathValue("workerID", "w_B")
+	// JWT says worker_id="w_A"; URL says "w_B". Mismatch → 404.
+	req = withSyncJWT(req, "w_A", "t_A", "global")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
 
 	if rr.Code != http.StatusNotFound {
-		t.Errorf("status=%d, want 404 (unknown worker)", rr.Code)
+		t.Errorf("status=%d, want 404 (mismatched URL/JWT worker_id)", rr.Code)
+	}
+	expected := `{"error": "worker not found"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != expected {
+		t.Errorf("body=%q, want %q", got, expected)
 	}
 }
 
-func TestSync_WorkerSvcError_Returns500(t *testing.T) {
-	h := syncHandler(nil, errors.New("db boom"), &fakeSyncBuilder{})
+// TestSync_JWTWithoutWorkerID_Returns404 covers the malformed-JWT
+// defense: if the JWT has no worker_id claim (older tokens, or a
+// misconfigured issuer), the handler must treat it identically to a
+// mismatch — same 404 body — so an attacker can't probe by sending a
+// degenerate JWT.
+func TestSync_JWTWithoutWorkerID_Returns404(t *testing.T) {
+	h := syncHandler(nil, nil, &fakeSyncBuilder{})
+
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
+	// JWT has tenant_id but no worker_id (withSyncJWT(""=workerID, ...))
+	req = withSyncJWT(req, "", "t_1", "global")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("status=%d, want 500 (db error)", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want 404 (no worker_id claim)", rr.Code)
+	}
+	expected := `{"error": "worker not found"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != expected {
+		t.Errorf("body=%q, want %q", got, expected)
 	}
 }
 
-func TestSync_BuilderError_Returns500(t *testing.T) {
-	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"}, nil, &fakeSyncBuilder{err: errors.New("repo gone")})
+// TestSync_JWTWorkerIDMatchesURL_SkipsWorkerSvcGet pins the new
+// positive path: when jwt.worker_id == url.workerID, the handler must
+// derive (tenant, region) from the JWT and call BuildFullSync WITHOUT
+// touching workerSvc.Get. The fakeSyncBuilder's BuildFullSync returns
+// an error, so the handler will surface it as 500 — proving the
+// handler reached the builder (i.e., did NOT short-circuit on
+// workerSvc.Get returning nil-not-found). If a future regression
+// re-introduces a workerSvc.Get call that returns nil, the test
+// would short-circuit at the 404 branch instead and the builder
+// error would NOT surface — making the test detect the regression.
+func TestSync_JWTWorkerIDMatchesURL_SkipsWorkerSvcGet(t *testing.T) {
+	h := syncHandler(nil, nil, &fakeSyncBuilder{err: errors.New("builder reached = good")})
+
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
-	req = withSyncJWTTenant(req, "t_1")
+	req = withSyncJWT(req, "w_1", "t_1", "us-east")
+	rr := httptest.NewRecorder()
+
+	h.Sync(rr, req)
+
+	// 500 means the handler reached BuildFullSync (and surfaced the
+	// injected error). If a regression brings back workerSvc.Get and
+	// it returns (nil, nil), the handler would 404 instead and this
+	// assertion would fail.
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 (builder should have been reached, proving workerSvc.Get was skipped); body=%s",
+			rr.Code, rr.Body.String())
+	}
+}
+
+// TestSync_BuilderError_Returns500: BuildFullSync error path is
+// unchanged — once past the JWT-match check, the handler still maps
+// a builder error to 500.
+func TestSync_BuilderError_Returns500(t *testing.T) {
+	h := syncHandler(nil, nil, &fakeSyncBuilder{err: errors.New("repo gone")})
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
+	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWT(req, "w_1", "t_1", "global")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -127,15 +208,16 @@ func TestSync_BuilderError_Returns500(t *testing.T) {
 	}
 }
 
+// TestSync_EmptyApps_ReturnsFullSyncEnvelopeWithEmptyMap: a worker
+// with no active deployments must still get a valid response — empty
+// apps map, NOT null. The worker's deserializer would crash on
+// `"apps": null` because the Rust HashMap doesn't represent null.
+// The handler explicitly normalizes nil to {}.
 func TestSync_EmptyApps_ReturnsFullSyncEnvelopeWithEmptyMap(t *testing.T) {
-	// A worker with no active deployments must still get a valid
-	// response — empty apps map, NOT null. The worker's deserializer
-	// would crash on `"apps": null` because the Rust HashMap doesn't
-	// represent null. The handler explicitly normalizes nil to {}.
-	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"}, nil, &fakeSyncBuilder{apps: nil})
+	h := syncHandler(nil, nil, &fakeSyncBuilder{apps: nil})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
-	req = withSyncJWTTenant(req, "t_1")
+	req = withSyncJWT(req, "w_1", "t_1", "global")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -163,11 +245,11 @@ func TestSync_EmptyApps_ReturnsFullSyncEnvelopeWithEmptyMap(t *testing.T) {
 	}
 }
 
+// TestSync_PopulatedApps_ReturnsPayload locks the wire shape: a
+// future refactor must not change field names or omit the type
+// field. The tenant_id in the response must come from the JWT (not
+// from a DB lookup), so this test also implicitly pins that.
 func TestSync_PopulatedApps_ReturnsPayload(t *testing.T) {
-	// The worker's existing handle_task_message handler treats
-	// "full_sync" as identical to "task_update" — same diff logic.
-	// This test locks the wire shape so a future refactor doesn't
-	// accidentally change field names or omit the type field.
 	want := map[string]nats.AppConfig{
 		"myapp": {
 			DeploymentID:   "d_1",
@@ -177,10 +259,10 @@ func TestSync_PopulatedApps_ReturnsPayload(t *testing.T) {
 			MaxMemoryMB:    256,
 		},
 	}
-	h := syncHandler(&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "us-east"}, nil, &fakeSyncBuilder{apps: want})
+	h := syncHandler(nil, nil, &fakeSyncBuilder{apps: want})
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
-	req = withSyncJWTTenant(req, "t_1")
+	req = withSyncJWT(req, "w_1", "t_1", "us-east")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
@@ -216,63 +298,36 @@ func TestSync_PopulatedApps_ReturnsPayload(t *testing.T) {
 	}
 }
 
-// TestSync_WrongTenant_Returns404 pins the cross-tenant
-// authorization check (review of PR #166, finding #1): a worker
-// authenticated as tenant A must NOT be able to fetch /sync for a
-// worker_id belonging to tenant B. Without this check, a compromised
-// worker JWT could enumerate other tenant workerIDs (they follow
-// the documented w_<region>_<n> prefix and are visible in
-// heartbeats) and pull tenant B's full app set — deployment IDs,
-// hashes, env vars, allowlists.
-//
-// Returns 404 (not 403) with the same body as the "worker not found"
-// branch so an attacker can't enumerate workerIDs by comparing
-// differential responses.
-func TestSync_WrongTenant_Returns404(t *testing.T) {
-	// workerSvc.Get returns a worker belonging to tenant B...
-	worker := &domain.Worker{ID: "w_B", TenantID: "t_B", Region: "global"}
-	h := syncHandler(worker, nil, &fakeSyncBuilder{})
-
-	// ...but the JWT is for tenant A.
-	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_B/sync", nil)
-	req.SetPathValue("workerID", "w_B")
-	req = withSyncJWTTenant(req, "t_A")
-	rr := httptest.NewRecorder()
-
-	h.Sync(rr, req)
-
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("status=%d, want 404 (cross-tenant request denied as not-found)", rr.Code)
-	}
-	// Body matches the "worker not found" branch so an attacker can't
-	// distinguish "real worker, wrong tenant" from "no such worker".
-	expected := `{"error": "worker not found"}`
-	if got := strings.TrimSpace(rr.Body.String()); got != expected {
-		t.Errorf("body=%q, want %q", got, expected)
-	}
-}
-
-// TestSync_SameTenant_Allowed pins the positive path of finding #1:
-// a worker whose JWT matches the worker_id's tenant gets the
-// payload. (Two tests below exercise the wrong-tenant branch and
-// the unknown-worker branch; this one locks "same tenant, request
-// succeeds".)
-func TestSync_SameTenant_Allowed(t *testing.T) {
-	want := map[string]nats.AppConfig{
-		"myapp": {DeploymentID: "d_1", DeploymentHash: "abc"},
-	}
-	h := syncHandler(
-		&domain.Worker{ID: "w_1", TenantID: "t_1", Region: "global"},
-		nil, &fakeSyncBuilder{apps: want},
-	)
+// TestSync_JWTRegionDrivesBuildFullSync pins that the region passed
+// to BuildFullSync is the JWT's region claim, not anything derived
+// from a workerSvc lookup. Catches a future refactor that adds back
+// a region lookup.
+func TestSync_JWTRegionDrivesBuildFullSync(t *testing.T) {
+	var gotRegion string
+	recording := &recordingSyncBuilder{recordRegion: &gotRegion}
+	h := syncHandler(nil, nil, recording)
 	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
 	req.SetPathValue("workerID", "w_1")
-	req = withSyncJWTTenant(req, "t_1")
+	req = withSyncJWT(req, "w_1", "t_1", "eu-central")
 	rr := httptest.NewRecorder()
 
 	h.Sync(rr, req)
 
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d, want 200 (same tenant allowed); body=%s", rr.Code, rr.Body.String())
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
+	if gotRegion != "eu-central" {
+		t.Errorf("BuildFullSync region=%q, want eu-central (from JWT)", gotRegion)
+	}
+}
+
+// recordingSyncBuilder captures the region argument so tests can
+// assert it's derived from the JWT, not a DB lookup.
+type recordingSyncBuilder struct {
+	recordRegion *string
+}
+
+func (r *recordingSyncBuilder) BuildFullSync(_ context.Context, _ string, region string) (map[string]nats.AppConfig, error) {
+	*r.recordRegion = region
+	return map[string]nats.AppConfig{}, nil
 }
