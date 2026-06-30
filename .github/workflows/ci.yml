@@ -76,18 +76,8 @@ jobs:
         if: matrix.crate != 'edge-cli'
         run: cargo semver-checks check-release --manifest-path ${{ matrix.crate }}/Cargo.toml --baseline-rev origin/main
 
-      - name: Cache cargo-audit binary
-        id: cache-audit
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-audit
-          key: cargo-audit-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-audit-${{ runner.os }}-
-
       - name: Install cargo-audit
-        if: steps.cache-audit.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit --force
+        uses: taiki-e/install-action@cargo-audit
 
       - name: Run cargo audit
         run: cargo audit --manifest-path ${{ matrix.crate }}/Cargo.toml || true
