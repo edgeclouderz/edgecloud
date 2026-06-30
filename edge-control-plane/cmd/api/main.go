@@ -168,12 +168,13 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc)
-	// Wire the read-only side of ReconcileService so the /sync HTTP
-	// fallback endpoint (issue #53) can return the same payload the
-	// periodic loop publishes. Done separately from NewInternalHandler
-	// so the constructor stays compact for tests.
-	internalHandler.SetSyncBuilder(reconcileSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc)
+	// The same *service.ReconcileService satisfies both the syncRequester
+	// (write side — RequestSync, used by RegisterWorker) and the
+	// syncPayloadBuilder (read side — BuildFullSync, used by the /sync
+	// HTTP fallback). Passing it twice is the documented shape; the
+	// narrow interfaces keep tests stubbable without standing up the
+	// full service.
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)

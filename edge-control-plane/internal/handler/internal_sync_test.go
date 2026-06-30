@@ -29,12 +29,17 @@ func (f *fakeSyncBuilder) BuildFullSync(_ context.Context, _, _ string) (map[str
 // dependencies the Sync endpoint touches. Other fields stay nil — the
 // handler must not call them on this code path.
 func syncHandler(worker *domain.Worker, workerErr error, builder *fakeSyncBuilder) *InternalHandler {
-	workerSvc := &fakeWorkerSvcForSync{worker: worker, err: workerErr}
-	h := NewInternalHandler(nil, workerSvc, nil, nil, nil)
+	workerSvc := &fakeWorkerSvc{worker: worker, getErr: workerErr}
+	// Pass an untyped nil when builder is nil. A typed nil
+	// (*fakeSyncBuilder)(nil) boxed into the syncPayloadBuilder
+	// interface is NOT == nil — Go's classic interface-nil gotcha
+	// — so the handler's nil check would falsely see a non-nil
+	// builder and skip the 501 short-circuit.
+	var b syncPayloadBuilder
 	if builder != nil {
-		h.SetSyncBuilder(builder)
+		b = builder
 	}
-	return h
+	return NewInternalHandler(nil, workerSvc, nil, nil, nil, b)
 }
 
 // withSyncJWTTenant mirrors withWorkerCtx in internal_register_test.go:
@@ -46,26 +51,6 @@ func syncHandler(worker *domain.Worker, workerErr error, builder *fakeSyncBuilde
 // check (nil-builder, missing-workerID, not-found, db-error) don't.
 func withSyncJWTTenant(r *http.Request, tenantID string) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), middleware.WorkerTenantIDKey, tenantID))
-}
-
-// fakeWorkerSvcForSync is a separate type from the RegisterWorker
-// fakeWorkerSvc because the Sync endpoint needs Get to return a
-// configurable worker. We can't extend fakeWorkerSvc with a per-test
-// `worker` field without breaking the RegisterWorker tests' assumption
-// that Get always returns (nil, nil).
-type fakeWorkerSvcForSync struct {
-	worker *domain.Worker
-	err    error
-}
-
-func (f *fakeWorkerSvcForSync) Register(_ context.Context, _ string, _ *domain.RegisterWorkerRequest) error {
-	return nil
-}
-func (f *fakeWorkerSvcForSync) ListByTenant(_ context.Context, _ string) ([]domain.Worker, error) {
-	return nil, nil
-}
-func (f *fakeWorkerSvcForSync) Get(_ context.Context, _ string) (*domain.Worker, error) {
-	return f.worker, f.err
 }
 
 // --- Sync ---------------------------------------------------------
