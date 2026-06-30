@@ -61,3 +61,5 @@ pub mod process;
 pub mod scheduling;
 #[cfg(feature = "time")]
 pub mod time;
+#[cfg(feature = "websocket")]
+pub mod websocket;

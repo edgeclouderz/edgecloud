@@ -13,6 +13,15 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 
+#[cfg(feature = "websocket")]
+use crate::edge::cloud::websocket::{
+    WsCloseEvent, WsConnectionInfo, WsErrorEvent, WsEvent, WsMessage,
+};
+#[cfg(feature = "websocket")]
+use crate::interfaces::websocket::UpgradeDecision;
+#[cfg(feature = "websocket")]
+use tokio_tungstenite::tungstenite::Message;
+
 /// Enum to hold either a plain TCP stream or a TLS stream.
 /// Allows a single handle_connection to work with both without dyn Trait.
 enum StreamKind {
@@ -653,6 +662,7 @@ pub struct IncomingRequest {
     pub headers: Vec<(String, String)>,
     pub body: BodySource,
     pub trace: Option<TraceContext>,
+    pub is_websocket_upgrade: bool,
 }
 
 /// W3C Trace Context parsed from inbound request headers.
@@ -701,6 +711,10 @@ pub struct HttpServer {
     stream_threshold: u64,
     /// Active connection handler task handles — drained on shutdown.
     conn_handles: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    #[cfg(feature = "websocket")]
+    pub pending_upgrades: Arc<
+        StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<UpgradeDecision>>>,
+    >,
 }
 
 impl HttpServer {
@@ -727,6 +741,8 @@ impl HttpServer {
             max_body_size,
             stream_threshold: DEFAULT_STREAM_THRESHOLD,
             conn_handles: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(feature = "websocket")]
+            pending_upgrades: Arc::new(StdMutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -754,6 +770,8 @@ impl HttpServer {
             max_body_size,
             stream_threshold: DEFAULT_STREAM_THRESHOLD,
             conn_handles: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(feature = "websocket")]
+            pending_upgrades: Arc::new(StdMutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -798,6 +816,8 @@ impl HttpServer {
         let tls_config = self.tls_config.clone();
         let max_body_size = self.max_body_size;
         let stream_threshold = self.stream_threshold;
+        #[cfg(feature = "websocket")]
+        let pending_upgrades = self.pending_upgrades.clone();
 
         let handle = tokio::spawn(async move {
             tokio::pin!(shutdown_rx);
@@ -832,6 +852,8 @@ impl HttpServer {
                                 let tls_config = tls_config.clone();
                                 let max_body_size = max_body_size;
                                 let stream_threshold = stream_threshold;
+                                #[cfg(feature = "websocket")]
+                                let pending_upgrades = pending_upgrades.clone();
 
                                 // Spawn a task that handles the connection and
                                 // acquires/releases the connection permit.
@@ -870,9 +892,19 @@ impl HttpServer {
                                         };
 
                                     Self::handle_connection(
-                                        id, stream, tx, ch_rx, stream_rx, meter, conn_timeout, max_body_size, stream_threshold,
-                                    )
-                                    .await;
+                                         id,
+                                         stream,
+                                         tx,
+                                         ch_rx,
+                                         stream_rx,
+                                         meter,
+                                         conn_timeout,
+                                         max_body_size,
+                                         stream_threshold,
+                                         #[cfg(feature = "websocket")]
+                                         pending_upgrades,
+                                     )
+                                     .await;
                                     drop(permit); // release connection slot
                                 });
                                 conn_handles.lock().unwrap().push(handle);
@@ -960,6 +992,9 @@ impl HttpServer {
         conn_timeout: Duration,
         max_body_size: u64,
         stream_threshold: u64,
+        #[cfg(feature = "websocket")] pending_upgrades: Arc<
+            StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<UpgradeDecision>>>,
+        >,
     ) {
         // Per-connection deadline. Each read/write operation must complete within
         // this window. If exceeded, the connection is aborted.
@@ -977,6 +1012,215 @@ impl HttpServer {
                 return;
             }
         };
+
+        #[cfg(feature = "websocket")]
+        let is_ws = is_websocket_upgrade(&parsed.headers);
+        #[cfg(not(feature = "websocket"))]
+        let is_ws = false;
+
+        #[cfg(feature = "websocket")]
+        if is_ws {
+            let ws_path = parsed.path.clone();
+            let ws_query = parsed.query.clone();
+            let ws_headers = parsed.headers.clone();
+            let (upgrade_tx, upgrade_rx) = tokio::sync::oneshot::channel::<UpgradeDecision>();
+            pending_upgrades
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, upgrade_tx);
+
+            let request = IncomingRequest {
+                id,
+                method: parsed.method,
+                path: parsed.path,
+                query: parsed.query,
+                headers: parsed.headers.clone(),
+                body: BodySource::None,
+                trace: parsed.trace,
+                is_websocket_upgrade: true,
+            };
+
+            if let Some(ref m) = meter {
+                m.record_request();
+            }
+
+            if tx.send(request).await.is_err() {
+                pending_upgrades
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                return;
+            }
+
+            match timeout(Duration::from_secs(30), upgrade_rx).await {
+                Ok(Ok(UpgradeDecision::Accept {
+                    conn_id,
+                    mut client_rx,
+                    event_tx,
+                    active_connections,
+                })) => {
+                    let key = parsed
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Sec-WebSocket-Key"))
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let accept_hash = compute_ws_accept(key);
+
+                    let handshake_response = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                         Upgrade: websocket\r\n\
+                         Connection: Upgrade\r\n\
+                         Sec-WebSocket-Accept: {}\r\n\r\n",
+                        accept_hash
+                    );
+                    if let Err(e) = stream.write_all(handshake_response.as_bytes()).await {
+                        tracing::warn!(req_id = %id, err = %e, "websocket handshake write error");
+                        active_connections
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&conn_id);
+                        return;
+                    }
+
+                    use futures::{SinkExt, StreamExt};
+                    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                        stream,
+                        tokio_tungstenite::tungstenite::protocol::Role::Server,
+                        None,
+                    )
+                    .await;
+
+                    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+                    let _ = event_tx.send(WsEvent::Connected(WsConnectionInfo {
+                        conn_id,
+                        path: ws_path,
+                        headers: ws_headers,
+                        query: ws_query,
+                    }));
+
+                    if let Some(ref m) = meter {
+                        m.record_ws_connection_connect();
+                    }
+
+                    let mut last_activity = Instant::now();
+                    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+                    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                    loop {
+                        tokio::select! {
+                            msg = ws_read.next() => {
+                                last_activity = Instant::now();
+                                match msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Some(ref m) = meter {
+                                            m.record_ws_message_in();
+                                        }
+                                        let _ = event_tx.send(WsEvent::TextMessage(WsMessage { conn_id, data: text.as_bytes().to_vec() }));
+                                    }
+                                    Some(Ok(Message::Binary(bin))) => {
+                                        if let Some(ref m) = meter {
+                                            m.record_ws_message_in();
+                                        }
+                                        let _ = event_tx.send(WsEvent::BinaryMessage(WsMessage { conn_id, data: bin.to_vec() }));
+                                    }
+                                    Some(Ok(Message::Ping(data))) => {
+                                        let _ = event_tx.send(WsEvent::Ping(data.to_vec()));
+                                    }
+                                    Some(Ok(Message::Pong(_))) => {
+                                        // Pong received: updates last_activity
+                                    }
+                                    Some(Ok(Message::Close(frame))) => {
+                                        let code = frame.as_ref().map(|f| f.code.into()).unwrap_or(1000);
+                                        let reason = frame.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
+                                        let _ = event_tx.send(WsEvent::Closed(WsCloseEvent { conn_id, code, reason }));
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        let _ = event_tx.send(WsEvent::Error(WsErrorEvent { conn_id, message: e.to_string() }));
+                                        break;
+                                    }
+                                    None => {
+                                        let _ = event_tx.send(WsEvent::Closed(WsCloseEvent { conn_id, code: 1000, reason: String::new() }));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            write_msg = client_rx.recv() => {
+                                last_activity = Instant::now();
+                                match write_msg {
+                                    Some(msg) => {
+                                        let is_close = matches!(msg, Message::Close(_));
+                                        let is_data = matches!(msg, Message::Text(_) | Message::Binary(_));
+                                        if let Err(e) = ws_write.send(msg).await {
+                                            tracing::warn!("websocket send error: {}", e);
+                                            break;
+                                        }
+                                        if is_data {
+                                            if let Some(ref m) = meter {
+                                                m.record_ws_message_out();
+                                            }
+                                        }
+                                        if is_close {
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        let _ = ws_write.send(Message::Close(None)).await;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = ping_interval.tick() => {
+                                if let Err(e) = ws_write.send(Message::Ping(bytes::Bytes::new())).await {
+                                    tracing::warn!("websocket ping send error: {}", e);
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep_until(last_activity + Duration::from_secs(300)) => {
+                                tracing::info!(conn_id = %conn_id, "websocket idle timeout, closing");
+                                let _ = ws_write.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                    code: 1008.into(),
+                                    reason: "Idle timeout".into(),
+                                }))).await;
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(ref m) = meter {
+                        m.record_ws_connection_close();
+                    }
+
+                    // Clean up connection from active set
+                    active_connections
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&conn_id);
+                }
+                Ok(Ok(UpgradeDecision::Reject { status, reason })) => {
+                    let reject_response = format!(
+                        "HTTP/1.1 {} {}\r\n\
+                         Connection: close\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\r\n\
+                         {}",
+                        status,
+                        reason,
+                        reason.len(),
+                        reason
+                    );
+                    let _ = stream.write_all(reject_response.as_bytes()).await;
+                }
+                _ => {
+                    let err_response = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(err_response.as_bytes()).await;
+                }
+            }
+            return;
+        }
 
         // 2. Split for concurrent body read / response write. The body-pipeline
         //    task owns the read half (active until body is fully consumed); the
@@ -1043,6 +1287,7 @@ impl HttpServer {
             headers: parsed.headers,
             body,
             trace: parsed.trace,
+            is_websocket_upgrade: false,
         };
 
         if let Some(ref m) = meter {
@@ -2126,4 +2371,187 @@ mod tests {
         assert!(dbg.contains("Buffered"));
         assert!(dbg.contains("4"));
     }
+
+    #[test]
+    #[cfg(feature = "websocket")]
+    fn test_is_websocket_upgrade() {
+        assert!(is_websocket_upgrade(&[
+            ("Connection".to_string(), "Upgrade".to_string()),
+            ("Upgrade".to_string(), "websocket".to_string())
+        ]));
+        assert!(is_websocket_upgrade(&[
+            ("connection".to_string(), "keep-alive, upgrade".to_string()),
+            ("upgrade".to_string(), "WebSocket".to_string())
+        ]));
+        assert!(!is_websocket_upgrade(&[
+            ("Connection".to_string(), "keep-alive".to_string()),
+            ("Upgrade".to_string(), "websocket".to_string())
+        ]));
+        assert!(!is_websocket_upgrade(&[
+            ("Connection".to_string(), "Upgrade".to_string()),
+            ("Upgrade".to_string(), "spdy".to_string())
+        ]));
+    }
+
+    #[test]
+    #[cfg(feature = "websocket")]
+    fn test_compute_ws_accept() {
+        // Standard WebSocket RFC 6455 test case
+        let client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        assert_eq!(compute_ws_accept(client_key), expected_accept);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "websocket")]
+    async fn test_websocket_handshake_and_frames() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let ws_state = crate::interfaces::websocket::WebSocketState::new();
+        let mut server = HttpServer::new();
+        server.pending_upgrades = ws_state.pending_upgrades.clone();
+
+        server
+            .start(0, Some("127.0.0.1".to_string()))
+            .await
+            .unwrap();
+        let port = server.get_assigned_port().unwrap();
+
+        // 1. Connect a raw TCP client
+        let mut client_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        // 2. Send WebSocket handshake request
+        let handshake_req = b"GET /ws HTTP/1.1\r\n\
+                              Host: 127.0.0.1\r\n\
+                              Upgrade: websocket\r\n\
+                              Connection: Upgrade\r\n\
+                              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                              Sec-WebSocket-Version: 13\r\n\r\n";
+        client_stream.write_all(handshake_req).await.unwrap();
+        client_stream.flush().await.unwrap();
+
+        // 3. Server polls the request
+        let req = server.poll().await.unwrap().unwrap();
+        assert!(req.is_websocket_upgrade);
+        assert_eq!(req.path, "/ws");
+
+        // 4. Server accepts the websocket
+        let conn_id = ws_state.accept_websocket(req.id).unwrap();
+
+        // 5. Client reads the 101 Response
+        let mut resp_buf = [0u8; 1024];
+        let n = client_stream.read(&mut resp_buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp_str.contains("HTTP/1.1 101 Switching Protocols"));
+        assert!(resp_str.contains("Upgrade: websocket"));
+        assert!(resp_str.contains("Connection: Upgrade"));
+        assert!(resp_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        // 6. Client wraps the stream using tungstenite
+        let mut ws_client = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_stream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+
+        // 7. Client sends a message
+        ws_client
+            .send(Message::Text("hello edgecloud".into()))
+            .await
+            .unwrap();
+
+        // 8. Server polls and gets the connected event first, then the message event
+        let mut connected_event = None;
+        let mut message_event = None;
+        for _ in 0..20 {
+            if let Ok(Some(ev)) = ws_state.ws_poll() {
+                if matches!(ev, crate::edge::cloud::websocket::WsEvent::Connected(_)) {
+                    connected_event = Some(ev);
+                } else {
+                    message_event = Some(ev);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = connected_event.expect("Expected Connected event first");
+        let event = message_event.expect("Failed to poll websocket message event");
+        if let crate::edge::cloud::websocket::WsEvent::TextMessage(msg) = event {
+            assert_eq!(msg.conn_id, conn_id);
+            assert_eq!(msg.data, b"hello edgecloud");
+        } else {
+            panic!("Expected TextMessage event, got {:?}", event);
+        }
+
+        // 9. Server sends a reply back
+        ws_state
+            .ws_send_text(conn_id, "hello guest".to_string())
+            .unwrap();
+
+        // 10. Client receives reply (skipping any Ping frames)
+        let mut text_reply = None;
+        for _ in 0..10 {
+            let msg = ws_client.next().await.unwrap().unwrap();
+            match msg {
+                Message::Text(text) => {
+                    text_reply = Some(text);
+                    break;
+                }
+                Message::Ping(_) => {
+                    // client auto-responds to ping or we just skip it
+                }
+                _ => {}
+            }
+        }
+        let reply_text = text_reply.expect("Did not receive text reply");
+        assert_eq!(reply_text.as_str(), "hello guest");
+
+        // 11. Server closes connection
+        ws_state
+            .ws_close(conn_id, 1000, "done".to_string())
+            .unwrap();
+
+        // 12. Client receives close frame
+        let close_frame = ws_client.next().await.unwrap().unwrap();
+        assert!(matches!(close_frame, Message::Close(_)));
+
+        server.shutdown().await;
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn is_websocket_upgrade(headers: &[(String, String)]) -> bool {
+    let mut has_upgrade_conn = false;
+    let mut has_websocket_upgrade = false;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("connection") {
+            if v.split(',')
+                .any(|s| s.trim().eq_ignore_ascii_case("upgrade"))
+            {
+                has_upgrade_conn = true;
+            }
+        } else if k.eq_ignore_ascii_case("upgrade") {
+            if v.trim().eq_ignore_ascii_case("websocket") {
+                has_websocket_upgrade = true;
+            }
+        }
+    }
+    has_upgrade_conn && has_websocket_upgrade
+}
+
+#[cfg(feature = "websocket")]
+fn compute_ws_accept(key: &str) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let result = hasher.finalize();
+    BASE64.encode(result)
 }
