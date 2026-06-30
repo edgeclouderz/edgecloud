@@ -586,6 +586,102 @@ func detectTransformedPatternsRust(wasiRs string) []domain.PatternInfo {
 	return patterns
 }
 
+// partitionManualReview recovers the manual-review signal that the
+// analyzer would have produced via --analyze-json, by diffing each
+// pattern's POSIX snippet against the transformed WASI source. Used
+// only when --analyze-json fails; the analyzer's structured output
+// remains the source of truth.
+//
+// Patterns whose POSIX form survives the transform (e.g. "fork(")
+// are flagged not-transformable: the transformer didn't rewrite them.
+// Patterns whose POSIX form is absent (the transformer emitted the
+// WASI equivalent) are flagged auto-transformable.
+func partitionManualReview(detected []domain.PatternInfo, wasiSource string) (transformed, manualReview []domain.PatternInfo) {
+	for _, p := range detected {
+		if snippet := posixSnippetForPattern(p.Pattern); snippet != "" && posixCallPresent(wasiSource, snippet) {
+			manualReview = append(manualReview, domain.PatternInfo{
+				Line:             p.Line,
+				Pattern:          p.Pattern,
+				Snippet:          p.Snippet,
+				WasiEquivalent:   p.WasiEquivalent,
+				Transformability: domain.TransformabilityNotTransformable,
+			})
+		} else {
+			transformed = append(transformed, p)
+		}
+	}
+	return transformed, manualReview
+}
+
+// posixCallPresent reports whether `callToken` (e.g. "bind(", "fork(")
+// appears in source as an actual POSIX call — i.e., not preceded by
+// an identifier character. The naive strings.Contains check matches
+// "bind(" inside "wasi_socket_tcp_start_bind(", producing false
+// positives for transformed source. The word-boundary check ensures
+// we only match the real POSIX call form.
+func posixCallPresent(source, callToken string) bool {
+	for i := 0; i+len(callToken) <= len(source); {
+		j := strings.Index(source[i:], callToken)
+		if j < 0 {
+			return false
+		}
+		idx := i + j
+		if idx == 0 || !isIdentChar(source[idx-1]) {
+			return true
+		}
+		i = idx + 1
+	}
+	return false
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_'
+}
+
+// posixSnippetForPattern returns the short POSIX call token
+// (e.g. "bind(", "fork(") used to diff against the transformed WASI
+// source. Accepts both formats:
+//   - heuristic-detected (auto-transformable) patterns use the
+//     POSIX call signature: "bind(fd, addr, len)"
+//   - analyzer-detected (not-transformable) patterns use the
+//     PascalCase enum Debug form: "Fork", "Poll", "Exec", etc.
+//
+// Returns "" if the pattern is not in the map → caller treats it as
+// transformed (we cannot prove manual review without an exact POSIX
+// token to check for).
+func posixSnippetForPattern(pattern string) string {
+	switch pattern {
+	// Heuristic-detected (auto-transformable) call signatures.
+	case "socket(AF_INET, SOCK_STREAM, 0)":
+		return "socket("
+	case "bind(fd, addr, len)":
+		return "bind("
+	case "listen(fd, backlog)":
+		return "listen("
+	case "accept(fd, ...)":
+		return "accept("
+	case "connect(fd, addr, len)":
+		return "connect("
+	case "send(fd, buf, len, flags)":
+		return "send("
+	case "recv(fd, buf, len, flags)":
+		return "recv("
+	case "fopen(path, mode)":
+		return "fopen("
+	case "gethostbyname(name)":
+		return "gethostbyname("
+	// Analyzer-detected (not-transformable) PascalCase names. These
+	// POSIX calls have no WASI equivalent; if the call still appears
+	// in the transformed source, the transformer left it untouched
+	// and the tenant needs manual review.
+	case "Fork", "Poll", "Select", "Exec", "SocketPair", "Shutdown", "SockRaw", "NonBlocking":
+		return strings.ToLower(pattern) + "("
+	default:
+		return ""
+	}
+}
+
 // MigrateTree analyzes + transforms every source file in `entries`
 // together and compiles them into a single wasm binary. M2.C9
 // (initial C path); M3.C7 added Rust.
@@ -656,11 +752,12 @@ func (s *MigrationService) MigrateTree(
 	// Write each entry to <tmpDir>/<path>. Reject path traversal
 	// (defense-in-depth; handler also validates).
 	type writtenFile struct {
-		path        string
-		absPath     string
-		wasiCPath   string // populated after transform
-		report      domain.FileReport
-		transformOK bool
+		path           string
+		absPath        string
+		originalSource string // populated at write time; reserved for future analyzers
+		wasiCPath      string // populated after transform
+		report         domain.FileReport
+		transformOK    bool
 	}
 	written := make([]writtenFile, 0, len(entries))
 
@@ -679,7 +776,7 @@ func (s *MigrationService) MigrateTree(
 		if err := os.WriteFile(abs, []byte(e.Source), 0o644); err != nil {
 			return nil, fmt.Errorf("writing %q: %w", e.Path, err)
 		}
-		written = append(written, writtenFile{path: e.Path, absPath: abs})
+		written = append(written, writtenFile{path: e.Path, absPath: abs, originalSource: e.Source})
 	}
 
 	// Per-file subprocess: transform + analyze-json.
@@ -748,19 +845,25 @@ func (s *MigrationService) MigrateTree(
 		// auto. The analyzer's structured output is the source of
 		// truth.
 		if !analyzeOK {
-			var patterns []domain.PatternInfo
+			var detected []domain.PatternInfo
 			if language == "rust" {
-				patterns = detectTransformedPatternsRust(wasiSource)
+				detected = detectTransformedPatternsRust(wasiSource)
 			} else {
-				patterns = detectTransformedPatterns(wasiSource)
+				detected = detectTransformedPatterns(wasiSource)
 			}
+			transformed, manualReview := partitionManualReview(detected, wasiSource)
+			// PatternsDetected is the union (transformed ∪ manualReview)
+			// so the tenant sees every detected pattern; status is
+			// classified from the union so a NotTransformable-only file
+			// surfaces as Failed, matching the Rust analyzer's convention.
+			combined := append(transformed, manualReview...)
 			single = domain.MigrationReport{
-				Status:               classifyFromPatterns(patterns),
+				Status:               classifyFromPatterns(combined),
 				WasmStored:           false,
 				AppName:              appName,
-				PatternsDetected:     patterns,
-				PatternsTransformed:  patterns,
-				PatternsManualReview: nil,
+				PatternsDetected:     combined,
+				PatternsTransformed:  transformed,
+				PatternsManualReview: manualReview,
 				Errors:               nil,
 			}
 		}

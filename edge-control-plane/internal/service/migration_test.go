@@ -545,6 +545,99 @@ func TestClassifyFromPatterns(t *testing.T) {
 	}
 }
 
+// TestPartitionManualReview pins the gap #4 fix: when --analyze-json
+// fails, the fallback heuristic must still split detected patterns into
+// Transformed vs ManualReview by diffing each POSIX snippet against the
+// transformed WASI source. Without this, every pattern was silently
+// classified as AutoTransformable and PatternsManualReview was always
+// empty in fallback scenarios.
+func TestPartitionManualReview(t *testing.T) {
+	bind := domain.PatternInfo{Pattern: "bind(fd, addr, len)", Snippet: "bind(fd, addr, len)", WasiEquivalent: "wasi_socket_tcp_start_bind"}
+	// fork uses the analyzer's PascalCase Debug form
+	// (PatternKind::Posix(PosixPattern::Fork) → "Fork"), not the
+	// POSIX call signature — the analyzer-detected set uses Debug
+	// strings while the heuristic uses call signatures.
+	fork := domain.PatternInfo{Pattern: "Fork", Snippet: "fork()", WasiEquivalent: "no WASI equivalent"}
+	unknown := domain.PatternInfo{Pattern: "weird_pattern_no_posix_token()", Snippet: "weird_pattern_no_posix_token()", WasiEquivalent: "n/a"}
+
+	tests := []struct {
+		name            string
+		detected        []domain.PatternInfo
+		wasiSource      string
+		wantTransformed []string
+		wantManual      []string
+	}{
+		{
+			name:            "bind preserved in wasi source → manual review",
+			detected:        []domain.PatternInfo{bind},
+			wasiSource:      "int main(){ bind(fd, addr, 8); return 0; }",
+			wantTransformed: nil,
+			wantManual:      []string{"bind(fd, addr, len)"},
+		},
+		{
+			name:            "bind rewritten to wasi → transformed",
+			detected:        []domain.PatternInfo{bind},
+			wasiSource:      "wasi_socket_tcp_start_bind(fd, addr, 8);",
+			wantTransformed: []string{"bind(fd, addr, len)"},
+			wantManual:      nil,
+		},
+		{
+			name:            "fork preserved → manual review",
+			detected:        []domain.PatternInfo{fork},
+			wasiSource:      "int main(){ if(fork()) return 1; return 0; }",
+			wantTransformed: nil,
+			wantManual:      []string{"Fork"},
+		},
+		{
+			name:            "unknown pattern defaults to transformed",
+			detected:        []domain.PatternInfo{unknown},
+			wasiSource:      "anything goes",
+			wantTransformed: []string{"weird_pattern_no_posix_token()"},
+			wantManual:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transformed, manualReview := partitionManualReview(tt.detected, tt.wasiSource)
+			if !patternNamesEqual(transformed, tt.wantTransformed) {
+				t.Errorf("transformed = %v, want %v", patternNames(transformed), tt.wantTransformed)
+			}
+			if !patternNamesEqual(manualReview, tt.wantManual) {
+				t.Errorf("manualReview = %v, want %v", patternNames(manualReview), tt.wantManual)
+			}
+			// All entries routed to manualReview must carry
+			// NotTransformable so downstream classifyFromPatterns
+			// and FileReport.ManualReview consumers see the right value.
+			for _, p := range manualReview {
+				if p.Transformability != domain.TransformabilityNotTransformable {
+					t.Errorf("manual-review entry must be NotTransformable, got: %q (pattern=%s)", p.Transformability, p.Pattern)
+				}
+			}
+		})
+	}
+}
+
+func patternNames(ps []domain.PatternInfo) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.Pattern
+	}
+	return out
+}
+
+func patternNamesEqual(got []domain.PatternInfo, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i].Pattern != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestAggregateTreeStatus(t *testing.T) {
 	mk := func(s domain.MigrationStatus) domain.FileReport {
 		return domain.FileReport{Path: "x.c", Status: s}
@@ -695,6 +788,97 @@ func TestMigrateTree_ToolchainFailure_ReturnsErrMigrateTreeFailed(t *testing.T) 
 	}
 	if len(report.Errors) == 0 {
 		t.Error("expected at least one error in the failure report")
+	}
+}
+
+// TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview pins gap #4:
+// when the per-file --analyze-json subprocess fails (older edge-migrate
+// binary, wrong PATH, etc.), the fallback heuristic at migration.go:750
+// must still recover the manual-review signal by diffing POSIX snippets
+// against the transformed WASI source — not silently classify every
+// detected pattern as auto-transformable.
+//
+// Strategy: write a tiny shim script that wraps the real edge-migrate
+// binary and selectively fails on --analyze-json while passing --transform
+// through. Run MigrateTree against a file containing fork() (a
+// NotTransformable POSIX call). With the shim, the fallback path runs
+// and the returned FileReport.ManualReview must contain the Fork entry.
+func TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	realBin, err := exec.LookPath("edge-migrate")
+	if err != nil {
+		t.Skip("edge-migrate not in PATH")
+	}
+	shimDir := t.TempDir()
+	shimPath := filepath.Join(shimDir, "edge-migrate-shim")
+	shim := "#!/bin/sh\n" +
+		"case \" $* \" in\n" +
+		"  *' --analyze-json '*|*' --analyze-json\\t'*)\n" +
+		"    echo 'shim: forcing --analyze-json failure' >&2\n" +
+		"    exit 1 ;;\n" +
+		"  *)\n" +
+		"    exec " + realBin + " \"$@\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc")
+
+	// Source: a fork() call. The transformer will leave it in place
+	// (no WASI equivalent exists), so the transformed source still
+	// contains "fork(" — the fallback diff must catch that and flag
+	// it as NotTransformable / manual review.
+	forkSource := `#include <stdio.h>
+#include <unistd.h>
+int main() {
+    pid_t pid = fork();
+    if (pid == 0) {
+        printf("child\\n");
+        return 0;
+    }
+    printf("parent\\n");
+    return 0;
+}`
+
+	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "fork_demo.c", Source: forkSource},
+	})
+	if err != nil {
+		// A compile failure here would mean clang couldn't compile
+		// the fork() call (fork is non-transformable, so the
+		// transformer leaves it untouched and clang for wasm32-wasip2
+		// won't accept it). That's expected: the per-file transform
+		// itself will succeed (the transformer just preserves fork),
+		// and clang will fail at the tree-compile step. Either way,
+		// the per-file FileReport.ManualReview must surface fork.
+		if report == nil {
+			t.Fatalf("expected non-nil report on any failure (handler emits 422 with body), got err: %v", err)
+		}
+	}
+
+	if len(report.Files) != 1 {
+		t.Fatalf("expected 1 file report, got: %d", len(report.Files))
+	}
+	fr := report.Files[0]
+	if len(fr.ManualReview) == 0 {
+		t.Errorf("expected at least 1 manual-review pattern (fork should be NotTransformable), got 0 — fallback lost the signal (gap #4 regression)")
+	}
+	foundFork := false
+	for _, p := range fr.ManualReview {
+		if p.Pattern == "Fork" {
+			foundFork = true
+			if p.Transformability != domain.TransformabilityNotTransformable {
+				t.Errorf("expected manual-review entry to be NotTransformable, got: %q", p.Transformability)
+			}
+		}
+	}
+	if !foundFork {
+		t.Errorf("expected Fork in manual_review, got patterns: %v", patternNames(fr.ManualReview))
 	}
 }
 
