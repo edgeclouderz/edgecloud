@@ -882,7 +882,7 @@ impl crate::edge::cloud::websocket::Host for RuntimeState {
     fn accept_websocket(&mut self, request_id: u64) -> Result<u64, String> {
         self.websocket.accept_websocket(request_id)
     }
-    fn reject_websocket(&mut self, request_id: u64, status: u32, reason: String) -> () {
+    fn reject_websocket(&mut self, request_id: u64, status: u32, reason: String) {
         let _ = self.websocket.reject_websocket(request_id, status, reason);
     }
     fn ws_poll(&mut self) -> Result<Option<crate::edge::cloud::websocket::WsEvent>, String> {
@@ -894,7 +894,7 @@ impl crate::edge::cloud::websocket::Host for RuntimeState {
     fn ws_send_binary(&mut self, conn_id: u64, data: Vec<u8>) -> Result<(), String> {
         self.websocket.ws_send_binary(conn_id, data)
     }
-    fn ws_close(&mut self, conn_id: u64, code: u16, reason: String) -> () {
+    fn ws_close(&mut self, conn_id: u64, code: u16, reason: String) {
         let _ = self.websocket.ws_close(conn_id, code, reason);
     }
     fn ws_connection_count(&mut self) -> u32 {

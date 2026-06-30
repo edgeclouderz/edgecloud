@@ -1890,6 +1890,38 @@ fn try_compress(body: &[u8], accept_gzip: bool) -> (Vec<u8>, bool) {
     (body.to_vec(), false)
 }
 
+#[cfg(feature = "websocket")]
+fn is_websocket_upgrade(headers: &[(String, String)]) -> bool {
+    let mut has_upgrade_conn = false;
+    let mut has_websocket_upgrade = false;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("connection") {
+            if v.split(',')
+                .any(|s| s.trim().eq_ignore_ascii_case("upgrade"))
+            {
+                has_upgrade_conn = true;
+            }
+        } else if k.eq_ignore_ascii_case("upgrade")
+            && v.trim().eq_ignore_ascii_case("websocket")
+        {
+            has_websocket_upgrade = true;
+        }
+    }
+    has_upgrade_conn && has_websocket_upgrade
+}
+
+#[cfg(feature = "websocket")]
+fn compute_ws_accept(key: &str) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let result = hasher.finalize();
+    BASE64.encode(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2522,36 +2554,4 @@ mod tests {
 
         server.shutdown().await;
     }
-}
-
-#[cfg(feature = "websocket")]
-fn is_websocket_upgrade(headers: &[(String, String)]) -> bool {
-    let mut has_upgrade_conn = false;
-    let mut has_websocket_upgrade = false;
-    for (k, v) in headers {
-        if k.eq_ignore_ascii_case("connection") {
-            if v.split(',')
-                .any(|s| s.trim().eq_ignore_ascii_case("upgrade"))
-            {
-                has_upgrade_conn = true;
-            }
-        } else if k.eq_ignore_ascii_case("upgrade") {
-            if v.trim().eq_ignore_ascii_case("websocket") {
-                has_websocket_upgrade = true;
-            }
-        }
-    }
-    has_upgrade_conn && has_websocket_upgrade
-}
-
-#[cfg(feature = "websocket")]
-fn compute_ws_accept(key: &str) -> String {
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine;
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let result = hasher.finalize();
-    BASE64.encode(result)
 }

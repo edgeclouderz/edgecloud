@@ -37,6 +37,12 @@ pub struct WebSocketState {
     pub next_conn_id: Arc<AtomicU64>,
 }
 
+impl Default for WebSocketState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebSocketState {
     pub fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
