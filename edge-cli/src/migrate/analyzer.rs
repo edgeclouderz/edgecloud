@@ -268,7 +268,10 @@ mod tests {
             .analyze_rust("use std::net::TcpStream;", Path::new("main.rs"))
             .unwrap();
         // "use std::net::TcpStream" matches both std::net AND TcpStream regexes
-        assert!(!findings.is_empty());
+        assert!(
+            findings.len() >= 2,
+            "expected std::net AND TcpStream regexes to both fire"
+        );
         assert!(findings.iter().any(|f| f.message.contains("std::net")));
     }
 
