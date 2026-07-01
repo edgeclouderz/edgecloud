@@ -109,6 +109,7 @@ async fn build_supervisor(
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;

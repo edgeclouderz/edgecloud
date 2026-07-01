@@ -67,6 +67,11 @@ pub struct Config {
     /// a worker is per-tenant in this design (whitepaper §9.3 calls for
     /// tenant-agnostic workers — file a follow-up to revisit).
     pub worker_tenant_id: String,
+    /// Per-request CPU budget for FaaS (Handler) components, in ms.
+    /// Default 1000ms (1s). The store's epoch deadline is set to
+    /// `handler_request_budget_ms / epoch_tick_ms` ticks before each
+    /// request is dispatched to the guest. Tune via `HANDLER_REQUEST_BUDGET_MS`.
+    pub handler_request_budget_ms: u64,
 }
 
 impl Config {
@@ -147,6 +152,7 @@ impl Config {
                 .unwrap_or_else(|_| "edgecloud".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
+            handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
         })
     }
 
