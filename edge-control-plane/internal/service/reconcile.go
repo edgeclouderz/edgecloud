@@ -242,13 +242,13 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 			envMap[e.EnvKey] = e.EnvValue
 		}
 
-		cfg := nats.AppConfig{
-			DeploymentID:   ad.DeploymentID,
-			DeploymentHash: deployment.Hash,
-			Env:            envMap,
-			Allowlist:      allowlist,
-			MaxMemoryMB:    maxMemoryMB,
-		}
+		cfg := nats.BuildAppConfig(
+			ad.DeploymentID,
+			deployment.Hash,
+			envMap,
+			allowlist,
+			maxMemoryMB,
+		)
 
 		regions := deployment.Regions
 		if len(regions) == 0 {
@@ -354,13 +354,13 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 			envMap[e.EnvKey] = e.EnvValue
 		}
 
-		out[ad.AppName] = nats.AppConfig{
-			DeploymentID:   ad.DeploymentID,
-			DeploymentHash: deployment.Hash,
-			Env:            envMap,
-			Allowlist:      allowlist,
-			MaxMemoryMB:    maxMemoryMB,
-		}
+		out[ad.AppName] = nats.BuildAppConfig(
+			ad.DeploymentID,
+			deployment.Hash,
+			envMap,
+			allowlist,
+			maxMemoryMB,
+		)
 	}
 	return out, nil
 }
