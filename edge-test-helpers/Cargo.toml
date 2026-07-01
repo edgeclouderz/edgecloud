@@ -1,0 +1,22 @@
+[package]
+name = "edge-test-helpers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Shared test harness helpers for edge-worker / edge-ingress / future crates (NATS container, supervisor wiring, skip predicate). Used only as a dev-dependency — never linked into production binaries."
+
+[dependencies]
+anyhow = "1.0"
+async-nats = { version = "0.49", features = ["jetstream", "nkeys"] }
+edge-worker = { path = "../edge-worker" }
+edge-runtime = { path = "../edge-runtime" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tempfile = "3"
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["nats"] }
+tokio = { version = "1.45", features = ["full"] }
+
+[lib]
+name = "edge_test_helpers"
+path = "src/lib.rs"

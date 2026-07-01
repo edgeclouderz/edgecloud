@@ -34,6 +34,14 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
+# Shared test harness: NATS container startup, skip predicate, and
+# Supervisor wiring (formerly duplicated across integration_tests.rs,
+# ingress_wire_integration.rs, and edge-ingress/tests/integration.rs).
+# The crate is dev-only on this side and on edge-ingress's side; its
+# regular `[dependencies]` list does pull edge-worker (it has to, to
+# type the supervisor field) — Cargo handles the dev-only↔regular
+# edge between the two crates without rejecting them as a cycle.
+edge-test-helpers = { path = "../edge-test-helpers" }
 # Cross-wire integration tests exercise the public-ingress contract:
 # the worker emits a heartbeat, the ingress parses it and populates its
 # routing table. Adding edge-ingress as a dev-dependency lets the test

@@ -32,3 +32,8 @@ edge-worker = { path = "../edge-worker" }
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
+# Shared test harness: NATS container startup + skip predicate, used
+# only for the `should_skip_integration_tests`/`start_nats` helpers
+# (the supervisor-wiring helpers target edge-worker; we don't use
+# those here). See the matching dev-dep on edge-worker.
+edge-test-helpers = { path = "../edge-test-helpers" }
