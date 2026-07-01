@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,15 +17,15 @@ import (
 // up to a maximum of `burst`. A call to Allow consumes one token.
 // When the bucket is empty, the call is denied.
 //
-// A background goroutine can call GC periodically to evict buckets
-// that haven't been touched in >10 minutes.
+// A background goroutine evicts stale (>10min untouched) buckets
+// every 5 minutes.
 type RateLimiter struct {
-	mu         sync.Mutex
-	buckets    map[string]*bucket
-	rate       float64 // tokens per second
-	burst      float64 // max accumulated tokens
-	lastGCTime time.Time
-	gcInterval time.Duration
+	mu       sync.Mutex
+	buckets  map[string]*bucket
+	rate     float64 // tokens per second
+	burst    float64 // max accumulated tokens
+	disabled bool    // when true, Middleware is a no-op
+	stopCh   chan struct{}
 }
 
 type bucket struct {
@@ -34,13 +35,44 @@ type bucket struct {
 
 // NewRateLimiter creates a token-bucket rate limiter.
 // rate: tokens added per second. burst: maximum accumulated tokens.
+// If rate <= 0 or burst <= 0, the limiter is disabled (no-op).
 func NewRateLimiter(rate, burst int) *RateLimiter {
-	return &RateLimiter{
-		buckets:    make(map[string]*bucket),
-		rate:       float64(rate),
-		burst:      float64(burst),
-		lastGCTime: time.Now(),
-		gcInterval: 5 * time.Minute,
+	rl := &RateLimiter{
+		buckets:  make(map[string]*bucket),
+		rate:     float64(rate),
+		burst:    float64(burst),
+		disabled: rate <= 0 || burst <= 0,
+		stopCh:   make(chan struct{}),
+	}
+	if !rl.disabled {
+		go rl.gcLoop()
+	}
+	return rl
+}
+
+// gcLoop runs GC every 5 minutes until the limiter is stopped.
+func (rl *RateLimiter) gcLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rl.GC()
+		case <-rl.stopCh:
+			return
+		}
+	}
+}
+
+// Stop shuts down the background GC goroutine. Safe to call multiple times.
+// After Stop, the limiter still works but stale buckets are never cleaned up.
+func (rl *RateLimiter) Stop() {
+	if !rl.disabled {
+		select {
+		case <-rl.stopCh:
+		default:
+			close(rl.stopCh)
+		}
 	}
 }
 
@@ -75,7 +107,6 @@ func (rl *RateLimiter) Allow(key string) bool {
 }
 
 // GC removes buckets that haven't been touched in >10 minutes.
-// Call periodically from a background goroutine.
 func (rl *RateLimiter) GC() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -86,29 +117,30 @@ func (rl *RateLimiter) GC() {
 			delete(rl.buckets, key)
 		}
 	}
-	rl.lastGCTime = time.Now()
 }
 
 // Middleware returns an HTTP middleware that rate-limits requests by
-// a key extracted from the request via keyFunc. When the limit is
-// exceeded, it responds with 429 Too Many Requests and a Retry-After
-// header.
+// a key extracted from the request via keyFunc. When disabled (rate <= 0
+// or burst <= 0), the middleware is a no-op. When the limit is exceeded,
+// it responds with 429 Too Many Requests and a Retry-After header.
 func (rl *RateLimiter) Middleware(keyFunc func(*http.Request) string) func(http.Handler) http.Handler {
+	if rl.disabled {
+		return func(next http.Handler) http.Handler {
+			return next
+		}
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := keyFunc(r)
 			if key == "" {
-				// No key means we can't rate-limit; pass through.
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Run GC periodically inline (best-effort, every gcInterval).
-			if time.Since(rl.lastGCTime) > rl.gcInterval {
-				go rl.GC()
-			}
-
 			if !rl.Allow(key) {
+				// Retry-After: 1 second is a safe lower bound.
+				// At the configured rate, one token replenishes in (1/rate) seconds.
 				w.Header().Set("Retry-After", "1")
 				httperror.QuotaExceededCtx(w, r, "rate limit exceeded")
 				return
@@ -121,15 +153,18 @@ func (rl *RateLimiter) Middleware(keyFunc func(*http.Request) string) func(http.
 
 // ClientIP extracts the client IP address from a request, checking
 // the X-Forwarded-For header first and falling back to RemoteAddr.
+// Handles both IPv4 (with port) and IPv6 (bracketed with port).
 func ClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		parts := strings.SplitN(fwd, ",", 2)
 		return strings.TrimSpace(parts[0])
 	}
-	// Strip port from RemoteAddr (e.g. "192.168.1.1:54321").
-	addr := r.RemoteAddr
-	if idx := strings.LastIndex(addr, ":"); idx != -1 {
-		return addr[:idx]
+
+	// net.SplitHostPort handles both "192.168.1.1:54321" and "[::1]:8080".
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// No port — likely direct IPv4/IPv6 without port.
+		return r.RemoteAddr
 	}
-	return addr
+	return host
 }

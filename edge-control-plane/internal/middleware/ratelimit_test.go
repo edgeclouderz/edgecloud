@@ -12,14 +12,14 @@ import (
 // TestRateLimiter_AllowsUpToBurst confirms that burst requests are
 // allowed, and the (burst+1)th is denied.
 func TestRateLimiter_AllowsUpToBurst(t *testing.T) {
-	rl := NewRateLimiter(10, 5) // 10/s rate, burst 5
+	rl := NewRateLimiter(10, 5)
+	defer rl.Stop()
 
 	for i := 0; i < 5; i++ {
 		if !rl.Allow("key-a") {
 			t.Fatalf("request %d: expected allowed, got denied", i+1)
 		}
 	}
-	// 6th should be denied
 	if rl.Allow("key-a") {
 		t.Fatal("expected 6th request to be denied")
 	}
@@ -28,7 +28,8 @@ func TestRateLimiter_AllowsUpToBurst(t *testing.T) {
 // TestRateLimiter_RefillsOverTime confirms that after waiting,
 // tokens are replenished and a subsequent request succeeds.
 func TestRateLimiter_RefillsOverTime(t *testing.T) {
-	rl := NewRateLimiter(10, 1) // 10/s rate, burst 1
+	rl := NewRateLimiter(10, 1)
+	defer rl.Stop()
 
 	if !rl.Allow("key-b") {
 		t.Fatal("expected first request to be allowed")
@@ -37,7 +38,6 @@ func TestRateLimiter_RefillsOverTime(t *testing.T) {
 		t.Fatal("expected second request to be denied (burst exhausted)")
 	}
 
-	// Wait for refill (>100ms at 10/s = 1 token)
 	time.Sleep(150 * time.Millisecond)
 
 	if !rl.Allow("key-b") {
@@ -49,13 +49,12 @@ func TestRateLimiter_RefillsOverTime(t *testing.T) {
 // exhausting its burst doesn't affect another key.
 func TestRateLimiter_MultipleKeysIndependent(t *testing.T) {
 	rl := NewRateLimiter(10, 3)
+	defer rl.Stop()
 
-	// Exhaust key-a
 	for i := 0; i < 3; i++ {
 		rl.Allow("key-a")
 	}
 
-	// key-b should still get its full burst
 	if !rl.Allow("key-b") {
 		t.Fatal("expected key-b to be allowed independently")
 	}
@@ -65,6 +64,7 @@ func TestRateLimiter_MultipleKeysIndependent(t *testing.T) {
 // from multiple goroutines without panicking.
 func TestRateLimiter_ConcurrentSafe(t *testing.T) {
 	rl := NewRateLimiter(100, 50)
+	defer rl.Stop()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -83,11 +83,11 @@ func TestRateLimiter_ConcurrentSafe(t *testing.T) {
 // TestRateLimiter_GC removes stale entries and leaves active ones.
 func TestRateLimiter_GC(t *testing.T) {
 	rl := NewRateLimiter(10, 5)
+	defer rl.Stop()
 
 	rl.Allow("stale-key")
 	rl.Allow("fresh-key")
 
-	// Manually age the stale bucket
 	rl.mu.Lock()
 	if b, ok := rl.buckets["stale-key"]; ok {
 		b.lastTick = time.Now().Add(-15 * time.Minute)
@@ -109,10 +109,32 @@ func TestRateLimiter_GC(t *testing.T) {
 	}
 }
 
+// TestRateLimiter_Disabled confirms that rate <= 0 or burst <= 0
+// creates a disabled limiter whose Middleware is a no-op.
+func TestRateLimiter_Disabled(t *testing.T) {
+	rl := NewRateLimiter(0, 0) // disabled
+
+	handler := rl.Middleware(func(r *http.Request) string {
+		return "any-key"
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200 with disabled limiter, got %d", i+1, w.Code)
+		}
+	}
+}
+
 // TestRateLimiter_Middleware_Returns429 confirms the middleware
 // returns 429 with Retry-After when the limit is exceeded.
 func TestRateLimiter_Middleware_Returns429(t *testing.T) {
 	rl := NewRateLimiter(10, 2)
+	defer rl.Stop()
 
 	handler := rl.Middleware(func(r *http.Request) string {
 		return "test-tenant"
@@ -120,7 +142,6 @@ func TestRateLimiter_Middleware_Returns429(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// Exhaust burst
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		w := httptest.NewRecorder()
@@ -130,7 +151,6 @@ func TestRateLimiter_Middleware_Returns429(t *testing.T) {
 		}
 	}
 
-	// 3rd request → 429
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -142,7 +162,6 @@ func TestRateLimiter_Middleware_Returns429(t *testing.T) {
 		t.Errorf("expected Retry-After: 1, got %q", retryAfter)
 	}
 
-	// Verify JSON error envelope
 	var body map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatalf("decode error envelope: %v", err)
@@ -159,10 +178,11 @@ func TestRateLimiter_Middleware_Returns429(t *testing.T) {
 // TestRateLimiter_Middleware_EmptyKeyPassthrough confirms that when
 // keyFunc returns "", the request passes through without rate limiting.
 func TestRateLimiter_Middleware_EmptyKeyPassthrough(t *testing.T) {
-	rl := NewRateLimiter(10, 0) // burst=0 means every request denied
+	rl := NewRateLimiter(10, 2)
+	defer rl.Stop()
 
 	handler := rl.Middleware(func(r *http.Request) string {
-		return "" // no key
+		return "" // no key — skip rate limiting
 	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -186,12 +206,30 @@ func TestClientIP_FromXForwardedFor(t *testing.T) {
 	}
 }
 
-// TestClientIP_FromRemoteAddr checks RemoteAddr fallback with port.
-func TestClientIP_FromRemoteAddr(t *testing.T) {
+// TestClientIP_FromRemoteAddrIPv4 checks RemoteAddr with IPv4 + port.
+func TestClientIP_FromRemoteAddrIPv4(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.RemoteAddr = "198.51.100.42:8080"
 	if ip := ClientIP(r); ip != "198.51.100.42" {
 		t.Errorf("expected 198.51.100.42, got %q", ip)
+	}
+}
+
+// TestClientIP_FromRemoteAddrIPv6 checks RemoteAddr with IPv6 + port.
+func TestClientIP_FromRemoteAddrIPv6(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "[::1]:8080"
+	if ip := ClientIP(r); ip != "::1" {
+		t.Errorf("expected ::1, got %q", ip)
+	}
+}
+
+// TestClientIP_FromRemoteAddrIPv6NoPort checks bare IPv6 without port.
+func TestClientIP_FromRemoteAddrIPv6NoPort(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "::1"
+	if ip := ClientIP(r); ip != "::1" {
+		t.Errorf("expected ::1, got %q", ip)
 	}
 }
 
@@ -202,4 +240,11 @@ func TestClientIP_NoPort(t *testing.T) {
 	if ip := ClientIP(r); ip != "10.0.0.1" {
 		t.Errorf("expected 10.0.0.1, got %q", ip)
 	}
+}
+
+// TestRateLimiter_StopIdempotent confirms Stop can be called multiple times.
+func TestRateLimiter_StopIdempotent(t *testing.T) {
+	rl := NewRateLimiter(10, 5)
+	rl.Stop()
+	rl.Stop() // should not panic
 }
