@@ -4,6 +4,8 @@
 
 pub mod auth;
 pub mod config;
+pub mod detect;
+pub mod dispatch;
 pub mod downloader;
 pub mod log_forwarder;
 pub mod messages;
