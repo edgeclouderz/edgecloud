@@ -34,13 +34,29 @@ pub enum ExecutionModel {
     Handler,
 }
 
+/// Canonical export key for the FaaS interface. The canonical-ABI
+/// `ComponentType::exports` iterator returns keys in
+/// `<interface-name>[@<version>]` form (e.g.
+/// `wasi:http/incoming-handler@0.2.1`). We match the bare prefix
+/// followed by either end-of-string or `@` so that:
+///
+/// * `wasi:http/incoming-handler`            — matches (no version)
+/// * `wasi:http/incoming-handler@0.2.1`      — matches (canonical form)
+/// * `wasi:http/incoming-handler-foo`        — does NOT match
+/// * `wasi:http/incoming-handler@0.2.1-evil` — does NOT match
+///
+/// The previous `starts_with` form silently misclassified any name
+/// beginning with the prefix.
+const HANDLER_EXPORT: &str = "wasi:http/incoming-handler";
+
 /// Inspect a component's exported interfaces to decide which execution
 /// model it expects.
 ///
-/// We treat any component exporting `wasi:http/incoming-handler` (with
-/// or without a version suffix, e.g. `@0.2.0`) as `Handler`. LongRunning
-/// is the default — `_start` is canonical for WASI Preview 2 components
-/// and we don't require any specific signature beyond that.
+/// We treat any component exporting the canonical
+/// `wasi:http/incoming-handler` (with an optional `@<version>` suffix)
+/// as `Handler`. LongRunning is the default — `_start` is canonical for
+/// WASI Preview 2 components and we don't require any specific
+/// signature beyond that.
 pub fn detect_execution_model(component: &Component) -> ExecutionModel {
     let ty = component.component_type();
     // `ComponentType::exports` needs the engine because canonical-ABI
@@ -48,10 +64,12 @@ pub fn detect_execution_model(component: &Component) -> ExecutionModel {
     // already holds its engine internally; we just borrow it back.
     let engine = component.engine();
     for (name, _item) in ty.exports(engine) {
-        // Match the bare interface name and the version-suffixed form.
-        // The bindgen normalizes across versions, so a `wasi:http/incoming-handler@0.2.0`
-        // export is still valid for our Handler linker.
-        if name.starts_with("wasi:http/incoming-handler") {
+        // Exact match OR canonical-ABI `<name>@<version>` form. The
+        // bindgen normalizes across patch versions, so `@0.2.0` is
+        // valid for our Handler linker even though our WIT pins `@0.2.1`.
+        if name == HANDLER_EXPORT
+            || name.starts_with(&format!("{HANDLER_EXPORT}@"))
+        {
             return ExecutionModel::Handler;
         }
     }
