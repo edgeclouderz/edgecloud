@@ -16,74 +16,62 @@ jobs:
   # ============================================================
   validate-rust:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies (edge-migrate only)
-        if: matrix.crate == 'edge-migrate'
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
 
       - name: Generate Cargo.lock
-        run: cargo generate-lockfile --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+        run: cargo generate-lockfile || true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo bin
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/
-          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dir
-        uses: actions/cache@v4
-        with:
-          path: ${{ matrix.crate }}/target/
-          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
 
       - name: Install rustfmt
         run: rustup component add rustfmt
 
       - name: Run rustfmt
-        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml --all
+        run: cargo fmt --check --all
 
       - name: Install clippy
         run: rustup component add clippy
 
       - name: Run clippy
-        run: cargo clippy --manifest-path ${{ matrix.crate }}/Cargo.toml -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          manifest-path: ${{ matrix.crate }}/Cargo.toml
+          manifest-path: Cargo.toml
 
       - name: Install cargo-semver-checks
-        if: matrix.crate != 'edge-cli'
         uses: taiki-e/install-action@cargo-semver-checks
 
       - name: Run cargo-semver-checks
-        if: matrix.crate != 'edge-cli'
-        run: cargo semver-checks check-release --manifest-path ${{ matrix.crate }}/Cargo.toml --baseline-rev origin/main
+        run: cargo semver-checks check-release --workspace --baseline-rev origin/main
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
       - name: Run cargo audit
-        run: cargo audit --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+        run: cargo audit || true
 
-      - name: Run cargo test
-        run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace
 
       - name: Install Rust Nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -92,7 +80,7 @@ jobs:
         uses: taiki-e/install-action@cargo-udeps
 
       - name: Run cargo-udeps
-        run: cargo +nightly udeps --manifest-path ${{ matrix.crate }}/Cargo.toml --all-targets
+        run: cargo +nightly udeps --workspace --all-targets
 
       - name: Install cargo-geiger
         uses: taiki-e/cache-cargo-install-action@v2
@@ -100,7 +88,7 @@ jobs:
           tool: cargo-geiger
 
       - name: Run cargo-geiger
-        run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+        run: cargo geiger || true
 
   # ============================================================
   # OPENAPI-VALIDATE — verify all mux routes are covered by the spec
@@ -239,45 +227,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Generate Cargo.lock
-        run: |
-          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
-          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
+        run: cargo generate-lockfile || true
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry/index/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target dirs
-        uses: actions/cache@v4
-        with:
-          path: |
-            edge-config/target/
-            edge-cli/target/
-            edge-worker/target/
-            edge-ingress/target/
-            edge-migrate/target/
-            edge-runtime/target/
-          key: cargo-target-coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
 
       - name: Run coverage
-        run: |
-          cargo llvm-cov --lcov --output-path lcov-rust.info \
-            --manifest-path edge-config/Cargo.toml \
-            --manifest-path edge-cli/Cargo.toml \
-            --manifest-path edge-worker/Cargo.toml \
-            --manifest-path edge-ingress/Cargo.toml \
-            --manifest-path edge-migrate/Cargo.toml \
-            --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml \
-            --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml \
-            --manifest-path edge-runtime/Cargo.toml || true
+        run: cargo llvm-cov --lcov --output-path lcov-rust.info --workspace || true
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4

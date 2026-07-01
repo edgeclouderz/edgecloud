@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["edge-migrate-lib", "edge-migrate-bin"]
+members = [
+    "edge-runtime",
+    "edge-worker",
+    "edge-ingress",
+    "edge-cli",
+    "edge-config",
+    "edge-migrate/edge-migrate-lib",
+    "edge-migrate/edge-migrate-bin",
+]
 
 [workspace.package]
 version = "0.1.0"
