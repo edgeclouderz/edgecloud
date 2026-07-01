@@ -1,6 +1,6 @@
 [package]
 name = "edge-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
@@ -44,6 +44,10 @@ base64 = "0.22"
 # URL parsing for egress policy
 url = "2"
 
+# WebSockets
+tokio-tungstenite = { version = "0.26", optional = true }
+sha1 = { version = "0.10", optional = true }
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
@@ -61,7 +65,7 @@ wiremock = "0.6"
 wat = "1"
 
 [features]
-default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking"]
+default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking", "websocket"]
 http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "tokio/sync", "dep:bytes", "dep:futures"]
 kv-store = []
 cache = ["dep:lru"]
@@ -71,3 +75,4 @@ scheduling = ["dep:tokio"]
 process = []
 http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2", "dep:bytes", "dep:futures"]
 networking = ["dep:trust-dns-resolver", "dep:tokio"]
+websocket = ["dep:tokio-tungstenite", "dep:sha1", "dep:tokio", "tokio/rt", "tokio/sync"]

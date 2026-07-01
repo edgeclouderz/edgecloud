@@ -120,13 +120,14 @@ pub struct AppStatus {
     pub exit_code: Option<i32>,
     /// Number of HTTP requests handled since last heartbeat.
     pub request_count: u64,
-    /// Total outbound bytes since the last heartbeat interval.
-    /// Covers http-client response bodies received by the guest and
-    /// http-server response bodies written back to callers.
-    /// Defaults to 0 when absent (old workers) — control plane must
-    /// treat a missing field as "no data", not as "zero usage".
     #[serde(default)]
     pub outbound_bytes: u64,
+    #[serde(default)]
+    pub ws_connections_active: u32,
+    #[serde(default)]
+    pub ws_messages_in: u64,
+    #[serde(default)]
+    pub ws_messages_out: u64,
     /// Tenant the app belongs to. Used by the public ingress to render the
     /// host (`<tenant_id>-<app_name>.edgecloud.dev` — see
     /// `edge-ingress::config::ingress_host` and
@@ -282,6 +283,9 @@ mod tests {
             exit_code: None,
             request_count: 1,
             outbound_bytes: 0,
+            ws_connections_active: 0,
+            ws_messages_in: 0,
+            ws_messages_out: 0,
             tenant_id: "t_1".into(),
             port: 8080,
             observer_metrics: vec![
@@ -344,6 +348,9 @@ mod tests {
             exit_code: None,
             request_count: 2,
             outbound_bytes: 512,
+            ws_connections_active: 0,
+            ws_messages_in: 0,
+            ws_messages_out: 0,
             tenant_id: "t_1".into(),
             port: 8080,
             observer_metrics: vec![],

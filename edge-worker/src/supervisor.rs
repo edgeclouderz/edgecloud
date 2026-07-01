@@ -896,6 +896,9 @@ impl Supervisor {
                     exit_code,
                     request_count: snap.request_count,
                     outbound_bytes: snap.outbound_bytes,
+                    ws_connections_active: snap.ws_connections_active,
+                    ws_messages_in: snap.ws_messages_in,
+                    ws_messages_out: snap.ws_messages_out,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                     observer_metrics,
@@ -928,8 +931,12 @@ impl Supervisor {
                 if inst.deployment_id != status.deployment_id {
                     continue;
                 }
-                inst.meter
-                    .subtract_delta(status.request_count, status.outbound_bytes);
+                inst.meter.subtract_delta(
+                    status.request_count,
+                    status.outbound_bytes,
+                    status.ws_messages_in,
+                    status.ws_messages_out,
+                );
             }
         }
     }
