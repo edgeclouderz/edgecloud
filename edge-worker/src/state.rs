@@ -8,6 +8,9 @@ use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
 
+use crate::detect::ExecutionModel;
+use crate::dispatch::HandlerDispatch;
+
 /// Status of a running app instance.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppInstanceStatus {
@@ -35,6 +38,13 @@ pub struct AppInstance {
     /// Channel to signal graceful shutdown to the app task. Wrapped in Option so
     /// it can be taken out of the locked struct to call send().
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Broadcast shutdown channel — `Some` only for Handler (FaaS)
+    /// apps whose axum/hyper server subscribes through
+    /// `with_graceful_shutdown` (Phase C-7). Multiple subscribers per
+    /// broadcast channel — needed so the server loop and any in-
+    /// flight per-request tasks can both observe the shutdown. Long-
+    /// Running apps keep using the `oneshot::Sender` above.
+    pub shutdown_tx_broadcast: Option<tokio::sync::broadcast::Sender<()>>,
     /// Pre-compiled component for fast instantiation on restart.
     pub instance_pre: InstancePre<edge_runtime::RuntimeState>,
     /// Handle to the spawned app task — used to propagate panics on stop.
@@ -45,15 +55,34 @@ pub struct AppInstance {
     /// never advance, and the Store-level deadline would never fire.
     /// Wrapped in Option so stop_app can take it out of the locked struct.
     pub ticker: Option<tokio::task::JoinHandle<()>>,
+    /// Which execution model the guest uses.
+    ///
+    /// `LongRunning` guests drive themselves via `_start` (spawned by
+    /// `run_app_loop`). `Handler` guests are dispatched per-request via
+    /// `dispatch` (Phase C wires `wasmtime_wasi_http::ProxyPre`).
+    pub execution_model: ExecutionModel,
+    /// FaaS dispatcher — `Some` only when `execution_model == Handler`.
+    ///
+    /// Phase B stores `Some(HandlerDispatch::new(port))` so the field
+    /// type-checks; Phase C fills in the `ProxyPre` + axum server. The
+    /// supervisor currently ignores `dispatch` for Handler components
+    /// (the spawned task is a placeholder pending the per-request
+    /// wiring) — see `supervisor::start_app`.
+    pub dispatch: Option<Arc<HandlerDispatch>>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.
 /// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
 /// (e.g., status update to Crashed) without replacing the Arc entry.
 pub struct WorkerState {
-    /// Currently running app instances: app_name -> AppInstance (Arc-wrapped for
-    /// cheap clone, with Mutex for interior mutability of status/fields).
-    pub apps: HashMap<String, Arc<Mutex<AppInstance>>>,
+    /// Currently running app instances, keyed by `(tenant_id, app_name)`.
+    ///
+    /// The tuple key prevents collisions when two tenants happen to
+    /// deploy an app with the same name (e.g. both tenants have a
+    /// service literally called "api"). It also lets `handle_task_message`
+    /// filter to just the current message's tenant without scanning
+    /// every running app.
+    pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
 }

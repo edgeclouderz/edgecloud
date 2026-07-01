@@ -1,0 +1,449 @@
+//! FaaS dispatcher for Handler-model components.
+//!
+//! Phase C: real HTTP server that hosts one
+//! `wasi:http/incoming-handler` export per `(tenant, app)` pair. Each
+//! accepted request creates a fresh `wasmtime::Store<RuntimeState>`
+//! (via `ProxyPre::instantiate_async`) and drives the guest's
+//! `handle(req, out)` impl. Outbound HTTP calls go through
+//! `RuntimeState::send_request`, which is where `EgressPolicy::check`
+//! runs (Phase C-3).
+//!
+//! # Why hyper (not axum)
+//!
+//! `wasmtime-wasi-http` 25 ships `HyperOutgoingBody` (a `hyper::Body`)
+//! and is documented to be paired with the raw `hyper::server::conn::http1`
+//! API. axum 0.7 wraps `hyper::Body` in `axum::body::Body` which round-
+//! trips through extra mpsc/adapter channels. Direct `hyper` keeps the
+//! per-request path lean. Body-cap limits are enforced via a separate
+//! `BodySizeCap` wrapper (TODO C-6.4) once the integration tests prove
+//! the simple path works end-to-end.
+//!
+//! # Per-request isolation
+//!
+//! Every request gets a fresh `ResourceTable` and a fresh `WasiCtx`
+//! (rebuilt from the stored env `HashMap` through `RuntimeState::clone`).
+//! Per-tenant `KvStore` / `Cache` / `Scheduler` are Arc-shared, so
+//! cheap to clone.
+//!
+//! # Per-request budget
+//!
+//! The store's epoch deadline is set to `request_budget_ticks`; the
+//! engine's epoch clock is advanced by the per-app `std::thread`
+//! ticker spawned at the top of `serve`. (The supervisor's
+//! long-running-path ticker — at `supervisor.rs:206-217` — is the
+//! tokio analogue. We use a dedicated OS thread here because tokio
+//! scheduling latency under load (parallel test runs) can drift the
+//! ticker past the deadline.) A guest that exceeds the budget traps
+//! with an interrupt — `handle_request` translates that into a
+//! synthetic 500 response.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::Request as HyperRequest;
+use hyper::Response as HyperResponse;
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use wasmtime::component::InstancePre;
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::WasiHttpView;
+
+use edge_runtime::interfaces::observe::{AppLogContext, LogSink};
+use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
+
+// Convenience aliases: the bindgen-generated `ProxyPre` lives one level
+// deeper than the example docs suggest — `wasmtime_wasi_http::ProxyPre`
+// is NOT re-exported at the crate root (verified in 25.0.3's `lib.rs`).
+// The Response Sender/Receiver aliases factor a 6-line type that
+// clippy::type_complexity rightly complains about.
+type HandlerProxyPre = wasmtime_wasi_http::bindings::ProxyPre<RuntimeState>;
+type HandlerResponseResult =
+    Result<HyperResponse<HyperOutgoingBody>, wasmtime_wasi_http::bindings::http::types::ErrorCode>;
+type HandlerResponseSender = tokio::sync::oneshot::Sender<HandlerResponseResult>;
+type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseResult>;
+
+/// Per-app HTTP dispatcher for a FaaS component.
+///
+/// Owns a `ProxyPre<RuntimeState>` (pre-instantiated component) and a
+/// `hyper`-based server bound to `0.0.0.0:port`. One instance per
+/// `(tenant_id, app_name)` is stored on the `AppInstance`.
+pub struct HandlerDispatch {
+    /// `wasmtime_wasi_http::ProxyPre` — pre-instantiated component
+    /// that exports `wasi:http/incoming-handler`. Cheap to clone
+    /// (Arc-shared); we hand a clone to each per-request task so
+    /// `proxy_pre.instantiate_async(&mut store)` is parallel-safe.
+    proxy_pre: HandlerProxyPre,
+    /// TCP port assigned to this app by `PortPool`.
+    port: u16,
+    /// Per-request wasmtime epoch deadline (in ticks, where each tick
+    /// is `tick_ms`).
+    request_budget_ticks: u64,
+    /// Engine-clock tick interval (ms) — how often the per-app ticker
+    /// calls `engine.increment_epoch()`. Defaults to 1 if the caller
+    /// passes 0.
+    tick_ms: u64,
+    /// Per-app context shared across all requests (tenant_id, egress,
+    /// meter, log_sink, app_ctx). Cheap to clone (`Arc`-heavy).
+    config: Arc<HandlerConfig>,
+}
+
+/// Per-app context handed to every FaaS request.
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct HandlerConfig {
+    /// Tenant that owns this dispatch — propagated into
+    /// `RuntimeState::tenant_id` and stamped onto the per-request log.
+    pub tenant_id: String,
+    /// EgressPolicy applied to outbound `wasi:http` calls.
+    pub egress: Arc<EgressPolicy>,
+    /// Per-app log sink — guest `emit_log` records flow here.
+    pub log_sink: Arc<dyn LogSink>,
+    /// App context stamped onto every log record for attribution.
+    pub app_ctx: AppLogContext,
+    /// Per-deployment request meter — incremented per accepted request
+    /// so the heartbeat carries the right counts.
+    pub meter: Arc<RequestMeter>,
+    /// Env vars injected into the per-request `WasiCtx`.
+    pub env: std::collections::HashMap<String, String>,
+}
+
+impl HandlerDispatch {
+    /// Build a dispatcher from a pre-instantiated component.
+    pub fn new(
+        instance_pre: InstancePre<RuntimeState>,
+        port: u16,
+        request_budget_ms: u64,
+        epoch_tick_ms: u64,
+        config: HandlerConfig,
+    ) -> anyhow::Result<Self> {
+        let proxy_pre = HandlerProxyPre::new(instance_pre)
+            .context("ProxyPre::new (component does not export wasi:http/incoming-handler)")?;
+        // Defend against divide-by-zero: a misconfigured 0 tick would
+        // NaN the math. Default to 1 ms.
+        let tick_ms = epoch_tick_ms.max(1);
+        let ticks = request_budget_ms / tick_ms;
+        Ok(Self {
+            proxy_pre,
+            port,
+            request_budget_ticks: ticks.max(1),
+            tick_ms,
+            config: Arc::new(config),
+        })
+    }
+
+    /// Spawn the HTTP server on `0.0.0.0:port`. Returns once the
+    /// shutdown signal is observed OR the server fails. The caller
+    /// (supervisor) drives this in a `tokio::spawn`.
+    pub async fn serve(
+        self: Arc<Self>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(("0.0.0.0", self.port))
+            .await
+            .with_context(|| format!("HandlerDispatch: bind 0.0.0.0:{}", self.port))?;
+        let local_addr = listener
+            .local_addr()
+            .with_context(|| format!("HandlerDispatch: local_addr for port {}", self.port))?;
+        tracing::info!(
+            port = self.port,
+            addr = %local_addr,
+            "HandlerDispatch: hyper HTTP/1 listener ready"
+        );
+
+        // Spawn the per-app epoch ticker. The engine clock is global,
+        // but advancing it in a per-app thread keeps a misbehaving
+        // app's deadline work isolated — when the app stops, the ticker
+        // joins with it. Mirrors the supervisor's long-running-path
+        // ticker at supervisor.rs:206-217. The ticker is REQUIRED —
+        // without it, the per-request epoch deadline never advances,
+        // and a busy guest runs to natural completion (or until the
+        // host kills the process). Tested by
+        // `l7_per_request_timeout_returns_500` in
+        // `edge-worker/tests/layer_integration.rs`.
+        //
+        // We use `std::thread` (not `tokio::spawn`) because tokio
+        // scheduling latency under load (multiple concurrent tests
+        // each spawning many tasks) can drift the ticker past the
+        // requested deadline. `std::thread::sleep` paces wall-clock
+        // strictly and is unaffected by tokio runtime state. The
+        // thread polls an `Arc<AtomicBool>` shutdown flag on every
+        // tick and exits within one tick interval.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let ticker_engine = self.proxy_pre.engine().clone();
+        let tick_ms = self.tick_ms;
+        let ticker_shutdown = shutdown_flag.clone();
+        let ticker_handle = thread::Builder::new()
+            .name(format!("epoch-tick-{}", self.port))
+            .spawn(move || loop {
+                if ticker_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(tick_ms));
+                if ticker_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticker_engine.increment_epoch();
+            })
+            .with_context(|| {
+                format!(
+                    "HandlerDispatch: spawn epoch-tick thread for port {}",
+                    self.port
+                )
+            })?;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    tracing::info!(port = self.port, "HandlerDispatch received shutdown");
+                    shutdown_flag.store(true, Ordering::Relaxed);
+                    // Best-effort join. The thread is bounded by one
+                    // tick interval (~1 ms in tests, 10 ms in prod).
+                    let _ = ticker_handle.join();
+                    return Ok(());
+                }
+                accept = listener.accept() => {
+                    let (client, addr) = match accept {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                port = self.port,
+                                err = %e,
+                                "accept failed; continuing"
+                            );
+                            continue;
+                        }
+                    };
+                    let server = self.clone();
+                    let tenant_id_for_log = server.config.tenant_id.clone();
+                    let app_name_for_log = server.config.app_ctx.app_name.clone();
+                    tokio::spawn(async move {
+                        match server.serve_connection(client).await {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    client = %addr,
+                                    "connection closed cleanly"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    tenant_id = %tenant_id_for_log,
+                                    app_name = %app_name_for_log,
+                                    client = %addr,
+                                    err = %e,
+                                    "connection ended with error"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Serve one accepted TCP connection. Iterates HTTP/1.1 request/
+    /// response cycles until the client closes or a handler errors.
+    ///
+    /// We use the raw `hyper::server::conn::http1` API because
+    /// `wasmtime-wasi-http` 25's examples pair with `hyper` directly.
+    /// axum 0.7 would add an extra layer of `axum::body::Body` ↔
+    /// `hyper::body::Incoming` conversion with no win for a FaaS
+    /// dispatch path that already round-trips through `hyper::Body`.
+    async fn serve_connection(
+        self: Arc<Self>,
+        client: tokio::net::TcpStream,
+    ) -> anyhow::Result<()> {
+        let io = TokioIo::new(client);
+        let server = self.clone();
+        let svc = service_fn(move |req: HyperRequest<Incoming>| {
+            let server = server.clone();
+            async move {
+                // `handle_request` returns `anyhow::Result<HyperResponse>`
+                // which is `Send + Sync + 'static` — the bounds
+                // `hyper::service::Service` requires on `Output::Error`.
+                server.handle_request(req).await
+            }
+        });
+        http1::Builder::new()
+            .keep_alive(true)
+            .serve_connection(io, svc)
+            .await
+            .context("http1::Builder::serve_connection")?;
+        Ok(())
+    }
+
+    /// Dispatch a single HTTP request through `ProxyPre`.
+    ///
+    /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
+    /// `lib.rs`. Key differences from that example:
+    ///
+    ///   * `RuntimeState::with_env_and_meter` constructs per-request
+    ///     state with the per-app tenant_id, egress policy, log sink,
+    ///     and app context — wired through `HandlerConfig`.
+    ///   * The store's epoch deadline is set to `request_budget_ticks`
+    ///     so a runaway guest hits an interrupt.
+    ///   * `meter.record_request()` is incremented before the guest is
+    ///     invoked so the count is exact even if the guest traps.
+    ///
+    /// Errors are mapped to:
+    ///   * `Ok(Ok(resp))` → forward the guest response.
+    ///   * `Ok(Err(http_error))` → wrap as a 500 response with the
+    ///     diagnostic in the body (so a client gets a real HTTP
+    ///     response, not a connection drop).
+    ///   * `Err(_dropped)` → guest never called `set` (trapped /
+    ///     hung); wrap into a 500 with the underlying task error.
+    async fn handle_request(
+        self: Arc<Self>,
+        req: HyperRequest<Incoming>,
+    ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
+        let engine = self.proxy_pre.engine();
+
+        // Per-request RuntimeState — fresh ResourceTable, fresh
+        // WasiCtx (rebuilt from the stored env HashMap), shared
+        // EgressPolicy + LogSink + meter (Arc-clones).
+        let request_state = RuntimeState::with_env_and_meter(
+            self.config.env.clone(),
+            Some(self.config.meter.clone()),
+            self.config.tenant_id.clone(),
+            self.config.egress.clone(),
+            self.config.log_sink.clone(),
+            self.config.app_ctx.clone(),
+        );
+
+        // 256 MiB memory cap per request — generous for FaaS
+        // workloads but bounds memory-bomb guests. Matches the
+        // LongRunning branch's hardcoded cap from the v0.1 era.
+        let mut store = edge_runtime::create_store(engine, 256, request_state);
+        store.set_epoch_deadline(self.request_budget_ticks);
+
+        // Build the incoming-request / response-outparam handles the
+        // guest will see. `new_incoming_request` records the URL +
+        // headers in the per-request `ResourceTable`. The response
+        // outparam delivers a `Result<Response, ErrorCode>` — see
+        // wasmtime-wasi-http 25's bindings.rs for the trappable_error
+        // declaration that maps `error-code` → `HttpError`.
+        let (sender, receiver): (HandlerResponseSender, HandlerResponseReceiver) =
+            tokio::sync::oneshot::channel();
+        let req_handle = store
+            .data_mut()
+            .new_incoming_request(Scheme::Http, req)
+            .context("new_incoming_request")?;
+        let out = store
+            .data_mut()
+            .new_response_outparam(sender)
+            .context("new_response_outparam")?;
+
+        // Account the request before dispatching the guest. We
+        // snapshot-and-subtract in the heartbeat loop, not here, so
+        // the counter only ever moves forward.
+        self.config.meter.record_request();
+        let tenant_for_log = self.config.tenant_id.clone();
+        let app_name_for_log = self.config.app_ctx.app_name.clone();
+        let proxy_pre = self.proxy_pre.clone();
+
+        let dispatch_task = tokio::spawn(async move {
+            let proxy = proxy_pre
+                .instantiate_async(&mut store)
+                .await
+                .context("proxy_pre.instantiate_async")?;
+            proxy
+                .wasi_http_incoming_handler()
+                .call_handle(store, req_handle, out)
+                .await
+        });
+
+        match receiver.await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(error_code)) => {
+                // Guest exited cleanly via `response-outparam::set`
+                // with an error (e.g. EgressPolicy denial surface
+                // upstream). Surface as 500 with diagnostics in the
+                // body so the client sees a real HTTP response.
+                tracing::warn!(
+                    tenant_id = %tenant_for_log,
+                    app_name = %app_name_for_log,
+                    err = %error_code,
+                    "guest response_outparam::set returned Err"
+                );
+                Ok(synthetic_500(&format!(
+                    "guest returned error-code: {error_code:?}"
+                )))
+            }
+            Err(_dropped) => {
+                // Sender dropped without invoking `set` — guest
+                // either trapped (e.g. epoch deadline exceeded) or
+                // never replied. Surface the underlying error from the
+                // dispatch task as a synthetic 500 so hyper sends a
+                // real response to the client instead of closing the
+                // connection mid-message.
+                let e = match dispatch_task.await {
+                    Ok(Ok(())) => {
+                        anyhow::anyhow!("guest never invoked `response-outparam::set` method")
+                    }
+                    Ok(Err(e)) => e,
+                    Err(e) => e.into(),
+                };
+                tracing::warn!(
+                    tenant_id = %tenant_for_log,
+                    app_name = %app_name_for_log,
+                    err = %e,
+                    "guest trap or hang; returning 500"
+                );
+                Ok(synthetic_500(&format!("{e:#}")))
+            }
+        }
+    }
+}
+
+/// Build a synthetic 500 HTTP response carrying `diagnostic` in the
+/// body. Used when the guest traps (epoch interrupt, oom) or returns
+/// an `ErrorCode` from `response-outparam::set`. hyper 1.x will close
+/// the connection mid-message if a service returns `Err` to
+/// `serve_connection` for `http1` — so the dispatcher MUST respond
+/// with `Ok(response)` rather than propagating `Err`.
+///
+/// Body shape is `text/plain; charset=utf-8` so curl -v / browsers
+/// render it. Length is bounded to 1 KiB so a runaway guest with a
+/// 100 MB error message doesn't blow up the dispatch.
+fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
+    use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
+    use hyper::StatusCode;
+
+    // Truncate the diagnostic to a UTF-8-safe boundary at 1024 bytes
+    // (so a 100 MB error string doesn't blow up the dispatch).
+    let bounded = {
+        let bytes = diagnostic.as_bytes();
+        let cap = bytes.len().min(1024);
+        let cap = bytes[..cap]
+            .iter()
+            .rposition(|b| (*b as i8) >= -0x40)
+            .unwrap_or(0);
+        std::str::from_utf8(&bytes[..cap]).unwrap_or("non-utf8 diagnostic")
+    };
+    let body = bounded.as_bytes().to_vec();
+    let len = body.len();
+
+    // `HyperOutgoingBody::new` expects a `Body<Data=Bytes, Error=ErrorCode>
+    // + Send + 'static`. `HyperOutgoingBody` is itself a
+    // `BoxBody<Bytes, ErrorCode>` from `http_body_util`, so we wrap a
+    // single-shot `Full<Bytes>` (Error = Infallible) via `MapErr` that
+    // converts any error into `ErrorCode::InternalError(None)`.
+    use http_body_util::{BodyExt, Full};
+    use std::convert::Infallible;
+    let body_wrapped =
+        Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
+
+    HyperResponse::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_LENGTH, len)
+        .body(HyperOutgoingBody::new(body_wrapped))
+        .expect("synthetic 500: builder with explicit content-length never fails")
+}
