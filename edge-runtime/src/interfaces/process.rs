@@ -211,4 +211,94 @@ mod tests {
         let process = Process::new();
         assert!(process.get_cwd().is_ok());
     }
+
+    // ── get_args ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_args_returns_at_least_binary_path() {
+        let process = Process::new();
+        let args = process.get_args();
+        assert!(!args.is_empty(), "args should contain at least the binary path");
+        // The first argument is the test binary path. It should exist
+        // and be an absolute path in normal test environments.
+        let first = &args[0];
+        assert!(!first.is_empty(), "first arg (binary path) should not be empty");
+    }
+
+    // ── filter_env_vars blocklist ───────────────────────────────────────
+
+    #[test]
+    fn test_filter_env_vars_blocks_aws_prefix() {
+        let raw = vec![
+            ("AWS_ACCESS_KEY_ID".into(), "AKID123".into()),
+            ("AWS_SECRET_KEY".into(), "sk_test".into()),
+            ("SAFE_VAR".into(), "hello".into()),
+        ];
+        let filtered: HashMap<_, _> = filter_env_vars(raw.into_iter()).collect();
+        assert!(!filtered.contains_key("AWS_ACCESS_KEY_ID"));
+        assert!(!filtered.contains_key("AWS_SECRET_KEY"));
+        assert_eq!(filtered.get("SAFE_VAR"), Some(&"hello".into()));
+    }
+
+    #[test]
+    fn test_filter_env_vars_blocks_edge_secrets() {
+        let raw = vec![
+            ("EDGE_SECRET_KEY".into(), "secret".into()),
+            ("EDGE_API_KEY".into(), "sk_test".into()),
+        ];
+        let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.is_empty(), "EDGE_SECRET and EDGE_API_KEY should be blocked");
+    }
+
+    #[test]
+    fn test_filter_env_vars_blocks_database_url() {
+        let raw = vec![("DATABASE_URL".into(), "postgres://...".into())];
+        let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_env_vars_blocks_stripe_keys() {
+        let raw = vec![("STRIPE_API_KEY".into(), "sk_live_xxx".into())];
+        let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_env_vars_blocks_secret_keyword() {
+        // Vars whose name STARTS WITH "SECRET" are blocked (prefix match).
+        let raw = vec![("SECRET_VALUE".into(), "classified".into())];
+        let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_env_vars_blocks_api_key_keyword() {
+        let raw = vec![("API_KEY".into(), "abc123".into())];
+        let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_env_vars_passes_safe_vars() {
+        let raw = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/root".into()),
+            ("MY_APP_VAR".into(), "value".into()),
+        ];
+        let filtered: HashMap<_, _> = filter_env_vars(raw.into_iter()).collect();
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.contains_key("PATH"));
+        assert!(filtered.contains_key("HOME"));
+        assert!(filtered.contains_key("MY_APP_VAR"));
+    }
+
+    #[test]
+    fn test_filter_env_vars_allows_non_blocked_secret_like_names() {
+        // The blocklist uses starts_with, so vars that contain "SECRET"
+        // but don't start with it are NOT blocked (defense-in-depth only).
+        let raw = vec![("MY_SECRET_KEY".into(), "val".into())];
+        let filtered: HashMap<_, _> = filter_env_vars(raw.into_iter()).collect();
+        assert!(filtered.contains_key("MY_SECRET_KEY"));
+    }
 }
