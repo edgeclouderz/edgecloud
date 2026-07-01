@@ -67,9 +67,7 @@ pub fn detect_execution_model(component: &Component) -> ExecutionModel {
         // Exact match OR canonical-ABI `<name>@<version>` form. The
         // bindgen normalizes across patch versions, so `@0.2.0` is
         // valid for our Handler linker even though our WIT pins `@0.2.1`.
-        if name == HANDLER_EXPORT
-            || name.starts_with(&format!("{HANDLER_EXPORT}@"))
-        {
+        if name == HANDLER_EXPORT || name.starts_with(&format!("{HANDLER_EXPORT}@")) {
             return ExecutionModel::Handler;
         }
     }

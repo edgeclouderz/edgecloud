@@ -649,10 +649,8 @@ fn build_wasi_ctx_for_tenant(env: &Arc<HashMap<String, String>>, tenant_id: &str
     // wasi:cli path. The blocklist (`AWS_*`, `*SECRET*`, `*API_KEY*`, …)
     // lives in `interfaces/process.rs::filter_env_vars` and is reused
     // here — single source of truth.
-    let env_strings: Vec<(String, String)> = process::filter_env_vars(
-        env.iter().map(|(k, v)| (k.clone(), v.clone())),
-    )
-    .collect();
+    let env_strings: Vec<(String, String)> =
+        process::filter_env_vars(env.iter().map(|(k, v)| (k.clone(), v.clone()))).collect();
     let mut builder = WasiCtxBuilder::new();
     builder.envs(&env_strings);
 

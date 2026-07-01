@@ -344,10 +344,7 @@ impl HandlerDispatch {
                                 cap = self.config.max_request_body_bytes,
                                 "request body exceeds per-app cap; rejecting 413",
                             );
-                            return Ok(synthetic_413(
-                                len,
-                                self.config.max_request_body_bytes,
-                            ));
+                            return Ok(synthetic_413(len, self.config.max_request_body_bytes));
                         }
                     }
                 }
@@ -511,9 +508,8 @@ fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBo
     use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use hyper::StatusCode;
 
-    let diagnostic = format!(
-        "request body of {content_length} bytes exceeds per-app cap of {cap} bytes"
-    );
+    let diagnostic =
+        format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
     let bounded = {
         let bytes = diagnostic.as_bytes();
         let cap = bytes.len().min(1024);
