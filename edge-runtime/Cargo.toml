@@ -9,37 +9,28 @@ description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces fo
 # Core wasmtime runtime
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
 wasmtime-wasi = { version = "25.0" }
+# WASI HTTP host impls — gives us `WasiHttpView`, `ProxyPre`, and the
+# `add_to_linker_async` helper that wires wasi:http/io/clocks/random into
+# a `ComponentLinker`. Used in `linker.rs` (C4) and via `ProxyPre` in the
+# worker's `dispatch.rs` (C6). Pulls `hyper` transitively.
+wasmtime-wasi-http = "25.0"
 
 # Async runtime
 tokio = { version = "1.45", features = ["full"], optional = true }
 
-# HTTP client for edge:http-client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false, optional = true }
-
-# Streaming primitives for reqwest::Body::wrap_stream (inbound + outbound body streams)
-futures = { version = "0.3", optional = true }
-bytes = { version = "1", optional = true }
+# HTTP types — `WasiHttpView::send_request` takes
+# `hyper::Request<HyperOutgoingBody>` and `OutgoingRequestConfig`. The
+# trait also exposes `is_forbidden_header(&http::HeaderName)` which we
+# override in `runtime.rs` (C3) to strip hop-by-hop headers.
+hyper = { version = "1", features = ["client", "http1"] }
+http = "1"
 
 # Caching
 lru = { version = "0.12", optional = true }
 parking_lot = "0.12"
 
-# DNS resolution for edge:networking
-trust-dns-resolver = { version = "0.23", features = ["tokio"], optional = true }
-
 # Metrics
 metrics = { version = "0.24", optional = true }
-
-# HTTP parsing for http-server
-httparse = { version = "1.10", optional = true }
-
-# TLS for http-server
-rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
-
-# gzip compression for http-server
-flate2 = { version = "1.1", optional = true }
 
 # Base64 encoding for kv-store persistence
 base64 = "0.22"
@@ -67,13 +58,15 @@ wiremock = "0.6"
 wat = "1"
 
 [features]
-default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking"]
-http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "tokio/sync", "dep:bytes", "dep:futures"]
+# Default features gate only modules that still exist in
+# `src/interfaces/`. The v0.2 cleanup dropped `http-client`, `http-server`,
+# `networking`, and `dns`; their deps (`reqwest`, `futures`, `bytes`,
+# `httparse`, `rustls`, `rustls-pemfile`, `tokio-rustls`, `flate2`,
+# `trust-dns-resolver`) are no longer listed.
+default = ["kv-store", "cache", "observe", "time", "scheduling", "process"]
 kv-store = []
 cache = ["dep:lru"]
 observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
-http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2", "dep:bytes", "dep:futures"]
-networking = ["dep:trust-dns-resolver", "dep:tokio"]
