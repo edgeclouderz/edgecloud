@@ -15,6 +15,7 @@ type Config struct {
 	App       AppConfig       `yaml:"app"`
 	Storage   StorageConfig   `yaml:"storage"`
 	JWT       JWTConfig       `yaml:"jwt"`
+	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Migration MigrationConfig `yaml:"migration"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
@@ -95,6 +96,20 @@ type JWTConfig struct {
 	Secret string `yaml:"secret"`
 	TTL    int    `yaml:"ttl_hours"`
 	Issuer string `yaml:"issuer"`
+}
+
+// RateLimitConfig controls per-tenant and per-IP rate limiting.
+// A zero value selects the default (200 req/s tenant, 20 req/s IP).
+// Set to negative values to disable a limiter entirely.
+type RateLimitConfig struct {
+	// TenantRate is the sustained requests-per-second per tenant.
+	TenantRate int `yaml:"tenant_rate"`
+	// TenantBurst is the maximum burst of requests per tenant.
+	TenantBurst int `yaml:"tenant_burst"`
+	// IPRate is the sustained requests-per-second per client IP.
+	IPRate int `yaml:"ip_rate"`
+	// IPBurst is the maximum burst of requests per client IP.
+	IPBurst int `yaml:"ip_burst"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -207,6 +222,36 @@ func Load(path string) (*Config, error) {
 		cfg.InternalToken = v
 	}
 
+	// Override rate-limit config with env vars
+	if v := os.Getenv("RATE_LIMIT_TENANT_RATE"); v != "" {
+		rate, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_TENANT_RATE must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.TenantRate = rate
+	}
+	if v := os.Getenv("RATE_LIMIT_TENANT_BURST"); v != "" {
+		burst, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_TENANT_BURST must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.TenantBurst = burst
+	}
+	if v := os.Getenv("RATE_LIMIT_IP_RATE"); v != "" {
+		rate, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_IP_RATE must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.IPRate = rate
+	}
+	if v := os.Getenv("RATE_LIMIT_IP_BURST"); v != "" {
+		burst, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_IP_BURST must be a valid integer: %w", err)
+		}
+		cfg.RateLimit.IPBurst = burst
+	}
+
 	// Override with migration config env vars
 	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
 		cfg.Migration.EdgeMigratePath = v
@@ -235,6 +280,21 @@ func Load(path string) (*Config, error) {
 	// `CONTROL_PLANE_REGION` env var. See issue #82.
 	if cfg.Region == "" {
 		cfg.Region = "global"
+	}
+
+	// Defaults for rate-limit config. Zero means "use default";
+	// negative means "disabled" (bypass middleware entirely).
+	if cfg.RateLimit.TenantRate == 0 {
+		cfg.RateLimit.TenantRate = 200
+	}
+	if cfg.RateLimit.TenantBurst == 0 {
+		cfg.RateLimit.TenantBurst = 300
+	}
+	if cfg.RateLimit.IPRate == 0 {
+		cfg.RateLimit.IPRate = 20
+	}
+	if cfg.RateLimit.IPBurst == 0 {
+		cfg.RateLimit.IPBurst = 40
 	}
 
 	// Reject insecure JWT secrets. Operators frequently ship with the
