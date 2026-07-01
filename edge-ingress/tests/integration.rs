@@ -14,11 +14,6 @@
 
 use std::time::Duration;
 
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerRequest;
-use testcontainers::ImageExt;
-use testcontainers_modules::nats::Nats;
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -28,34 +23,12 @@ use edge_ingress::config::Config;
 use edge_ingress::heartbeats;
 use edge_ingress::routing::RoutingTable;
 
-// TODO(shared-test-harness): this helper and the `start_nats`
-// testcontainers setup below are byte-for-byte copies of the same code
-// in `edge-worker/tests/integration_tests.rs`. Extract both into a
-// shared `edge-test-helpers` crate (workspace-relative) so a future
-// change to the test-skip policy or the NATS startup contract lands in
-// one place.
-fn should_skip_integration_tests() -> bool {
-    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
-        || !std::path::Path::new("/var/run/docker.sock").exists()
-}
-
-async fn start_nats() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
-        .with_startup_timeout(Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration {
-            length: Duration::from_secs(5),
-        }])
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("get NATS port");
-    (container, format!("{}:{}", host, port))
-}
+// Shared test harness: NATS container startup + skip predicate, imported
+// from `edge_test_helpers`. These were byte-for-byte duplicates of the
+// same helpers in `edge-worker/tests/integration_tests.rs` and
+// `edge-worker/tests/ingress_wire_integration.rs` — see PR #166
+// follow-up #4 for the rationale.
+use edge_test_helpers::{should_skip_integration_tests, start_nats};
 
 fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
     Config {

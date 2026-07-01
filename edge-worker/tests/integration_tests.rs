@@ -10,48 +10,37 @@
 //! Skip in CI with: SKIP_INTEGRATION_TESTS=1 cargo test ...
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerRequest;
-use testcontainers::ImageExt;
-use testcontainers_modules::nats::Nats;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use edge_runtime::interfaces::observe::LogSink;
-use edge_worker::auth::WorkerJwtSigner;
 use edge_worker::config::Config;
-use edge_worker::downloader::Downloader;
-use edge_worker::log_forwarder::LogForwarder;
 use edge_worker::messages::{AppSpec, HeartbeatMessage, TaskMessage};
-use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
-use edge_worker::port_pool::PortPool;
-use edge_worker::state::{AppInstanceStatus, WorkerState};
+use edge_worker::state::AppInstanceStatus;
 use edge_worker::supervisor::Supervisor;
 
-// TODO(shared-test-harness): this helper is a byte-for-byte copy of the
-// same code in `edge-ingress/tests/integration.rs`. Extract both
-// `should_skip_integration_tests` and the testcontainers NATS startup
-// into a shared `edge-test-helpers` crate (workspace-relative) so a
-// future change to the test-skip policy or NATS startup contract lands
-// in one place.
-
-/// Returns true if integration tests should be skipped (e.g., in CI environments
-/// where Docker is unavailable or unreliable for container tests).
-fn should_skip_integration_tests() -> bool {
-    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
-        || !std::path::Path::new("/var/run/docker.sock").exists()
-}
+// Shared test harness: NATS container startup, skip predicate, and
+// Supervisor wiring. See `edge-test-helpers/src/lib.rs` for the
+// rationale. The helpers used here are:
+//   - should_skip_integration_tests(): env-aware skip predicate
+//   - start_nats(): shared across tests that need direct NATS access
+//     (heartbeat publish / queue-group pinning) and also covers the
+//     "build two supervisors against one NATS container" case.
+//   - build_supervisor_with(config) / build_supervisor_from_url(nats_url, config):
+//     single-worker supervisor builders; the only knob the test
+//     actually customises per case is `Config` fields + cache_dir.
+use edge_test_helpers::{
+    build_supervisor_from_url, build_supervisor_with, default_cache_dir,
+    should_skip_integration_tests, start_nats, SupervisorGuard,
+};
 
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
@@ -120,16 +109,19 @@ const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 /// Collects all test infrastructure: NATS container, mock HTTP server, and a
 /// Supervisor wired up with real NATS and a mock Downloader.
 ///
-/// The struct owns the NATS container AND a per-test `cache_dir` tempdir so
-/// they are dropped (and cleaned up) when the test ends. The per-test
-/// `cache_dir` is critical: a shared `/tmp/...` cache leaks state across
-/// tests, so a tampered-cache test would poison every later test that uses
-/// the same `deployment_id`.
+/// The struct owns the [`SupervisorGuard`] (which carries the NATS
+/// container) AND a per-test `cache_dir` tempdir so they are dropped
+/// (and cleaned up) when the test ends. The per-test `cache_dir` is
+/// critical: a shared `/tmp/...` cache leaks state across tests, so a
+/// tampered-cache test would poison every later test that uses the
+/// same `deployment_id`.
 pub struct TestHarness {
     pub nats_url: String,
     pub mock_server: MockServer,
     pub supervisor: Arc<Supervisor>,
-    _nats_container: testcontainers::ContainerAsync<Nats>,
+    /// Owns the NATS container. Keeping the guard alive keeps the
+    /// container alive; dropping it (at TestHarness teardown) stops it.
+    _sup_guard: SupervisorGuard,
     _cache_dir: tempfile::TempDir,
 }
 
@@ -146,31 +138,44 @@ impl TestHarness {
 
     /// Inner constructor — actual setup logic. Wrapped by a timeout in `new()`.
     async fn new_inner() -> anyhow::Result<Self> {
-        let (_nats_container, nats_url) = nats_container().await;
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
 
-        // Delegate supervisor wiring to the shared helper used by the
-        // multi-worker queue-group test so there is one canonical path
-        // for constructing a Supervisor in tests. The per-test tempdir
-        // is passed in so cache-poisoning tests don't leak state across
-        // the suite (test_cached_tampered_artifact_*).
-        let supervisor = build_supervisor(
-            &nats_url,
-            "test-worker",
-            "test-region",
-            "test-pinning-group",
-            "test-consumer",
-            &mock_server.uri(),
-            cache_dir.path(),
-        )
-        .await?;
+        // Delegate supervisor wiring to the shared helper. The per-test
+        // tempdir is threaded through Config.cache_dir so cache-poisoning
+        // tests don't leak state across the suite
+        // (test_cached_tampered_artifact_*).
+        let config = Config {
+            worker_id: "test-worker".to_string(),
+            region: "test-region".to_string(),
+            worker_addr: "test-host:0".to_string(),
+            nats_url: String::new(), // overwritten by build_supervisor_with
+            control_plane_url: mock_server.uri(),
+            cache_dir: cache_dir.path().to_path_buf(),
+            heartbeat_interval_secs: 30,
+            worker_sync_threshold_secs: 60,
+            health_check_timeout_secs: 60,
+            port_cooldown_secs: 60,
+            starting_port: 18_000,
+            max_memory_mb: 256,
+            epoch_tick_ms: 10,
+            epoch_deadline_ticks: 100,
+            queue_group: "test-pinning-group".to_string(),
+            consumer_name: "test-consumer".to_string(),
+            worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+            worker_jwt_issuer: "edgecloud".to_string(),
+            worker_tenant_id: "t_test".to_string(),
+        };
+
+        let sup_guard = build_supervisor_with(config).await;
+        let nats_url = sup_guard.nats_url.clone();
+        let supervisor = sup_guard.supervisor.clone();
 
         Ok(Self {
             nats_url,
             mock_server,
             supervisor,
-            _nats_container,
+            _sup_guard: sup_guard,
             _cache_dir: cache_dir,
         })
     }
@@ -179,28 +184,6 @@ impl TestHarness {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Start a NATS container and return (container, url).
-///
-/// Uses a simple duration-based wait instead of the built-in stderr matching,
-/// which can be unreliable in CI where NATS log messages may appear out of order.
-/// A hard startup_timeout bounds the total wait so the test fails fast on error.
-async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
-        .with_startup_timeout(std::time::Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration {
-            length: std::time::Duration::from_secs(5),
-        }])
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("get NATS port");
-    (container, format!("{}:{}", host, port))
-}
 
 /// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
 async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<HeartbeatMessage> {
@@ -346,16 +329,20 @@ async fn test_heartbeat_published() {
 }
 
 async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
-    let (container, nats_url) = nats_container().await;
+    // Start a NATS container directly (no `SupervisorGuard` here because
+    // this test doesn't bind the container to the supervisor struct; it
+    // forgets it explicitly so it stays alive for the test's duration,
+    // matching the pre-PR-#166-followup-#4 behavior).
+    let (container, nats_url) = start_nats().await;
     std::mem::forget(container); // keep alive for test; dropped when test fn returns
 
     let config = Config {
         worker_id: "test-worker".to_string(),
         region: "test-region".to_string(),
         worker_addr: "test-host:0".to_string(),
-        nats_url: nats_url.clone(),
+        nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
+        cache_dir: default_cache_dir(),
         heartbeat_interval_secs: 30,
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
@@ -370,55 +357,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
     };
-
-    let engine = edge_runtime::create_engine().context("create engine")?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-
-    let nats = Arc::new(
-        NatsClientImpl::connect(&nats_url)
-            .await
-            .context("connect nats")?,
-    ) as Arc<dyn NatsClientTrait>;
-
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer.clone(),
-    );
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let supervisor = Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-        jwt_signer,
-        http,
-    });
+    let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
     // Build and publish a heartbeat manually
     let heartbeat = supervisor.build_heartbeat().await;
@@ -494,94 +433,6 @@ async fn test_stop_all_apps() {
 
     let state = harness.supervisor.state.read().await;
     assert!(state.apps.is_empty(), "all apps should be stopped");
-}
-
-// ---------------------------------------------------------------------------
-// PR #96: build_supervisor helper + queue-group pinning regression test.
-// (Kept here after main's hash + cache tests to avoid an interleaved
-// conflict during rebase.)
-// ---------------------------------------------------------------------------
-
-/// Build a Supervisor that connects to `nats_url`. Shared helper for both
-/// the single-worker `TestHarness` and the multi-worker queue-group test.
-///
-/// `cache_dir` is explicit so per-test tempdirs (needed by the
-/// cache-poisoning tests) can be plumbed through. Pass
-/// `Path::new("/tmp/edge-worker-test-cache")` for tests that don't care
-/// about cache isolation.
-async fn build_supervisor(
-    nats_url: &str,
-    worker_id: &str,
-    region: &str,
-    queue_group: &str,
-    consumer_name: &str,
-    control_plane_url: &str,
-    cache_dir: &std::path::Path,
-) -> anyhow::Result<Arc<Supervisor>> {
-    let config = Config {
-        worker_id: worker_id.to_string(),
-        region: region.to_string(),
-        worker_addr: "test-host:0".to_string(),
-        nats_url: nats_url.to_string(),
-        control_plane_url: control_plane_url.to_string(),
-        cache_dir: cache_dir.to_path_buf(),
-        heartbeat_interval_secs: 30,
-        worker_sync_threshold_secs: 60,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: queue_group.to_string(),
-        consumer_name: consumer_name.to_string(),
-        // JWT secret + tenant id are required by Config::from_env but in
-        // tests we construct Config directly and never hit the auth path
-        // against a real control plane (the mock server accepts anything
-        // on /api/internal/*). Any non-empty placeholder works.
-        worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-    };
-
-    let engine = edge_runtime::create_engine()?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-    let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer.clone(),
-    );
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    Ok(Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-        jwt_signer,
-        http,
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +782,7 @@ async fn test_queue_group_pinning() {
 
 async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     // Single NATS container, shared by both workers and the publisher.
-    let (nats_container, nats_url) = nats_container().await;
+    let (nats_container, nats_url) = start_nats().await;
 
     let region = "test-region";
     let queue_group = "test-pinning-group";
@@ -939,26 +790,51 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     // Two workers — same region, same queue group, distinct consumer names.
     // The pinning test doesn't touch the downloader, so a shared /tmp cache
     // is fine — give each worker its own subdir to avoid cross-worker clobber.
-    let sup_a = build_supervisor(
-        &nats_url,
-        "w_pinning_a",
-        region,
-        queue_group,
-        "consumer-a",
-        "http://localhost:9999",
-        Path::new("/tmp/edge-worker-test-pinning-a"),
-    )
-    .await?;
-    let sup_b = build_supervisor(
-        &nats_url,
-        "w_pinning_b",
-        region,
-        queue_group,
-        "consumer-b",
-        "http://localhost:9999",
-        Path::new("/tmp/edge-worker-test-pinning-b"),
-    )
-    .await?;
+    let config_a = Config {
+        worker_id: "w_pinning_a".to_string(),
+        region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
+        nats_url: String::new(), // overwritten by build_supervisor_from_url
+        control_plane_url: "http://localhost:9999".to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-a"),
+        heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: queue_group.to_string(),
+        consumer_name: "consumer-a".to_string(),
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
+    };
+    let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
+
+    let config_b = Config {
+        worker_id: "w_pinning_b".to_string(),
+        region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
+        nats_url: String::new(),
+        control_plane_url: "http://localhost:9999".to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-b"),
+        heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: queue_group.to_string(),
+        consumer_name: "consumer-b".to_string(),
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
+    };
+    let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
     // Each supervisor gets its own shutdown channel — the test triggers
     // shutdown at the end and waits for both loops to exit.
@@ -1710,6 +1586,14 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure() {
 // fetch_sync tests below skip the NATS subscription and only inspect
 // the HTTP response.
 //
+// This is now a thin shim over `edge_test_helpers::build_supervisor_with`
+// that lets each test specify only the bits that vary (worker_id,
+// region, tenant_id, control_plane_url). It's still useful because
+// the rest of the Config (starting_port, queue_group, …) is identical
+// across all 5 call sites — keeping the wiring logic next to the
+// tests lets the test author see what knobs can be customised
+// without having to jump into the helper crate.
+//
 // `control_plane_url` must be the wiremock server URI for fetch_sync
 // tests. Tests construct it themselves.
 async fn build_supervisor_only_with_cp(
@@ -1718,14 +1602,11 @@ async fn build_supervisor_only_with_cp(
     tenant_id: &str,
     control_plane_url: &str,
 ) -> anyhow::Result<Arc<Supervisor>> {
-    let (container, nats_url) = nats_container().await;
-    std::mem::forget(container);
-
     let config = Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: "test-host:0".to_string(),
-        nats_url,
+        nats_url: String::new(), // overwritten by build_supervisor_with
         control_plane_url: control_plane_url.to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-sync-test-cache"),
         heartbeat_interval_secs: 30,
@@ -1743,45 +1624,16 @@ async fn build_supervisor_only_with_cp(
         worker_tenant_id: tenant_id.to_string(),
     };
 
-    let engine = edge_runtime::create_engine().context("create engine")?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-    let nats =
-        Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn NatsClientTrait>;
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer.clone(),
-    );
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    Ok(Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-        jwt_signer,
-        http,
-    }))
+    let guard = build_supervisor_with(config).await;
+    // Discard the guard's container handle — `supervisor` is a clone
+    // of the Arc inside the guard; the guard holds the container
+    // alive for as long as it's in scope. Once this function returns
+    // the caller owns the supervisor but NOT the guard; that means
+    // the container drops when this function returns. The callers
+    // (fetch_sync / handle_task_message tests) use the supervisor's
+    // JS jetstream connection for the test's full duration — the
+    // container lifetime needs to match. To preserve the test
+    // semantics, we intentionally forget the NATS container here.
+    std::mem::forget(guard._nats_container);
+    Ok(guard.supervisor)
 }

@@ -26,73 +26,32 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerRequest;
-use testcontainers::ImageExt;
-use testcontainers_modules::nats::Nats;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 
-use edge_worker::auth::WorkerJwtSigner;
-use edge_worker::config::Config;
-use edge_worker::downloader::Downloader;
-use edge_worker::log_forwarder::LogForwarder;
+use edge_test_helpers::{
+    build_supervisor_from_url, default_cache_dir, should_skip_integration_tests, start_nats,
+};
 use edge_worker::messages::HeartbeatMessage;
-use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
-use edge_worker::port_pool::PortPool;
-use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
 
 use edge_ingress::heartbeats::apply_heartbeat;
 use edge_ingress::routing::RoutingTable;
 
-// TODO(shared-test-harness): byte-for-byte duplicate of the same helpers
-// in `edge-worker/tests/integration_tests.rs` and `edge-ingress/tests/integration.rs`.
-// Extract `should_skip_integration_tests` and the NATS container startup
-// into a shared `edge-test-helpers` crate so changes to the skip policy
-// or NATS startup contract land in one place. Tracked separately to
-// avoid expanding the scope of this PR.
-
-fn should_skip_integration_tests() -> bool {
-    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
-        || !std::path::Path::new("/var/run/docker.sock").exists()
-}
-
-async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
-        .with_startup_timeout(std::time::Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration {
-            length: std::time::Duration::from_secs(5),
-        }])
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("get NATS port");
-    (container, format!("{}:{}", host, port))
-}
-
-/// Build a minimal Supervisor pointed at the given NATS URL. No mock HTTP
-/// server is needed — this test never starts apps, it only verifies the
-/// heartbeat wire contract.
-async fn build_supervisor(
-    nats_url: &str,
+/// Construct a `Config` matching the worker's runtime expectations, for
+/// the heartbeat wire test (which never starts apps; the only fields it
+/// cares about are worker_id / region / worker_addr).
+fn wire_test_config(
     worker_id: &str,
     region: &str,
     worker_addr: &str,
-) -> anyhow::Result<Arc<Supervisor>> {
-    let config = Config {
+) -> edge_worker::config::Config {
+    edge_worker::config::Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: worker_addr.to_string(),
-        nats_url: nats_url.to_string(),
+        nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: std::path::PathBuf::from("/tmp/edge-worker-ingress-wire-test"),
+        cache_dir: default_cache_dir(),
         heartbeat_interval_secs: 30,
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
@@ -102,55 +61,11 @@ async fn build_supervisor(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         queue_group: "ingress-wire-group".to_string(),
-        consumer_name: format!("ingress-wire-{}", worker_id),
-        // JWT fields: required by Config, but the wire tests construct
-        // Config directly and never hit the auth path against a real
-        // control plane (the mock server accepts anything). Any non-empty
-        // placeholder is fine.
+        consumer_name: format!("ingress-wire-{worker_id}"),
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
-    };
-
-    let engine = edge_runtime::create_engine().context("create engine")?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
-
-    let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer.clone(),
-    );
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    Ok(Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-        jwt_signer,
-        http,
-    }))
+    }
 }
 
 /// The full #70 contract: worker emits a heartbeat with `worker_addr`,
@@ -174,8 +89,11 @@ async fn heartbeat_worker_addr_round_trips_into_ingress_routing_table() {
 }
 
 async fn run_test() -> anyhow::Result<()> {
-    let (nats_container, nats_url) = nats_container().await;
-    std::mem::forget(nats_container); // keep alive for the duration of the test; dropped at fn return
+    let (nats_container, nats_url) = start_nats().await;
+    // Forgetting the container keeps it alive until the test runtime
+    // exits. We can't use a `SupervisorGuard` here because we need the
+    // raw NATS URL to subscribe to it directly from this test.
+    std::mem::forget(nats_container);
 
     let region = "fra";
     let worker_id = "w_ingress_wire";
@@ -184,7 +102,8 @@ async fn run_test() -> anyhow::Result<()> {
     // through the wire unmodified.
     let worker_addr = "203.0.113.42:8080";
 
-    let supervisor = build_supervisor(&nats_url, worker_id, region, worker_addr).await?;
+    let config = wire_test_config(worker_id, region, worker_addr);
+    let supervisor: Arc<Supervisor> = build_supervisor_from_url(&nats_url, config).await?;
 
     // Build the heartbeat exactly as the worker would on its 30s tick
     // (see `edge-worker/src/main.rs:110`).
