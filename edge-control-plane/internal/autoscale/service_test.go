@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -452,6 +453,205 @@ func TestSubscribe_DisabledSkips(t *testing.T) {
 	if err := s.Subscribe(context.Background()); err != nil {
 		t.Errorf("Subscribe(enabled=false) err = %v, want nil", err)
 	}
+}
+
+// TestDesiredApps_FallbackOnDBError pins the safe default when the
+// deployment repository is unreachable: desiredApps must return 0
+// (not panic, not return a stale count) so the autoscaler sees
+// needed=1 and noops rather than scaling down based on bad data.
+func TestDesiredApps_FallbackOnDBError(t *testing.T) {
+	s := NewService(Deps{
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) {
+				return 0, errors.New("connection refused")
+			},
+		},
+		EventRepo: &mockEventRepo{},
+		Cloud:     &MockCloudProvider{},
+		Log:       discardLogger(),
+	})
+	if n := s.desiredApps(context.Background()); n != 0 {
+		t.Errorf("desiredApps = %d, want 0 on DB error", n)
+	}
+}
+
+// TestDesiredApps_ReturnsCount pins the happy path: the deploy repo
+// returns a count and desiredApps passes it through.
+func TestDesiredApps_ReturnsCount(t *testing.T) {
+	s := NewService(Deps{
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) { return 42, nil },
+		},
+		EventRepo: &mockEventRepo{},
+		Cloud:     &MockCloudProvider{},
+		Log:       discardLogger(),
+	})
+	if n := s.desiredApps(context.Background()); n != 42 {
+		t.Errorf("desiredApps = %d, want 42", n)
+	}
+}
+
+// TestFormatSeconds_LessThanOne pins the sub-second branch: a value
+// like 0.5 must render as "<1s" so cooldown log messages are
+// readable even when the decision tick fires almost immediately
+// after the last event.
+func TestFormatSeconds_LessThanOne(t *testing.T) {
+	if got := formatSeconds(0.5); got != "<1s" {
+		t.Errorf("formatSeconds(0.5) = %q, want \"<1s\"", got)
+	}
+}
+
+// TestEvaluateAll_ScaleUpOnShortage exercises the full decision
+// pipeline end-to-end inside a single tick:
+//   - Seed a fleet with 1 worker reporting 10 free slots
+//   - desiredApps returns 20 → needed = 24 → shortage → scale_up
+//
+// This test validates that the snapshot → ComputeDecision → execute
+// chain works correctly without requiring a NATS server.
+func TestEvaluateAll_ScaleUpOnShortage(t *testing.T) {
+	events := &mockEventRepo{}
+	s := NewService(Deps{
+		Cfg: Config{
+			Enabled: true, MinWorkers: 1, MaxWorkers: 10,
+			TargetHeadroomPct: 20, DecisionIntervalS: 30,
+		},
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) { return 20, nil },
+		},
+		EventRepo: events,
+		Cloud: &MockCloudProvider{
+			ProvisionFunc: func(_ context.Context, _ string) (string, error) { return "", nil },
+		},
+		Log: discardLogger(),
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"worker_id": "w_fra_abc",
+		"region":    "fra",
+		"cluster_headroom": map[string]any{"app_slots": 10},
+	})
+	s.handleHeartbeat(natsMsg(body))
+
+	s.evaluateAll(context.Background())
+
+	if len(events.events) == 0 {
+		t.Fatal("no events recorded after evaluateAll")
+	}
+	ev := events.events[0]
+	if ev.Action != domain.AutoscaleUp {
+		t.Errorf("Action = %q, want scale_up", ev.Action)
+	}
+	if ev.Region != "fra" {
+		t.Errorf("Region = %q, want fra", ev.Region)
+	}
+	if ev.FromCount != 1 || ev.ToCount != 2 {
+		t.Errorf("FromCount=%d ToCount=%d, want 1→2", ev.FromCount, ev.ToCount)
+	}
+	if !ev.Succeeded {
+		t.Errorf("Succeeded = false, want true")
+	}
+	if ev.ProviderKind != "mock" {
+		t.Errorf("ProviderKind = %q, want mock", ev.ProviderKind)
+	}
+}
+
+// TestEvaluateAll_MultiRegionIndependent verifies that the per-region
+// fan-out in evaluateAll produces independent decisions for each
+// region. fra needs a scale_up (1 worker, 10 slots, desiredApps=20),
+// iad needs a scale_down (5 workers, 2500 free slots, desiredApps=20).
+func TestEvaluateAll_MultiRegionIndependent(t *testing.T) {
+	events := &mockEventRepo{}
+	s := NewService(Deps{
+		Cfg: Config{
+			Enabled: true, MinWorkers: 1, MaxWorkers: 10,
+			TargetHeadroomPct: 20, DecisionIntervalS: 30,
+		},
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) { return 20, nil },
+		},
+		EventRepo: events,
+		Cloud: &MockCloudProvider{
+			ProvisionFunc:   func(_ context.Context, _ string) (string, error) { return "", nil },
+			DeprovisionFunc: func(_ context.Context, _, _ string) error { return nil },
+		},
+		Log: discardLogger(),
+	})
+
+	// fra: 1 worker with 10 slots → shortage → scale_up
+	s.handleHeartbeat(natsMsg(jsonBody(map[string]any{
+		"worker_id": "w_fra_abc", "region": "fra",
+		"cluster_headroom": map[string]any{"app_slots": 10},
+	})))
+	// iad: 5 workers with 500 slots each → excess → scale_down
+	for i := 0; i < 5; i++ {
+		s.handleHeartbeat(natsMsg(jsonBody(map[string]any{
+			"worker_id": fmt.Sprintf("w_iad_%d", i), "region": "iad",
+			"cluster_headroom": map[string]any{"app_slots": 500},
+		})))
+	}
+
+	s.evaluateAll(context.Background())
+
+	if len(events.events) != 2 {
+		t.Fatalf("events = %d, want 2 (fra scale_up, iad scale_down)", len(events.events))
+	}
+
+	// fra must be scale_up
+	evFra := events.events[0]
+	if evFra.Action != domain.AutoscaleUp {
+		t.Errorf("fra Action = %q, want scale_up", evFra.Action)
+	}
+	if evFra.Region != "fra" {
+		t.Errorf("fra Region = %q, want fra", evFra.Region)
+	}
+
+	// iad must be scale_down
+	evIad := events.events[1]
+	if evIad.Action != domain.AutoscaleDown {
+		t.Errorf("iad Action = %q, want scale_down", evIad.Action)
+	}
+	if evIad.Region != "iad" {
+		t.Errorf("iad Region = %q, want iad", evIad.Region)
+	}
+}
+
+// TestEvaluateAll_NoopOnTarget verifies that when the fleet is within
+// the target headroom band, evaluateAll records a noop event.
+func TestEvaluateAll_NoopOnTarget(t *testing.T) {
+	events := &mockEventRepo{}
+	s := NewService(Deps{
+		Cfg: Config{
+			Enabled: true, MinWorkers: 1, MaxWorkers: 10,
+			TargetHeadroomPct: 20, DecisionIntervalS: 30,
+		},
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) { return 10, nil },
+		},
+		EventRepo: events,
+		Cloud:     &MockCloudProvider{},
+		Log:       discardLogger(),
+	})
+
+	// 1 worker with 50 slots, desiredApps=10 → needed=12, free=50 → within target
+	s.handleHeartbeat(natsMsg(jsonBody(map[string]any{
+		"worker_id": "w_fra_abc", "region": "fra",
+		"cluster_headroom": map[string]any{"app_slots": 50},
+	})))
+
+	s.evaluateAll(context.Background())
+
+	if len(events.events) != 1 {
+		t.Fatalf("events = %d, want 1 (noop)", len(events.events))
+	}
+	if events.events[0].Action != domain.AutoscaleNoop {
+		t.Errorf("Action = %q, want noop", events.events[0].Action)
+	}
+}
+
+// jsonBody is a convenience wrapper for json.Marshal in tests.
+func jsonBody(v map[string]any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // natsMsg wraps a byte payload in a *natsio.Msg. We don't need a
