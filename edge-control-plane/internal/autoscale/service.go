@@ -75,17 +75,17 @@ type Service struct {
 	cloud      CloudProvider
 	log        *slog.Logger
 
-	// mu guards fleets + lastEventByRegion. Even though the current
-	// Subscribe goroutine is the only writer, exposing the fleet view
-	// through a getter method (used by tests) makes a lock necessary
-	// so the test's reader doesn't race with the production writer.
+	// mu guards fleets + lastEventByRegion. Uses RWMutex so the admin
+	// endpoint (SnapshotFleet) can read without blocking heartbeat writes.
+	// Writers (handleHeartbeat, evaluateAll, execute) take the write lock;
+	// readers (SnapshotFleet) take the read lock.
 	//
 	// lastEventByRegion is keyed by region so each region's cooldown
 	// clock is independent. A scale_up in fra does not block iad's
 	// next scale_up, and vice versa. (Pre-#85 this was a single
 	// `lastEvent` shared cluster-wide, which contradicted the
 	// per-action-class docstring on applyCooldown.)
-	mu                sync.Mutex
+	mu                sync.RWMutex
 	fleets            map[string]map[string]WorkerHeadroom // region → workerID → headroom
 	lastEventByRegion map[string]*domain.AutoscaleEvent
 }
@@ -189,7 +189,7 @@ func (s *Service) evaluateAll(ctx context.Context) {
 	s.mu.Unlock()
 
 	for region, workers := range snapshot {
-		state := FleetState{Workers: workers, DesiredApps: s.desiredApps(ctx, region)}
+		state := FleetState{Workers: workers, DesiredApps: s.desiredApps(ctx)}
 		d := ComputeDecision(state, s.cfg)
 		d = s.applyCooldown(d, lastEvents[region], time.Now())
 		s.execute(ctx, region, workers, d)
@@ -197,12 +197,12 @@ func (s *Service) evaluateAll(ctx context.Context) {
 }
 
 // desiredApps returns the fleet-wide active deployment count.
-// Same value for every region in this v1 (region partitioning of the
-// deployment table is a follow-up; the data model has region only
-// on workers). Falls back to 0 on DB error — the autoscaler would
+// The same value is used for every region — region partitioning of the
+// deployment table is a follow-up (the data model has region only
+// on workers today). Falls back to 0 on DB error — the autoscaler would
 // then see `needed=1` (the floor) and likely noop, which is the
 // safer default than scale_down based on stale data.
-func (s *Service) desiredApps(ctx context.Context, _ string) int {
+func (s *Service) desiredApps(ctx context.Context) int {
 	if s.deployRepo == nil {
 		return 0
 	}
@@ -219,11 +219,10 @@ func (s *Service) desiredApps(ctx context.Context, _ string) int {
 // from ComputeDecision so the pure decision logic can be tested
 // without any clock stub.
 //
-// Cooldown is per-action-class (scale_up vs scale_down share the
-// same clock — the most recent event of either type gates the next
-// event of the same type). A scale_down 30s after a scale_up
-// therefore does NOT suppress the scale_down, even if both happened
-// in the last minute.
+// Cooldown is per-action-class: a scale_up only gates the next
+// scale_up, and a scale_down only gates the next scale_down.
+// A scale_down 30s after a scale_up is NOT suppressed — the two
+// action classes have independent cooldown timers.
 //
 // lastEvent is the most-recent autoscale_events row from the DB.
 // nil means no cooldown history.
@@ -387,8 +386,8 @@ func (s *Service) handleHeartbeat(msg *natsio.Msg) {
 // `region`. Exported for the cluster admin endpoint (PR #4) and tests.
 // Returns nil when no heartbeats have arrived for the region.
 func (s *Service) SnapshotFleet(region string) []WorkerHeadroom {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	regionMap, ok := s.fleets[region]
 	if !ok {
 		return nil

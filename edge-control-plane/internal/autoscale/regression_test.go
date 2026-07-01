@@ -218,11 +218,10 @@ func runSubscribeWithCleanup(t *testing.T, s *Service, nc *natsio.Conn, ctx cont
 		s.run(ctx, sub, ch)
 	}()
 	t.Cleanup(func() {
-		// Drain the channel so sub.Unsubscribe doesn't hang.
-		go func() {
-			for range ch {
-			}
-		}()
+		// ctx is canceled by the test's defer cancel() before cleanup
+		// runs, so s.run will already have exited via ctx.Done() and
+		// closed sub.Unsubscribe() in its own defer. wg.Wait() just
+		// synchronizes — no drain goroutine needed.
 		wg.Wait()
 	})
 }
