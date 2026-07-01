@@ -17,11 +17,31 @@
 //!
 //! - L1–L4: linker-state tests, in `edge-runtime/tests/v0_2_smoke.rs`
 //! - L5: dispatch round-trip — `l5_handler_dispatch_round_trip` (this file)
-//! - L6: body cap — deferred (fixture path not yet implemented)
+//! - L6: body cap — `l6_request_body_over_cap_returns_413` (this file)
+//! - L6b: body cap under — `l6b_request_body_under_cap_reaches_guest` (this file)
 //! - L7: per-request timeout — `l7_per_request_timeout_returns_500` (this file)
 //! - L8: long-running self-host — deferred (long_running fixture not yet built)
 //! - L9: tenant filesystem isolation — deferred (fixture fs paths not yet impl)
 //! - L10: deadline interrupts outbound — deferred (outgoing-handler path pending)
+//! - L11: process.get-env — `l11_guest_calls_process_get_env` (this file)
+//! - L12: time.now — `l12_guest_calls_time_now` (this file)
+//! - L13: kv-store round-trip — `l13_guest_calls_kv_store_round_trip` (this file)
+//! - L14: cache round-trip — `l14_guest_calls_cache_round_trip` (this file)
+//! - L15: observe.emit-log — `l15_guest_emit_log_reaches_sink` (this file)
+//! - L16: scheduling.schedule-once — `l16_guest_schedules_task` (this file)
+//! - L17: kv-store exists — `l17_kv_store_exists` (this file)
+//! - L18: kv-store list-keys — `l18_kv_store_list_keys` (this file)
+//! - L19: kv-store clear — `l19_kv_store_clear` (this file)
+//! - L20: kv-store batch ops — `l20_kv_store_batch_ops` (this file)
+//! - L21: cache size — `l21_cache_size` (this file)
+//! - L22: cache exists/list/clear — `l22_cache_exists_and_list` (this file)
+//! - L23: cache batch ops — `l23_cache_batch_ops` (this file)
+//! - L24: observe counter/gauge/histogram — `l24_observe_counter_gauge_histogram` (this file)
+//! - L25: time resolution — `l25_time_resolution` (this file)
+//! - L26: scheduling repeat/cancel — `l26_scheduling_repeat_and_cancel` (this file)
+//! - L27: process get-all-env — `l27_process_get_all_env` (this file)
+//! - L28: process get-args — `l29_process_get_args` (this file)
+//! - L29: process get-cwd — `l30_process_get_cwd` (this file)
 //!
 //! ## Skip policy
 //!
@@ -36,6 +56,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -45,20 +66,24 @@ use edge_runtime::{
     create_component_linker_handler, create_engine, EgressPolicy, RequestMeter, RuntimeState,
 };
 use edge_worker::dispatch::{HandlerConfig, HandlerDispatch};
-use edge_worker::port_pool::PortPool;
 use reqwest::StatusCode;
+use tokio::sync::broadcast;
 use wasmtime::component::{Component, InstancePre};
+
+/// Shared atomic port counter for integration tests running in parallel.
+/// Starts at 30000 to avoid clashing with ephemeral ports or developer services.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(30000);
+
+/// Allocate a unique port for an integration test dispatch.
+fn alloc_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Skip predicate for the layer integration tests. Unlike the supervisor
 /// integration tests, these don't need Docker — but they're skipped when
-/// the fixture is missing or CI is set.
+/// the fixture is missing. The fixture is committed to the repo so CI runs
+/// these tests on every PR.
 fn should_skip_layer_tests() -> bool {
-    if std::env::var("SKIP_INTEGRATION_TESTS").is_ok() {
-        return true;
-    }
-    if std::env::var("CI").is_ok() {
-        return true;
-    }
     let candidates = [
         "tests/fixtures/handler.wasm",
         "edge-worker/tests/fixtures/handler.wasm",
@@ -122,8 +147,7 @@ impl LayerHarness {
 
         // Port allocation: prefer 8192+ (ephemeral range, less likely
         // to clash with a developer's local services).
-        let mut pool = PortPool::new(8192, 0);
-        let port = pool.acquire().context("port pool exhausted")?;
+        let port = alloc_port();
 
         let config = HandlerConfig {
             tenant_id: "test-tenant".to_string(),
@@ -156,9 +180,15 @@ impl LayerHarness {
             }
         });
 
-        // The handler is HTTP/1 plain text. Give the listener a moment
-        // to bind; `accept()` will fail if the bind raced.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the TCP listener to be ready. Retry a few times because
+        // `tokio::spawn` may not schedule the `serve` task immediately.
+        let addr = format!("127.0.0.1:{port}");
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         Ok(Self {
             url_base: format!("http://127.0.0.1:{port}"),
@@ -252,6 +282,115 @@ async fn l5b_handler_dispatch_unknown_path_returns_404() {
     );
 }
 
+// ---- L6: body cap enforcement -------------------------------------------
+
+/// L6: a request whose `Content-Length` exceeds the per-app body cap
+/// receives a synthetic 413 response BEFORE the guest is invoked.
+///
+/// The body cap is enforced in `HandlerDispatch::handle_request` via a
+/// pre-check on the `Content-Length` header. This test wires a dispatch
+/// with a tiny cap (100 bytes) and asserts that a POST with a 1 KiB
+/// body returns 413.
+///
+/// A companion test (l6b) verifies that requests under the cap reach
+/// the guest normally (and get the guest's response, not a 413).
+#[tokio::test(flavor = "multi_thread")]
+async fn l6_request_body_over_cap_returns_413() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    // Spawn a harness with a tight 100-byte body cap.
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l6".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l6-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l6-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 100,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client::builder");
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let large_body = "x".repeat(1024); // 1 KiB — well over the 100-byte cap.
+    let resp = client
+        .post(&url)
+        .body(large_body)
+        .send()
+        .await
+        .expect("POST with large body");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "over-cap request should receive 413, got {}",
+        resp.status()
+    );
+}
+
+/// L6b: a request whose `Content-Length` is under the per-app body cap
+/// reaches the guest normally and returns the guest's response (not a 413).
+#[tokio::test(flavor = "multi_thread")]
+async fn l6b_request_body_under_cap_reaches_guest() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l6b".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l6b-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l6b-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024, // 10 MB — generous
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client::builder");
+
+    // The handler fixture only accepts GET. A POST will hit the
+    // guest (under cap) and return 405 (method not allowed). The key
+    // assertion is that we get an HTTP response from the guest, not
+    // a 413 from the cap pre-check.
+    let url = format!("http://127.0.0.1:{port}/");
+    let small_body = "hello";
+    let resp = client
+        .post(&url)
+        .body(small_body)
+        .send()
+        .await
+        .expect("POST with small body");
+    assert_eq!(
+        resp.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "under-cap POST should reach guest and return 405, got {}",
+        resp.status()
+    );
+}
+
 // ---- L7: per-request timeout -------------------------------------------
 
 /// L7: a handler that exceeds the per-request epoch deadline returns
@@ -279,8 +418,7 @@ async fn l7_per_request_timeout_returns_500() {
         .instantiate_pre(&component)
         .expect("linker.instantiate_pre");
 
-    let mut pool = PortPool::new(8192, 0);
-    let port = pool.acquire().expect("port pool exhausted");
+    let port = alloc_port();
 
     let config = HandlerConfig {
         tenant_id: "test-tenant".to_string(),
@@ -347,4 +485,1211 @@ async fn l7_per_request_timeout_returns_500() {
     );
 
     let _ = shutdown_tx.send(());
+}
+
+// ---- Shared helpers -----------------------------------------------------
+
+/// Spawn a `HandlerDispatch` on a free port with a supplied `HandlerConfig`.
+/// Returns the port number the server is listening on.
+///
+/// Duplicates the spawn logic from `LayerHarness::spawn` but accepts an
+/// arbitrary `HandlerConfig` so tests can vary body caps, timeouts, and
+/// other knobs without repeating the full setup.
+async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Sender<()>) {
+    let path = handler_fixture_path().expect("handler.wasm fixture missing");
+    let engine = create_engine().expect("create_engine");
+    let linker =
+        create_component_linker_handler(&engine).expect("create_component_linker_handler");
+    let bytes = std::fs::read(&path).expect("read handler.wasm");
+    let component = Component::from_binary(&engine, &bytes).expect("Component::from_binary");
+
+    let instance_pre: InstancePre<RuntimeState> = linker
+        .instantiate_pre(&component)
+        .expect("linker.instantiate_pre");
+
+    let port = alloc_port();
+
+    let dispatch = Arc::new(
+        HandlerDispatch::new(instance_pre, port, 5_000, 10, config)
+            .expect("HandlerDispatch::new"),
+    );
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    tokio::spawn(async move {
+        let result = dispatch.serve(shutdown_rx).await;
+        eprintln!("[TEST] HandlerDispatch::serve returned: {result:?}");
+    });
+
+    // Wait for the TCP listener to be ready.
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..20 {
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => return (port, shutdown_tx),
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("HandlerDispatch on {addr} did not start listening after 1s");
+}
+
+// ---- Concurrent request isolation ---------------------------------------
+
+/// Fires N concurrent `GET /` requests against a single `HandlerDispatch`
+/// and asserts all return 200. Verifies the per-request isolation path
+/// (`ProxyPre::instantiate_async` called concurrently with fresh
+/// `RuntimeState` per request) doesn't deadlock or produce garbled
+/// responses.
+#[tokio::test(flavor = "multi_thread")]
+async fn l5c_concurrent_requests_all_succeed() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let harness = LayerHarness::spawn().await.expect("LayerHarness::spawn");
+    let mut handles = Vec::new();
+
+    for i in 0..10 {
+        let base = harness.url_base.clone();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest::Client");
+        handles.push(tokio::spawn(async move {
+            let url = format!("{base}/");
+            let resp = client.get(&url).send().await.expect("GET /");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (i, status, body)
+        }));
+    }
+
+    for handle in handles {
+        let (i, status, body) = handle.await.expect("concurrent request joined");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "concurrent request {i} should return 200, got {status}: {body}"
+        );
+    }
+}
+
+// ---- E2E edge:cloud interface tests (L11–L16) --------------------------
+
+/// A `LogSink` that records every push for later inspection.
+#[derive(Clone)]
+struct RecordingLogSink {
+    records: Arc<std::sync::Mutex<Vec<(LogRecord, AppLogContext)>>>,
+}
+
+impl RecordingLogSink {
+    fn new() -> Self {
+        Self {
+            records: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn take(&self) -> Vec<(LogRecord, AppLogContext)> {
+        std::mem::take(&mut self.records.lock().unwrap())
+    }
+}
+
+impl LogSink for RecordingLogSink {
+    fn push(&self, record: LogRecord, ctx: AppLogContext) {
+        self.records.lock().unwrap().push((record, ctx));
+    }
+}
+
+/// L11: call process.get-env from the guest with a custom env var.
+/// Assert the response body matches the injected value.
+#[tokio::test(flavor = "multi_thread")]
+async fn l11_guest_calls_process_get_env() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l11".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l11".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l11".to_string(),
+        )),
+        env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/env/KV_KEY"))
+        .send()
+        .await
+        .expect("GET /env/KV_KEY");
+    assert_eq!(resp.status(), StatusCode::OK, "expected 200");
+    let body = resp.text().await.expect("body");
+    assert_eq!(body, "hello-from-host", "env var should match injected value");
+}
+
+/// L12: call time.now() from the guest. Assert the response is a
+/// parseable u64 > 0 (a valid Unix millisecond timestamp).
+#[tokio::test(flavor = "multi_thread")]
+async fn l12_guest_calls_time_now() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l12".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l12".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l12".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/time/now"))
+        .send()
+        .await
+        .expect("GET /time/now");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    let ts: u64 = body
+        .trim()
+        .parse()
+        .expect("time.now() should return a u64 timestamp");
+    assert!(ts > 1_700_000_000, "timestamp should be reasonable (> 2023)");
+}
+
+/// L13: kv-store round-trip from the guest. Set a key, then get it
+/// back in a second request.
+#[tokio::test(flavor = "multi_thread")]
+async fn l13_guest_calls_kv_store_round_trip() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l13".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l13".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l13".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Set key=color, val=blue
+    let resp = client
+        .get(format!("{base}/kv/set?key=color&val=blue"))
+        .send()
+        .await
+        .expect("GET /kv/set");
+    assert_eq!(resp.status(), StatusCode::OK, "set should succeed");
+
+    // Get key=color
+    let resp = client
+        .get(format!("{base}/kv/get?key=color"))
+        .send()
+        .await
+        .expect("GET /kv/get");
+    assert_eq!(resp.status(), StatusCode::OK, "get should succeed");
+    let body = resp.text().await.expect("body");
+    assert_eq!(body, "blue", "kv-store should return the value we set");
+
+    // Delete key=color
+    let resp = client
+        .get(format!("{base}/kv/del?key=color"))
+        .send()
+        .await
+        .expect("GET /kv/del");
+    assert_eq!(resp.status(), StatusCode::OK, "del should succeed");
+
+    // Get again — should 404
+    let resp = client
+        .get(format!("{base}/kv/get?key=color"))
+        .send()
+        .await
+        .expect("GET /kv/get (after delete)");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted key should 404");
+}
+
+/// L14: cache round-trip from the guest. Same pattern as L13 but
+/// exercises the cache interface instead of kv-store.
+#[tokio::test(flavor = "multi_thread")]
+async fn l14_guest_calls_cache_round_trip() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l14".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l14".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l14".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Set key=lang, val=rust
+    let resp = client
+        .get(format!("{base}/cache/set?key=lang&val=rust"))
+        .send()
+        .await
+        .expect("GET /cache/set");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Get key=lang
+    let resp = client
+        .get(format!("{base}/cache/get?key=lang"))
+        .send()
+        .await
+        .expect("GET /cache/get");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert_eq!(body, "rust");
+
+    // Delete key=lang
+    let resp = client
+        .get(format!("{base}/cache/del?key=lang"))
+        .send()
+        .await
+        .expect("GET /cache/del");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Get again — should 404
+    let resp = client
+        .get(format!("{base}/cache/get?key=lang"))
+        .send()
+        .await
+        .expect("GET /cache/get (after delete)");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// L15: call observe.emit-log from the guest. Verify the log record
+/// reaches the host's LogSink with the correct message.
+#[tokio::test(flavor = "multi_thread")]
+async fn l15_guest_emit_log_reaches_sink() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let sink = Arc::new(RecordingLogSink::new());
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: sink.clone() as Arc<dyn LogSink>,
+        app_ctx: AppLogContext {
+            app_name: "l15".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l15".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l15".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/log?msg=hello-from-wasm"))
+        .send()
+        .await
+        .expect("GET /log");
+    assert_eq!(resp.status(), StatusCode::OK, "log endpoint should return 200");
+
+    // Allow a brief moment for the record to propagate through the observer.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let records = sink.take();
+    assert!(!records.is_empty(), "should have received at least one log record");
+    let (record, ctx) = &records[0];
+    assert_eq!(record.message, "hello-from-wasm");
+    assert_eq!(ctx.app_name, "l15");
+    assert_eq!(ctx.tenant_id, "test-tenant");
+}
+
+/// L16: call scheduling.schedule-once from the guest. Assert the
+/// response is a non-empty string (a UUID).
+#[tokio::test(flavor = "multi_thread")]
+async fn l16_guest_schedules_task() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l16".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l16".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l16".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/sched/once?ms=60000"))
+        .send()
+        .await
+        .expect("GET /sched/once");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(!body.is_empty(), "schedule-once should return a task ID");
+    // The ID is a UUID v4: 36 hex chars with hyphens.
+    assert_eq!(
+        body.len(),
+        36,
+        "task ID should be a UUID (36 chars), got: {body:?}"
+    );
+}
+
+// ── L17–L35: remaining edge:cloud interface functions ───────────────────
+//
+// These tests exercise every function of every edge:cloud interface that
+// is not yet covered by L5–L16. Each function gets its own test.
+
+/// Minimal test config — reduces boilerplate for the remaining tests.
+fn test_config(app_name: &str) -> HandlerConfig {
+    HandlerConfig {
+        tenant_id: app_name.to_string(), // unique per test for store isolation
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: app_name.to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: app_name.to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            app_name.to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    }
+}
+
+fn make_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client")
+}
+
+// ── kv-store (remaining: exists, list-keys, clear, get-many, set-many,
+//              delete-many) ──────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l17_kv_store_exists() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l17")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
+    let resp = cl.get(&b("/kv/exists?key=a")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "true");
+
+    let resp = cl.get(&b("/kv/exists?key=none")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l18_kv_store_list_keys() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l18")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
+    cl.get(&b("/kv/set?key=b&val=2")).send().await.unwrap();
+    cl.get(&b("/kv/set?key=ab&val=3")).send().await.unwrap();
+
+    let resp = cl.get(&b("/kv/list?prefix=")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert!(keys.contains(&"a".to_string()));
+    assert!(keys.contains(&"b".to_string()));
+    assert!(keys.contains(&"ab".to_string()));
+
+    let resp = cl.get(&b("/kv/list?prefix=a")).send().await.unwrap();
+    let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(keys.len(), 2, "prefix 'a' should match 'a' and 'ab'");
+    assert!(keys.contains(&"a".to_string()));
+    assert!(keys.contains(&"ab".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l19_kv_store_clear() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l19")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
+    cl.get(&b("/kv/set?key=b&val=2")).send().await.unwrap();
+    cl.get(&b("/kv/clear")).send().await.unwrap();
+    let resp = cl.get(&b("/kv/get?key=a")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = cl.get(&b("/kv/get?key=b")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l20_kv_store_batch_ops() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l20")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // set-many
+    let resp = cl
+        .get(&b("/kv/set-many?keys=x,y,z&vals=1,2,3"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // get-many
+    let resp = cl
+        .get(&b("/kv/get-many?keys=x,y,z"))
+        .send()
+        .await
+        .unwrap();
+    let vals: Vec<Option<String>> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(vals, vec![Some("1".into()), Some("2".into()), Some("3".into())]);
+
+    // Delete two, get-many again
+    cl.get(&b("/kv/del-many?keys=x,y")).send().await.unwrap();
+    let resp = cl
+        .get(&b("/kv/get-many?keys=x,y,z"))
+        .send()
+        .await
+        .unwrap();
+    let vals: Vec<Option<String>> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(vals, vec![None, None, Some("3".into())]);
+}
+
+// ── cache (remaining: size, exists, list-keys, clear, get-many, set-many,
+//            delete-many) ────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l21_cache_size() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l21")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/cache/size")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap().parse::<u32>().unwrap(), 0);
+
+    cl.get(&b("/cache/set?key=a&val=1")).send().await.unwrap();
+    cl.get(&b("/cache/set?key=b&val=2")).send().await.unwrap();
+    let resp = cl.get(&b("/cache/size")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap().parse::<u32>().unwrap(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l22_cache_exists_and_list() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l22")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/cache/set?key=a&val=1")).send().await.unwrap();
+
+    let resp = cl.get(&b("/cache/exists?key=a")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "true");
+    let resp = cl.get(&b("/cache/exists?key=none")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "false");
+
+    let resp = cl.get(&b("/cache/list?prefix=a")).send().await.unwrap();
+    let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(keys, vec!["a"]);
+
+    cl.get(&b("/cache/clear")).send().await.unwrap();
+    let resp = cl.get(&b("/cache/exists?key=a")).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l23_cache_batch_ops() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l23")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/cache/set-many?keys=a,b,c&vals=x,y,z"))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = cl
+        .get(&b("/cache/get-many?keys=a,b,c"))
+        .send()
+        .await
+        .unwrap();
+    let vals: Vec<Option<String>> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(vals, vec![Some("x".into()), Some("y".into()), Some("z".into())]);
+
+    cl.get(&b("/cache/del-many?keys=a,b")).send().await.unwrap();
+    let resp = cl
+        .get(&b("/cache/get-many?keys=a,b,c"))
+        .send()
+        .await
+        .unwrap();
+    let vals: Vec<Option<String>> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(vals, vec![None, None, Some("z".into())]);
+}
+
+// ── observe (remaining: increment-counter, record-gauge, record-histogram,
+//             emit-log-record) ──────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l24_observe_counter_gauge_histogram() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l24")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // These are fire-and-forget — we just assert they don't error.
+    let resp = cl.get(&b("/observe/counter?name=hits&val=3")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = cl.get(&b("/observe/gauge?name=temp&val=36.5")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = cl
+        .get(&b("/observe/histogram?name=latency&val=42.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── time (remaining: resolution — sleep is tested in unit tests only
+//            because `time::sleep` calls block_on which panics inside
+//            a tokio runtime) ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l25_time_resolution() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l25")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/time/resolution")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r: u64 = resp.text().await.unwrap().trim().parse().expect("u64");
+    assert!(r > 0, "resolution should be > 0");
+}
+
+// ── scheduling (remaining: schedule-repeating, cancel) ──────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l26_scheduling_repeat_and_cancel() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l26")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/sched/repeat?ms=60000")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let id = resp.text().await.unwrap();
+    assert_eq!(id.len(), 36, "repeat should return UUID");
+
+    let resp = cl.get(&b(&format!("/sched/cancel?id={id}"))).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── process (remaining: get-all-env, get-args, get-cwd) ─────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l27_process_get_all_env() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let mut env = HashMap::new();
+    env.insert("TEST_VAR".to_string(), "hello".to_string());
+    env.insert("ANOTHER_VAR".to_string(), "world".to_string());
+    let (port, _tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "l27".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l27".to_string(),
+            tenant_id: "l27".to_string(),
+            deployment_id: "l27".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "l27".to_string(),
+            "l27".to_string(),
+        )),
+        env,
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/env")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let envs: Vec<Vec<String>> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let pairs: std::collections::HashMap<String, String> = envs
+        .into_iter()
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect();
+    assert_eq!(pairs.get("TEST_VAR"), Some(&"hello".to_string()));
+    assert_eq!(pairs.get("ANOTHER_VAR"), Some(&"world".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l29_process_get_args() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l29")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/args")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let args: Vec<String> =
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert!(!args.is_empty(), "args should contain at least the binary path");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l30_process_get_cwd() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l30")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/cwd")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cwd = resp.text().await.unwrap();
+    assert!(!cwd.is_empty(), "cwd should not be empty");
+    assert!(
+        std::path::Path::new(&cwd).is_absolute(),
+        "cwd should be absolute: {cwd}"
+    );
+}
+
+// ── L31-L50: System-level behavioral tests ─────────────────────────────
+//
+// These tests exercise concurrency, multi-tenancy, TTL expiry, resource
+// limits, cross-interface interaction, persistence, and time consistency.
+
+// ── Concurrency & Data Races (L31-L35) ────────────────────────────────
+
+/// 100 concurrent kv-store sets — all must succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn l31_concurrent_kv_sets() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l31")).await;
+    let cl = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let mut handles = Vec::new();
+    for i in 0..100 {
+        let url = b(&format!("/kv/set?key=k{i}&val=v{i}"));
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        let resp = handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "concurrent set {i} failed");
+    }
+}
+
+/// 50 concurrent readers and 50 concurrent writers to the same key.
+#[tokio::test(flavor = "multi_thread")]
+async fn l32_concurrent_kv_read_write() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l32")).await;
+    let cl = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let mut handles = Vec::new();
+    // 50 writers
+    for i in 0..50 {
+        let url = b(&format!("/kv/set?key=shared&val=writer-{i}"));
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+    // 50 readers
+    for _ in 0..50 {
+        let url = b("/kv/get?key=shared");
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        let resp = handle.await.unwrap().unwrap();
+        assert!(
+            resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND,
+            "concurrent read/write request {i} failed: {}",
+            resp.status()
+        );
+    }
+}
+
+/// 50 concurrent observers incrementing the same counter.
+#[tokio::test(flavor = "multi_thread")]
+async fn l33_concurrent_observe_counter() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l33")).await;
+    let cl = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let url = b("/observe/counter?name=systest&val=1");
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+    for handle in handles {
+        let resp = handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "concurrent counter failed");
+    }
+}
+
+/// 50 concurrent schedule-once calls — all must return unique UUIDs.
+#[tokio::test(flavor = "multi_thread")]
+async fn l34_concurrent_scheduling() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l34")).await;
+    let cl = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let url = b("/sched/once?ms=60000");
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for handle in handles {
+        let resp = handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = resp.text().await.unwrap();
+        assert!(ids.insert(id), "duplicate scheduling UUID returned");
+    }
+    assert_eq!(ids.len(), 50, "all 50 scheduling IDs must be unique");
+}
+
+// ── Multi-Tenant Isolation (L36-L38) ───────────────────────────────────
+
+/// Two tenants writing to the same key must not see each other's data.
+#[tokio::test(flavor = "multi_thread")]
+async fn l35_tenant_isolation_kv_store() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port_a, _tx_a) = spawn_handler_with_config(
+        test_config("tenant-a"),
+    )
+    .await;
+    let (port_b, _tx_b) = spawn_handler_with_config(
+        test_config("tenant-b"),
+    )
+    .await;
+    let cl = make_client();
+
+    // Tenant A writes a secret
+    cl.get(&format!("http://127.0.0.1:{port_a}/kv/set?key=secret&val=a-data"))
+        .send()
+        .await
+        .unwrap();
+
+    // Tenant B should NOT see it
+    let resp = cl
+        .get(&format!("http://127.0.0.1:{port_b}/kv/get?key=secret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "tenant B should not see tenant A's kv-store data"
+    );
+}
+
+/// Same isolation test for cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn l36_tenant_isolation_cache() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port_a, _tx_a) = spawn_handler_with_config(
+        test_config("tenant-cache-a"),
+    )
+    .await;
+    let (port_b, _tx_b) = spawn_handler_with_config(
+        test_config("tenant-cache-b"),
+    )
+    .await;
+    let cl = make_client();
+
+    cl.get(&format!("http://127.0.0.1:{port_a}/cache/set?key=token&val=a-token"))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = cl
+        .get(&format!("http://127.0.0.1:{port_b}/cache/get?key=token"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "tenant B should not see tenant A's cache data"
+    );
+}
+
+// ── TTL / Expiry (L39-L40) ──────────────────────────────────────────────
+
+/// kv-store TTL: key set with 2s TTL must be gone after 3s.
+#[tokio::test(flavor = "multi_thread")]
+async fn l37_kv_store_ttl_expiry() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l37")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // Set with 2s TTL
+    cl.get(&b("/kv/set?key=ttl-key&val=ephemeral&ttl=2"))
+        .send()
+        .await
+        .unwrap();
+
+    // Immediately exists
+    let resp = cl.get(&b("/kv/get?key=ttl-key")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wait for expiry
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Should be gone
+    let resp = cl.get(&b("/kv/get?key=ttl-key")).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "TTL key should have expired"
+    );
+}
+
+/// cache TTL: same pattern.
+#[tokio::test(flavor = "multi_thread")]
+async fn l38_cache_ttl_expiry() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l38")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    cl.get(&b("/cache/set?key=ttl-cache&val=ephemeral&ttl=2"))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = cl.get(&b("/cache/get?key=ttl-cache")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let resp = cl.get(&b("/cache/get?key=ttl-cache")).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "TTL cache entry should have expired"
+    );
+}
+
+// ── Resource Limits (L41-L44) ───────────────────────────────────────────
+
+/// Cancel a non-existent scheduling ID — should not panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn l39_scheduling_cancel_unknown() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l39")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(&b("/sched/cancel?id=00000000-0000-0000-0000-000000000000"))
+        .send()
+        .await
+        .unwrap();
+    // Cancel on unknown ID should succeed (no-op).
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Missing env var returns 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn l40_process_get_env_missing() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l40")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(&b("/env/DOES_NOT_EXIST_XYZ"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Cross-Interface Interaction (L45-L46) ───────────────────────────────
+
+/// KV set + observe log in sequence — both must work.
+#[tokio::test(flavor = "multi_thread")]
+async fn l41_kv_and_log_together() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l41")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = cl.get(&b("/log?msg=set-a=1")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify the kv-store value is still there
+    let resp = cl.get(&b("/kv/get?key=a")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "1");
+}
+
+/// Schedule + KV + log — all three interfaces in sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn l42_schedule_kv_log_sequence() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l42")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/sched/once?ms=60000")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let task_id = resp.text().await.unwrap();
+
+    let resp = cl.get(&b("/kv/set?key=task&val=ok")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = cl.get(&b("/log?msg=scheduled")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = cl.get(&b("/kv/get?key=task")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "ok");
+
+    // The task ID should be a valid UUID
+    assert_eq!(task_id.len(), 36);
+}
+
+// ── Time Consistency (L50) ──────────────────────────────────────────────
+
+/// Two sequential time.now() calls must return increasing values.
+#[tokio::test(flavor = "multi_thread")]
+async fn l43_time_now_monotonic() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l43")).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl.get(&b("/time/now")).send().await.unwrap();
+    let t1: u64 = resp.text().await.unwrap().trim().parse().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let resp = cl.get(&b("/time/now")).send().await.unwrap();
+    let t2: u64 = resp.text().await.unwrap().trim().parse().unwrap();
+
+    assert!(t2 > t1, "time.now() should be monotonic: t1={t1}, t2={t2}");
+}
+
+/// Two concurrent time.now() calls — both must return valid timestamps.
+#[tokio::test(flavor = "multi_thread")]
+async fn l44_concurrent_time_now() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let (port, _tx) = spawn_handler_with_config(test_config("l44")).await;
+    let cl = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let url = b("/time/now");
+        let cl = cl.clone();
+        handles.push(tokio::spawn(async move {
+            cl.get(&url).send().await
+        }));
+    }
+
+    for handle in handles {
+        let resp = handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ts: u64 = resp.text().await.unwrap().trim().parse().unwrap();
+        assert!(ts > 1_700_000_000, "unreasonable timestamp: {ts}");
+    }
 }

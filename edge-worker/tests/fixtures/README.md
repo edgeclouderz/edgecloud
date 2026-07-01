@@ -97,19 +97,38 @@ the next round.
 ## L6–L10 status: ⏳ pending
 
 The fixture's surface (`GET /` and `GET /busy`) covers L5 (round-trip)
-and L7 (per-request timeout) once the harness lands. The remaining
-paths (`/echo`, `/kv-set`, `/kv-get`, `/fs-write`, `/fs-read`,
-`/egress-test`) require additional wit-bindgen API gymnastics
-(resource lifetimes, `Result<T, E>` lifting for outgoing-handler) that
-are out of scope for the v0.2 cut. They'll land when L6, L9, and L10
-are written.
+and L7 (per-request timeout). The following paths were added to
+exercise edge:cloud interfaces:
+
+| Path                        | Interface call               |
+|-----------------------------|------------------------------|
+| `GET /env/{key}`            | `process.get-env(key)`       |
+| `GET /time/now`             | `time.now()`                 |
+| `GET /kv/set?key=x&val=y`   | `kv-store.set(x, y)`        |
+| `GET /kv/get?key=x`         | `kv-store.get(x)`           |
+| `GET /kv/del?key=x`         | `kv-store.delete(x)`        |
+| `GET /cache/set?key=x&val=y`| `cache.set(x, y)`           |
+| `GET /cache/get?key=x`      | `cache.get(x)`              |
+| `GET /cache/del?key=x`      | `cache.delete(x)`           |
+| `GET /log?msg=...`          | `observe.emit-log(...)`     |
+| `GET /sched/once?ms=N`     | `scheduling.schedule-once(N)`|
 
 ## Paths implemented by `handler.wasm`
 
-| Path        | Behavior                                              |
-|-------------|-------------------------------------------------------|
-| `GET /`     | 200, body `{"hello":"handler","path":"/"}`           |
-| `GET /busy` | Busy-loops a counter for ~5s of Wasm execution        |
+| Path                          | Behavior                                    |
+|-------------------------------|---------------------------------------------|
+| `GET /`                       | 200, body `{"hello":"handler","path":"/"}`  |
+| `GET /busy`                   | Busy-loops for ~5s, then 200                |
+| `GET /env/{key}`              | 200 with env value, or 404                  |
+| `GET /time/now`               | 200 with timestamp (u64)                    |
+| `GET /kv/set?key=x&val=y`     | 200 "ok"                                    |
+| `GET /kv/get?key=x`           | 200 with value, or 404                      |
+| `GET /kv/del?key=x`           | 200 "ok"                                    |
+| `GET /cache/set?key=x&val=y`  | 200 "ok"                                    |
+| `GET /cache/get?key=x`        | 200 with value, or 404                      |
+| `GET /cache/del?key=x`        | 200 "ok"                                    |
+| `GET /log?msg=...`            | 200 "ok"                                    |
+| `GET /sched/once?ms=N`       | 200 with task ID (UUID)                     |
 
 All other paths return 404. The handler also exports `wasi:cli/run` as
 a trap (unreachable) so the macro-generated `export!` is satisfied; the

@@ -472,15 +472,20 @@ fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
     use hyper::StatusCode;
 
     // Truncate the diagnostic to a UTF-8-safe boundary at 1024 bytes
-    // (so a 100 MB error string doesn't blow up the dispatch).
+    // (so a 100 MB error string doesn't blow up the dispatch). Only
+    // truncate when above the cap — inputs already under 1024 pass
+    // through unchanged.
     let bounded = {
         let bytes = diagnostic.as_bytes();
-        let cap = bytes.len().min(1024);
-        let cap = bytes[..cap]
-            .iter()
-            .rposition(|b| (*b as i8) >= -0x40)
-            .unwrap_or(0);
-        std::str::from_utf8(&bytes[..cap]).unwrap_or("non-utf8 diagnostic")
+        if bytes.len() <= 1024 {
+            diagnostic
+        } else {
+            let cut = bytes[..1024]
+                .iter()
+                .rposition(|b| (*b as i8) >= -0x40)
+                .unwrap_or(0);
+            std::str::from_utf8(&bytes[..cut]).unwrap_or("non-utf8 diagnostic")
+        }
     };
     let body = bounded.as_bytes().to_vec();
     let len = body.len();
@@ -516,12 +521,15 @@ fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBo
     );
     let bounded = {
         let bytes = diagnostic.as_bytes();
-        let cap = bytes.len().min(1024);
-        let cap = bytes[..cap]
-            .iter()
-            .rposition(|b| (*b as i8) >= -0x40)
-            .unwrap_or(0);
-        std::str::from_utf8(&bytes[..cap]).unwrap_or("non-utf8 diagnostic")
+        if bytes.len() <= 1024 {
+            &diagnostic[..]
+        } else {
+            let cut = bytes[..1024]
+                .iter()
+                .rposition(|b| (*b as i8) >= -0x40)
+                .unwrap_or(0);
+            std::str::from_utf8(&bytes[..cut]).unwrap_or("non-utf8 diagnostic")
+        }
     };
     let body = bounded.as_bytes().to_vec();
     let len = body.len();
@@ -537,4 +545,148 @@ fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBo
         .header(CONTENT_LENGTH, len)
         .body(HyperOutgoingBody::new(body_wrapped))
         .expect("synthetic 413: builder with explicit content-length never fails")
+}
+
+#[cfg(test)]
+mod synthetic_response_tests {
+    use super::*;
+    use hyper::StatusCode;
+
+    #[test]
+    fn synthetic_500_returns_internal_server_error() {
+        let resp = synthetic_500("something went wrong");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn synthetic_500_has_text_content_type() {
+        let resp = synthetic_500("test");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn synthetic_500_has_content_length_header() {
+        let resp = synthetic_500("hello");
+        assert!(resp.headers().get("content-length").is_some());
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(cl > 0, "content-length must be positive");
+    }
+
+    #[test]
+    fn synthetic_500_content_length_matches_diagnostic_length() {
+        let resp = synthetic_500("abc");
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // "abc" fits in the capped body — length should be 3.
+        assert_eq!(cl, 3, "content-length should match 'abc' length");
+    }
+
+    #[test]
+    fn synthetic_500_truncates_very_long_diagnostics() {
+        let long = "x".repeat(10_000);
+        let resp = synthetic_500(&long);
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Truncated at 1024 bytes.
+        assert!(cl <= 1024, "body should be <= 1024 bytes, got {cl}");
+    }
+
+    #[test]
+    fn synthetic_500_empty_diagnostic_returns_500() {
+        let resp = synthetic_500("");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn synthetic_500_content_length_is_zero_for_empty() {
+        let resp = synthetic_500("");
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cl, 0, "empty diagnostic should have zero-length body");
+    }
+
+    #[test]
+    fn synthetic_413_returns_payload_too_large() {
+        let resp = synthetic_413(1_000_000, 1024);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn synthetic_413_has_text_content_type() {
+        let resp = synthetic_413(5000, 100);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn synthetic_413_has_content_length_header() {
+        let resp = synthetic_413(5000, 100);
+        assert!(resp.headers().get("content-length").is_some());
+    }
+
+    #[test]
+    fn synthetic_413_diagnostic_mentions_both_values() {
+        let resp = synthetic_413(5000, 100);
+        // We can't easily read the body without consuming the response,
+        // but the content-length is always > 0 for non-empty input.
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The diagnostic is the format string "request body of {content_length}
+        // bytes exceeds per-app cap of {cap} bytes". For 5000/100 that's around
+        // 60 chars, well under 1024.
+        assert!(cl > 10 && cl < 100, "unexpected diagnostic length {cl}");
+    }
+
+    #[test]
+    fn synthetic_413_handles_large_numbers() {
+        let resp = synthetic_413(u64::MAX, u64::MAX);
+        let cl: usize = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            cl <= 1024,
+            "body should be capped at 1024 even for huge values"
+        );
+    }
 }

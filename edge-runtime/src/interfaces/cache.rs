@@ -593,4 +593,71 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn test_persistence_survives_drop() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("cache-persist.json");
+
+        let val = b"persistent-value".to_vec();
+        // Use spawn_blocking so flush_if_persistent can call block_on.
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            let val = val.clone();
+            move || {
+                let cache = Cache::with_persistence(&path, 100).expect("create");
+                cache.set("k".into(), val, None).unwrap();
+            }
+        })
+        .await
+        .expect("spawn_blocking");
+
+        // Rebuild and verify
+        let cache = Cache::with_persistence(&path, 100).expect("reload");
+        assert_eq!(cache.get("k").unwrap(), Some(b"persistent-value".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_persistence_empty_cache_round_trips() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("cache-empty.json");
+
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || {
+                let cache = Cache::with_persistence(&path, 100).expect("create");
+                assert_eq!(cache.size().unwrap(), 0);
+            }
+        })
+        .await
+        .expect("spawn_blocking");
+
+        let cache = Cache::with_persistence(&path, 100).expect("reload");
+        assert_eq!(cache.size().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_persistence_survives_multiple_entries() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("cache-multi.json");
+
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || {
+                let cache = Cache::with_persistence(&path, 100).expect("create");
+                cache.set("a".into(), b"1".to_vec(), None).unwrap();
+                cache.set("b".into(), b"2".to_vec(), None).unwrap();
+                cache.set("c".into(), b"3".to_vec(), None).unwrap();
+            }
+        })
+        .await
+        .expect("spawn_blocking");
+
+        // Rebuild and verify in the async context — get doesn't call
+        // flush_if_persistent, so it doesn't need spawn_blocking.
+        let cache = Cache::with_persistence(&path, 100).expect("reload");
+        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(cache.get("c").unwrap(), Some(b"3".to_vec()));
+    }
 }
