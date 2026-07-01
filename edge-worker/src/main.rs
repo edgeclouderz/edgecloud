@@ -2,6 +2,8 @@
 
 mod auth;
 mod config;
+mod detect;
+mod dispatch;
 mod downloader;
 mod log_forwarder;
 mod messages;
