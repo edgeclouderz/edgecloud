@@ -22,6 +22,12 @@ jwt:
   ttl_hours: 24
   issuer: "edgecloud"
 
+rate_limit:
+  tenant_rate: 200
+  tenant_burst: 300
+  ip_rate: 20
+  ip_burst: 40
+
 migration:
   edge_migrate_path: "edge-migrate"
   wasi_sdk_path: "/usr/local/wasi-sdk/bin"
