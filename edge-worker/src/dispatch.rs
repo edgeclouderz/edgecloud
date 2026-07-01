@@ -344,10 +344,7 @@ impl HandlerDispatch {
                                 cap = self.config.max_request_body_bytes,
                                 "request body exceeds per-app cap; rejecting 413",
                             );
-                            return Ok(synthetic_413(
-                                len,
-                                self.config.max_request_body_bytes,
-                            ));
+                            return Ok(synthetic_413(len, self.config.max_request_body_bytes));
                         }
                     }
                 }
@@ -516,9 +513,8 @@ fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBo
     use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use hyper::StatusCode;
 
-    let diagnostic = format!(
-        "request body of {content_length} bytes exceeds per-app cap of {cap} bytes"
-    );
+    let diagnostic =
+        format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
     let bounded = {
         let bytes = diagnostic.as_bytes();
         if bytes.len() <= 1024 {
@@ -562,7 +558,11 @@ mod synthetic_response_tests {
     fn synthetic_500_has_text_content_type() {
         let resp = synthetic_500("test");
         assert_eq!(
-            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "text/plain; charset=utf-8"
         );
     }
@@ -643,7 +643,11 @@ mod synthetic_response_tests {
     fn synthetic_413_has_text_content_type() {
         let resp = synthetic_413(5000, 100);
         assert_eq!(
-            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "text/plain; charset=utf-8"
         );
     }

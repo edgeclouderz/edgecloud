@@ -544,7 +544,8 @@ mod tests {
                 .expect("test runtime");
             let _guard = rt.enter();
             let s = Scheduler::with_persistence(&path).expect("reload");
-            s.cancel(&id).expect("persisted task should be cancellable after reload");
+            s.cancel(&id)
+                .expect("persisted task should be cancellable after reload");
         }
     }
 
@@ -571,7 +572,8 @@ mod tests {
                 .expect("test runtime");
             let _guard = rt.enter();
             let s = Scheduler::with_persistence(&path).expect("reload");
-            s.cancel(&id).expect("persisted repeating task should be cancellable");
+            s.cancel(&id)
+                .expect("persisted repeating task should be cancellable");
         }
     }
 

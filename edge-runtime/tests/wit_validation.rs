@@ -43,10 +43,7 @@ fn find_world<'a>(
 }
 
 /// Collect edge:cloud interface imports from a world as (interface_name, function_count).
-fn edge_interface_imports(
-    resolve: &Resolve,
-    world: &wit_parser::World,
-) -> Vec<(String, usize)> {
+fn edge_interface_imports(resolve: &Resolve, world: &wit_parser::World) -> Vec<(String, usize)> {
     let mut result = Vec::new();
     for (_key, item) in &world.imports {
         if let WorldItem::Interface { id, .. } = item {
@@ -55,7 +52,10 @@ fn edge_interface_imports(
                 if let Some(pkg) = iface.package {
                     let pkg_name = &resolve.packages[pkg].name;
                     if pkg_name.namespace == "edge" && pkg_name.name == "cloud" {
-                        let name = iface.name.clone().unwrap_or_else(|| "<unnamed>".to_string());
+                        let name = iface
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_string());
                         result.push((name, iface.functions.len()));
                     }
                 }
@@ -73,7 +73,10 @@ fn all_exports(resolve: &Resolve, world: &wit_parser::World) -> Vec<(String, usi
             WorldKey::Name(n) => n.clone(),
             WorldKey::Interface(id) => {
                 if let Some(iface) = resolve.interfaces.get(*id) {
-                    iface.name.clone().unwrap_or_else(|| format!("iface-{id:?}"))
+                    iface
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("iface-{id:?}"))
                 } else {
                     format!("<iface {id:?}>")
                 }
@@ -96,10 +99,7 @@ fn wit_package_parses() {
     let pkg = &resolve.packages[pkg_id];
     assert_eq!(pkg.name.namespace, "edge");
     assert_eq!(pkg.name.name, "cloud");
-    assert_eq!(
-        pkg.name.version,
-        Some(semver::Version::new(0, 2, 0))
-    );
+    assert_eq!(pkg.name.version, Some(semver::Version::new(0, 2, 0)));
 }
 
 #[test]
@@ -129,12 +129,36 @@ fn edge_runtime_world_has_correct_imports() {
 
     // Remove the auto-generated name or the explicit name — both appear
     // depending on how bindgen resolves the WIT package.
-    assert_eq!(imports.remove("kv-store"), Some(9), "kv-store should have 9 functions");
-    assert_eq!(imports.remove("cache"), Some(10), "cache should have 10 functions");
-    assert_eq!(imports.remove("observe"), Some(5), "observe should have 5 functions");
-    assert_eq!(imports.remove("time"), Some(3), "time should have 3 functions");
-    assert_eq!(imports.remove("scheduling"), Some(3), "scheduling should have 3 functions");
-    assert_eq!(imports.remove("process"), Some(5), "process should have 5 functions");
+    assert_eq!(
+        imports.remove("kv-store"),
+        Some(9),
+        "kv-store should have 9 functions"
+    );
+    assert_eq!(
+        imports.remove("cache"),
+        Some(10),
+        "cache should have 10 functions"
+    );
+    assert_eq!(
+        imports.remove("observe"),
+        Some(5),
+        "observe should have 5 functions"
+    );
+    assert_eq!(
+        imports.remove("time"),
+        Some(3),
+        "time should have 3 functions"
+    );
+    assert_eq!(
+        imports.remove("scheduling"),
+        Some(3),
+        "scheduling should have 3 functions"
+    );
+    assert_eq!(
+        imports.remove("process"),
+        Some(5),
+        "process should have 5 functions"
+    );
 
     // No unexpected interfaces.
     assert!(
@@ -193,9 +217,7 @@ fn edge_runtime_handler_world_exports_wasi_http_incoming_handler() {
     let world = find_world(&resolve, pkg_id, "edge-runtime-handler");
 
     let exports = all_exports(&resolve, world);
-    let has_handler = exports
-        .iter()
-        .any(|(name, _)| name == "incoming-handler");
+    let has_handler = exports.iter().any(|(name, _)| name == "incoming-handler");
     assert!(
         has_handler,
         "edge-runtime-handler world must export wasi:http/incoming-handler, got: {:?}",
@@ -267,10 +289,12 @@ fn both_worlds_import_identical_edge_interfaces() {
     let world_a = find_world(&resolve, pkg_id, "edge-runtime");
     let world_b = find_world(&resolve, pkg_id, "edge-runtime-handler");
 
-    let imports_a: HashMap<String, usize> =
-        edge_interface_imports(&resolve, world_a).into_iter().collect();
-    let imports_b: HashMap<String, usize> =
-        edge_interface_imports(&resolve, world_b).into_iter().collect();
+    let imports_a: HashMap<String, usize> = edge_interface_imports(&resolve, world_a)
+        .into_iter()
+        .collect();
+    let imports_b: HashMap<String, usize> = edge_interface_imports(&resolve, world_b)
+        .into_iter()
+        .collect();
 
     assert_eq!(
         imports_a, imports_b,

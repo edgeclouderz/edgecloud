@@ -498,8 +498,7 @@ async fn l7_per_request_timeout_returns_500() {
 async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Sender<()>) {
     let path = handler_fixture_path().expect("handler.wasm fixture missing");
     let engine = create_engine().expect("create_engine");
-    let linker =
-        create_component_linker_handler(&engine).expect("create_component_linker_handler");
+    let linker = create_component_linker_handler(&engine).expect("create_component_linker_handler");
     let bytes = std::fs::read(&path).expect("read handler.wasm");
     let component = Component::from_binary(&engine, &bytes).expect("Component::from_binary");
 
@@ -510,8 +509,7 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
     let port = alloc_port();
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(instance_pre, port, 5_000, 10, config)
-            .expect("HandlerDispatch::new"),
+        HandlerDispatch::new(instance_pre, port, 5_000, 10, config).expect("HandlerDispatch::new"),
     );
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
@@ -639,7 +637,10 @@ async fn l11_guest_calls_process_get_env() {
         .expect("GET /env/KV_KEY");
     assert_eq!(resp.status(), StatusCode::OK, "expected 200");
     let body = resp.text().await.expect("body");
-    assert_eq!(body, "hello-from-host", "env var should match injected value");
+    assert_eq!(
+        body, "hello-from-host",
+        "env var should match injected value"
+    );
 }
 
 /// L12: call time.now() from the guest. Assert the response is a
@@ -684,7 +685,10 @@ async fn l12_guest_calls_time_now() {
         .trim()
         .parse()
         .expect("time.now() should return a u64 timestamp");
-    assert!(ts > 1_700_000_000, "timestamp should be reasonable (> 2023)");
+    assert!(
+        ts > 1_700_000_000,
+        "timestamp should be reasonable (> 2023)"
+    );
 }
 
 /// L13: kv-store round-trip from the guest. Set a key, then get it
@@ -752,7 +756,11 @@ async fn l13_guest_calls_kv_store_round_trip() {
         .send()
         .await
         .expect("GET /kv/get (after delete)");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted key should 404");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "deleted key should 404"
+    );
 }
 
 /// L14: cache round-trip from the guest. Same pattern as L13 but
@@ -860,13 +868,20 @@ async fn l15_guest_emit_log_reaches_sink() {
         .send()
         .await
         .expect("GET /log");
-    assert_eq!(resp.status(), StatusCode::OK, "log endpoint should return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "log endpoint should return 200"
+    );
 
     // Allow a brief moment for the record to propagate through the observer.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let records = sink.take();
-    assert!(!records.is_empty(), "should have received at least one log record");
+    assert!(
+        !records.is_empty(),
+        "should have received at least one log record"
+    );
     let (record, ctx) = &records[0];
     assert_eq!(record.message, "hello-from-wasm");
     assert_eq!(ctx.app_name, "l15");
@@ -1036,24 +1051,17 @@ async fn l20_kv_store_batch_ops() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // get-many
-    let resp = cl
-        .get(&b("/kv/get-many?keys=x,y,z"))
-        .send()
-        .await
-        .unwrap();
-    let vals: Vec<Option<String>> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-    assert_eq!(vals, vec![Some("1".into()), Some("2".into()), Some("3".into())]);
+    let resp = cl.get(&b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
+    let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(
+        vals,
+        vec![Some("1".into()), Some("2".into()), Some("3".into())]
+    );
 
     // Delete two, get-many again
     cl.get(&b("/kv/del-many?keys=x,y")).send().await.unwrap();
-    let resp = cl
-        .get(&b("/kv/get-many?keys=x,y,z"))
-        .send()
-        .await
-        .unwrap();
-    let vals: Vec<Option<String>> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let resp = cl.get(&b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
+    let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(vals, vec![None, None, Some("3".into())]);
 }
 
@@ -1123,9 +1131,11 @@ async fn l23_cache_batch_ops() {
         .send()
         .await
         .unwrap();
-    let vals: Vec<Option<String>> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-    assert_eq!(vals, vec![Some("x".into()), Some("y".into()), Some("z".into())]);
+    let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(
+        vals,
+        vec![Some("x".into()), Some("y".into()), Some("z".into())]
+    );
 
     cl.get(&b("/cache/del-many?keys=a,b")).send().await.unwrap();
     let resp = cl
@@ -1133,8 +1143,7 @@ async fn l23_cache_batch_ops() {
         .send()
         .await
         .unwrap();
-    let vals: Vec<Option<String>> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(vals, vec![None, None, Some("z".into())]);
 }
 
@@ -1151,10 +1160,18 @@ async fn l24_observe_counter_gauge_histogram() {
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
     // These are fire-and-forget — we just assert they don't error.
-    let resp = cl.get(&b("/observe/counter?name=hits&val=3")).send().await.unwrap();
+    let resp = cl
+        .get(&b("/observe/counter?name=hits&val=3"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = cl.get(&b("/observe/gauge?name=temp&val=36.5")).send().await.unwrap();
+    let resp = cl
+        .get(&b("/observe/gauge?name=temp&val=36.5"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = cl
@@ -1200,7 +1217,11 @@ async fn l26_scheduling_repeat_and_cancel() {
     let id = resp.text().await.unwrap();
     assert_eq!(id.len(), 36, "repeat should return UUID");
 
-    let resp = cl.get(&b(&format!("/sched/cancel?id={id}"))).send().await.unwrap();
+    let resp = cl
+        .get(&b(&format!("/sched/cancel?id={id}")))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -1223,10 +1244,7 @@ async fn l27_process_get_all_env() {
             tenant_id: "l27".to_string(),
             deployment_id: "l27".to_string(),
         },
-        meter: Arc::new(RequestMeter::new(
-            "l27".to_string(),
-            "l27".to_string(),
-        )),
+        meter: Arc::new(RequestMeter::new("l27".to_string(), "l27".to_string())),
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
     })
@@ -1236,8 +1254,7 @@ async fn l27_process_get_all_env() {
 
     let resp = cl.get(&b("/env")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let envs: Vec<Vec<String>> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let envs: Vec<Vec<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     let pairs: std::collections::HashMap<String, String> = envs
         .into_iter()
         .map(|pair| (pair[0].clone(), pair[1].clone()))
@@ -1257,9 +1274,11 @@ async fn l29_process_get_args() {
 
     let resp = cl.get(&b("/args")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let args: Vec<String> =
-        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-    assert!(!args.is_empty(), "args should contain at least the binary path");
+    let args: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert!(
+        !args.is_empty(),
+        "args should contain at least the binary path"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1305,9 +1324,7 @@ async fn l31_concurrent_kv_sets() {
     for i in 0..100 {
         let url = b(&format!("/kv/set?key=k{i}&val=v{i}"));
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
@@ -1334,17 +1351,13 @@ async fn l32_concurrent_kv_read_write() {
     for i in 0..50 {
         let url = b(&format!("/kv/set?key=shared&val=writer-{i}"));
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
     // 50 readers
     for _ in 0..50 {
         let url = b("/kv/get?key=shared");
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
@@ -1374,9 +1387,7 @@ async fn l33_concurrent_observe_counter() {
     for _ in 0..50 {
         let url = b("/observe/counter?name=systest&val=1");
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
     for handle in handles {
         let resp = handle.await.unwrap().unwrap();
@@ -1401,9 +1412,7 @@ async fn l34_concurrent_scheduling() {
     for _ in 0..50 {
         let url = b("/sched/once?ms=60000");
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
 
     let mut ids = std::collections::HashSet::new();
@@ -1425,21 +1434,17 @@ async fn l35_tenant_isolation_kv_store() {
         return;
     }
 
-    let (port_a, _tx_a) = spawn_handler_with_config(
-        test_config("tenant-a"),
-    )
-    .await;
-    let (port_b, _tx_b) = spawn_handler_with_config(
-        test_config("tenant-b"),
-    )
-    .await;
+    let (port_a, _tx_a) = spawn_handler_with_config(test_config("tenant-a")).await;
+    let (port_b, _tx_b) = spawn_handler_with_config(test_config("tenant-b")).await;
     let cl = make_client();
 
     // Tenant A writes a secret
-    cl.get(&format!("http://127.0.0.1:{port_a}/kv/set?key=secret&val=a-data"))
-        .send()
-        .await
-        .unwrap();
+    cl.get(&format!(
+        "http://127.0.0.1:{port_a}/kv/set?key=secret&val=a-data"
+    ))
+    .send()
+    .await
+    .unwrap();
 
     // Tenant B should NOT see it
     let resp = cl
@@ -1461,20 +1466,16 @@ async fn l36_tenant_isolation_cache() {
         return;
     }
 
-    let (port_a, _tx_a) = spawn_handler_with_config(
-        test_config("tenant-cache-a"),
-    )
-    .await;
-    let (port_b, _tx_b) = spawn_handler_with_config(
-        test_config("tenant-cache-b"),
-    )
-    .await;
+    let (port_a, _tx_a) = spawn_handler_with_config(test_config("tenant-cache-a")).await;
+    let (port_b, _tx_b) = spawn_handler_with_config(test_config("tenant-cache-b")).await;
     let cl = make_client();
 
-    cl.get(&format!("http://127.0.0.1:{port_a}/cache/set?key=token&val=a-token"))
-        .send()
-        .await
-        .unwrap();
+    cl.get(&format!(
+        "http://127.0.0.1:{port_a}/cache/set?key=token&val=a-token"
+    ))
+    .send()
+    .await
+    .unwrap();
 
     let resp = cl
         .get(&format!("http://127.0.0.1:{port_b}/cache/get?key=token"))
@@ -1581,11 +1582,7 @@ async fn l40_process_get_env_missing() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl
-        .get(&b("/env/DOES_NOT_EXIST_XYZ"))
-        .send()
-        .await
-        .unwrap();
+    let resp = cl.get(&b("/env/DOES_NOT_EXIST_XYZ")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1681,9 +1678,7 @@ async fn l44_concurrent_time_now() {
     for _ in 0..10 {
         let url = b("/time/now");
         let cl = cl.clone();
-        handles.push(tokio::spawn(async move {
-            cl.get(&url).send().await
-        }));
+        handles.push(tokio::spawn(async move { cl.get(&url).send().await }));
     }
 
     for handle in handles {

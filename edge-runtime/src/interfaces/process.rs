@@ -218,11 +218,17 @@ mod tests {
     fn test_get_args_returns_at_least_binary_path() {
         let process = Process::new();
         let args = process.get_args();
-        assert!(!args.is_empty(), "args should contain at least the binary path");
+        assert!(
+            !args.is_empty(),
+            "args should contain at least the binary path"
+        );
         // The first argument is the test binary path. It should exist
         // and be an absolute path in normal test environments.
         let first = &args[0];
-        assert!(!first.is_empty(), "first arg (binary path) should not be empty");
+        assert!(
+            !first.is_empty(),
+            "first arg (binary path) should not be empty"
+        );
     }
 
     // ── filter_env_vars blocklist ───────────────────────────────────────
@@ -247,7 +253,10 @@ mod tests {
             ("EDGE_API_KEY".into(), "sk_test".into()),
         ];
         let filtered: Vec<_> = filter_env_vars(raw.into_iter()).collect();
-        assert!(filtered.is_empty(), "EDGE_SECRET and EDGE_API_KEY should be blocked");
+        assert!(
+            filtered.is_empty(),
+            "EDGE_SECRET and EDGE_API_KEY should be blocked"
+        );
     }
 
     #[test]
