@@ -405,7 +405,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         jwt_signer.clone(),
     );
 
-let http = reqwest::Client::builder()
+    let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
