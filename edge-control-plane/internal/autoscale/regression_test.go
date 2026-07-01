@@ -27,6 +27,7 @@ package autoscale
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -103,11 +104,15 @@ func newTestNATS(t *testing.T) *natsio.Conn {
 // keeps the test stable across CI runners that schedule ticks
 // slightly late.
 //
+// The optional `overrides` Config is shallow-merged into the defaults
+// (only non-zero fields replace). Same pattern works for scale-down
+// tests that need a shorter ScaleDownCooldownS.
+//
 // Returns the service, an event recorder (so the test can assert on what
 // was inserted), and a MockCloudProvider whose Provision counter
-// (cloud.ProvisionCalls()) is bumped automatically by the mock — no
-// caller-side accounting needed.
-func newServiceForRegression(t *testing.T, nc *natsio.Conn) (
+// (cloud.ProvisionCalls()) and Deprovision counter (cloud.DeprovisionCalls())
+// are bumped automatically by the mock — no caller-side accounting needed.
+func newServiceForRegression(t *testing.T, nc *natsio.Conn, overrides ...Config) (
 	*Service, *mockEventRepo, *MockCloudProvider,
 ) {
 	t.Helper()
@@ -116,16 +121,38 @@ func newServiceForRegression(t *testing.T, nc *natsio.Conn) (
 		KindFunc:      func() string { return "mock" },
 		ProvisionFunc: func(_ context.Context, region string) (string, error) { return "w_" + region + "_new", nil },
 	}
+	cfg := Config{
+		Enabled:            true,
+		MinWorkers:         1,
+		MaxWorkers:         10,
+		TargetHeadroomPct:  20,
+		ScaleUpCooldownS:   5,
+		ScaleDownCooldownS: 60,
+		DecisionIntervalS:  1,
+	}
+	if len(overrides) > 0 {
+		o := overrides[0]
+		if o.MinWorkers != 0 {
+			cfg.MinWorkers = o.MinWorkers
+		}
+		if o.MaxWorkers != 0 {
+			cfg.MaxWorkers = o.MaxWorkers
+		}
+		if o.TargetHeadroomPct != 0 {
+			cfg.TargetHeadroomPct = o.TargetHeadroomPct
+		}
+		if o.ScaleUpCooldownS != 0 {
+			cfg.ScaleUpCooldownS = o.ScaleUpCooldownS
+		}
+		if o.ScaleDownCooldownS != 0 {
+			cfg.ScaleDownCooldownS = o.ScaleDownCooldownS
+		}
+		if o.DecisionIntervalS != 0 {
+			cfg.DecisionIntervalS = o.DecisionIntervalS
+		}
+	}
 	s := NewService(Deps{
-		Cfg: Config{
-			Enabled:            true,
-			MinWorkers:         1,
-			MaxWorkers:         10,
-			TargetHeadroomPct:  20,
-			ScaleUpCooldownS:   5,
-			ScaleDownCooldownS: 60,
-			DecisionIntervalS:  1,
-		},
+		Cfg:        cfg,
 		NC:         nc,
 		DeployRepo: &mockDeployRepo{},
 		EventRepo:  events,
@@ -187,6 +214,53 @@ func waitForProvision(t *testing.T, cloud *MockCloudProvider, deadline time.Dura
 				return
 			}
 		}
+	}
+}
+
+// waitForDeprovision polls until at least `n` Deprovision calls
+// have been recorded on `cloud`, or `deadline` elapses. Mirrors
+// waitForProvision but for the Deprovision counter.
+func waitForDeprovision(t *testing.T, cloud *MockCloudProvider, n int64, deadline time.Duration) {
+	t.Helper()
+	timeout := time.NewTimer(deadline)
+	defer timeout.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-timeout.C:
+			t.Fatalf("waitForDeprovision(%d): only %d calls within %v", n, cloud.DeprovisionCalls(), deadline)
+		case <-tick.C:
+			if cloud.DeprovisionCalls() >= n {
+				return
+			}
+		}
+	}
+}
+
+// publishHeartbeatCustom sends a heartbeat with a custom worker ID.
+// Needed for multi-worker scale-down tests where each heartbeat must
+// come from a distinct worker to build the fleet view.
+func publishHeartbeatCustom(t *testing.T, nc *natsio.Conn, workerID, region string, appSlots uint32) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"type":      "heartbeat",
+		"worker_id": workerID,
+		"region":    region,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"apps":      map[string]any{},
+		"cluster_headroom": map[string]any{
+			"app_slots": appSlots,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal heartbeat: %v", err)
+	}
+	if err := nc.Publish("edgecloud.heartbeats."+region, body); err != nil {
+		t.Fatalf("publish heartbeat: %v", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("nats flush: %v", err)
 	}
 }
 
@@ -372,6 +446,132 @@ func TestRegression_MultiRegionIndependent(t *testing.T) {
 				return
 			}
 		}
+	}
+}
+
+// TestRegression_ScaleDownFiresOnExcess exercises the Deprovision
+// path end-to-end: 3 workers in region fra each reporting 500 free
+// slots while desiredApps=1. With TargetHeadroomPct=20, needed=1,
+// free=1500 > 2×1 → scale_down by 1.
+//
+// This is the only test that proves the full Deprovision pipeline
+// works (pickVictim → CloudProvider.Deprovision → event recorded).
+func TestRegression_ScaleDownFiresOnExcess(t *testing.T) {
+	if reason, ok := shouldSkipRegression(); ok {
+		t.Skipf("regression: %s", reason)
+	}
+
+	nc := newTestNATS(t)
+	// ScaleDownCooldownS=5 so we don't wait 60s to observe the second
+	// tick, but the default 60s would still work for the first fire.
+	s, events, cloud := newServiceForRegression(t, nc, Config{
+		ScaleDownCooldownS: 5,
+	})
+	s.deployRepo = &mockDeployRepo{
+		// Count=1 so needed=1 (1 + 20% = 1.2 → 1, floor at 1).
+		// 3 workers × 500 free slots = 1500, far above 2×1 → scale_down.
+		countFunc: func(_ context.Context) (int, error) { return 1, nil },
+	}
+	// Wire Deprovision so it succeeds and increments the counter.
+	cloud.DeprovisionFunc = func(_ context.Context, _, _ string) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runSubscribeWithCleanup(t, s, nc, ctx)
+
+	// 3 workers, all with massive excess capacity.
+	for i := 0; i < 3; i++ {
+		publishHeartbeatCustom(t, nc, fmt.Sprintf("w_fra_%d", i), "fra", 500)
+	}
+
+	// Wait for the first Deprovision to fire.
+	waitForDeprovision(t, cloud, 1, 90*time.Second)
+
+	// Give the Insert a moment to land.
+	time.Sleep(100 * time.Millisecond)
+
+	if len(events.events) < 1 {
+		t.Fatal("Provision called but no event recorded")
+	}
+	ev := events.events[0]
+	if ev.Action != domain.AutoscaleDown {
+		t.Errorf("event.Action = %q, want scale_down", ev.Action)
+	}
+	if ev.Region != "fra" {
+		t.Errorf("event.Region = %q, want fra", ev.Region)
+	}
+	if ev.FromCount != 3 || ev.ToCount != 2 {
+		t.Errorf("event.FromCount=%d ToCount=%d, want 3→2", ev.FromCount, ev.ToCount)
+	}
+	if !ev.Succeeded {
+		t.Errorf("event.Succeeded = false, want true")
+	}
+}
+
+// TestRegression_ScaleDownCooldownSuppressesSecond pins the
+// scale-down cooldown contract: after a successful Deprovision, a
+// subsequent tick within ScaleDownCooldownS must suppress the next
+// Deprovision and record a cooldown-noop event instead.
+func TestRegression_ScaleDownCooldownSuppressesSecond(t *testing.T) {
+	if reason, ok := shouldSkipRegression(); ok {
+		t.Skipf("regression: %s", reason)
+	}
+
+	nc := newTestNATS(t)
+	// Short cooldown so the observation window fits inside it.
+	// ScaleDownCooldownS=2s means the test waits ~2.5s after the
+	// first Deprovision and must observe NO second Deprovision.
+	s, events, cloud := newServiceForRegression(t, nc, Config{
+		ScaleUpCooldownS:   5,
+		ScaleDownCooldownS: 2,
+	})
+	s.deployRepo = &mockDeployRepo{
+		countFunc: func(_ context.Context) (int, error) { return 1, nil },
+	}
+	cloud.DeprovisionFunc = func(_ context.Context, _, _ string) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runSubscribeWithCleanup(t, s, nc, ctx)
+
+	// 3 workers with excess → triggers first scale_down.
+	for i := 0; i < 3; i++ {
+		publishHeartbeatCustom(t, nc, fmt.Sprintf("w_fra_%d", i), "fra", 500)
+	}
+	waitForDeprovision(t, cloud, 1, 90*time.Second)
+	firstCount := cloud.DeprovisionCalls()
+
+	// Keep heartbeats coming (still 3 workers worth, but one has been
+	// deprovisioned — the fleet view still sees 3 until the heartbeat
+	// service removes it, which doesn't happen because we keep publishing
+	// all 3). The key: excess still exists.
+	for i := 0; i < 5; i++ {
+		for j := 0; j < 3; j++ {
+			publishHeartbeatCustom(t, nc, fmt.Sprintf("w_fra_%d", j), "fra", 500)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Observe for 1.5s — with ScaleDownCooldownS=2s, this sits
+	// comfortably inside the cooldown window and must NOT fire
+	// another Deprovision.
+	time.Sleep(1500 * time.Millisecond)
+
+	secondCount := cloud.DeprovisionCalls()
+	if secondCount > firstCount {
+		t.Errorf("Deprovision called again: first=%d second=%d (cooldown should suppress)", firstCount, secondCount)
+	}
+
+	// At least one cooldown-suppressed noop event must exist.
+	foundNoop := false
+	for _, ev := range events.events {
+		if ev.Action == domain.AutoscaleNoop {
+			foundNoop = true
+			break
+		}
+	}
+	if !foundNoop {
+		t.Errorf("no noop event recorded after cooldown-suppressed scale_down; events=%d", len(events.events))
 	}
 }
 

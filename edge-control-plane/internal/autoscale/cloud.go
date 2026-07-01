@@ -138,6 +138,12 @@ func (m *MockCloudProvider) ProvisionCalls() int64 {
 	return m.provisionCount.Load()
 }
 
+// DeprovisionCalls returns the number of times Deprovision has been
+// invoked. Safe to call from any goroutine.
+func (m *MockCloudProvider) DeprovisionCalls() int64 {
+	return m.deprovisionCount.Load()
+}
+
 // ResetCounters zeroes the Provision / Deprovision counters. Useful
 // when reusing a single MockCloudProvider across subtests.
 func (m *MockCloudProvider) ResetCounters() {
