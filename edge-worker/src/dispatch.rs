@@ -110,6 +110,11 @@ pub struct HandlerConfig {
     pub meter: Arc<RequestMeter>,
     /// Env vars injected into the per-request `WasiCtx`.
     pub env: std::collections::HashMap<String, String>,
+    /// Per-request body-size cap in bytes. Requests with a
+    /// `Content-Length` exceeding this are rejected with 413 before
+    /// the guest is invoked. `0` disables the cap (NOT RECOMMENDED —
+    /// see `Config::handler_max_request_body_bytes`).
+    pub max_request_body_bytes: u64,
 }
 
 impl HandlerDispatch {
@@ -297,12 +302,58 @@ impl HandlerDispatch {
     ///   * `Ok(Err(http_error))` → wrap as a 500 response with the
     ///     diagnostic in the body (so a client gets a real HTTP
     ///     response, not a connection drop).
-    ///   * `Err(_dropped)` → guest never called `set` (trapped /
+    ///   * `Err(dispatch_outcome)` → guest never called `set` (trapped /
     ///     hung); wrap into a 500 with the underlying task error.
+    ///
+    /// Note: there is no `tokio::spawn` here. The original sketch
+    /// spawned a task so `receiver.await` and the guest call could
+    /// race, but that's unnecessary — the guest only delivers a
+    /// response by calling `response-outparam::set`, which drops the
+    /// sender and triggers `receiver`. The two are causally linked,
+    /// so awaiting them in sequence is correct. Inlining also
+    /// eliminates a previously-latent use-after-free: the spawned
+    /// future borrowed `&mut store` from this stack frame, so if
+    /// `hyper` dropped the response future mid-dispatch, the spawned
+    /// task kept running with a dangling borrow. With the spawn gone,
+    /// `store` lives only on this stack and is dropped at function
+    /// return.
     async fn handle_request(
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
+        // Body-cap pre-check. Prevents a FaaS guest from being asked to
+        // handle a 10 GB POST that we'd then have to buffer into the
+        // 256 MiB wasmtime memory cap. We trust Content-Length as the
+        // upper bound: hyper parses it eagerly; chunked requests with
+        // no Content-Length still trip the wasmtime memory cap, which
+        // is enforced by `StoreLimitsBuilder.memory_size` and is
+        // defense-in-depth against the missing-header case.
+        //
+        // Returning 413 *before* the guest runs (instead of dispatching
+        // and letting the guest trap) means a misconfigured tenant
+        // can't DoS the worker by spamming large payloads.
+        if self.config.max_request_body_bytes > 0 {
+            if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+                if let Ok(cl_str) = cl.to_str() {
+                    if let Ok(len) = cl_str.parse::<u64>() {
+                        if len > self.config.max_request_body_bytes {
+                            tracing::warn!(
+                                tenant_id = %self.config.tenant_id,
+                                app_name = %self.config.app_ctx.app_name,
+                                content_length = len,
+                                cap = self.config.max_request_body_bytes,
+                                "request body exceeds per-app cap; rejecting 413",
+                            );
+                            return Ok(synthetic_413(
+                                len,
+                                self.config.max_request_body_bytes,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         let engine = self.proxy_pre.engine();
 
         // Per-request RuntimeState — fresh ResourceTable, fresh
@@ -348,7 +399,10 @@ impl HandlerDispatch {
         let app_name_for_log = self.config.app_ctx.app_name.clone();
         let proxy_pre = self.proxy_pre.clone();
 
-        let dispatch_task = tokio::spawn(async move {
+        // Inline guest dispatch. `instantiate_async` + `call_handle`
+        // run sequentially on this future; the guest returns by
+        // calling `set` (drops `sender`), which fires `receiver`.
+        let dispatch_outcome: anyhow::Result<()> = async {
             let proxy = proxy_pre
                 .instantiate_async(&mut store)
                 .await
@@ -357,7 +411,8 @@ impl HandlerDispatch {
                 .wasi_http_incoming_handler()
                 .call_handle(store, req_handle, out)
                 .await
-        });
+        }
+        .await;
 
         match receiver.await {
             Ok(Ok(resp)) => Ok(resp),
@@ -379,16 +434,16 @@ impl HandlerDispatch {
             Err(_dropped) => {
                 // Sender dropped without invoking `set` — guest
                 // either trapped (e.g. epoch deadline exceeded) or
-                // never replied. Surface the underlying error from the
-                // dispatch task as a synthetic 500 so hyper sends a
-                // real response to the client instead of closing the
-                // connection mid-message.
-                let e = match dispatch_task.await {
-                    Ok(Ok(())) => {
+                // never replied. `dispatch_outcome` has already
+                // resolved (above) with the underlying error; surface
+                // it as a synthetic 500 so hyper sends a real response
+                // to the client instead of closing the connection
+                // mid-message.
+                let e = match dispatch_outcome {
+                    Ok(()) => {
                         anyhow::anyhow!("guest never invoked `response-outparam::set` method")
                     }
-                    Ok(Err(e)) => e,
-                    Err(e) => e.into(),
+                    Err(e) => e,
                 };
                 tracing::warn!(
                     tenant_id = %tenant_for_log,
@@ -446,4 +501,40 @@ fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
         .header(CONTENT_LENGTH, len)
         .body(HyperOutgoingBody::new(body_wrapped))
         .expect("synthetic 500: builder with explicit content-length never fails")
+}
+
+/// Build a synthetic 413 Payload Too Large response. Used by the body
+/// cap in `handle_request`. Body shape mirrors `synthetic_500` so curl
+/// -v / browsers render it identically — the only difference is the
+/// status code and the diagnostic prefix.
+fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBody> {
+    use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
+    use hyper::StatusCode;
+
+    let diagnostic = format!(
+        "request body of {content_length} bytes exceeds per-app cap of {cap} bytes"
+    );
+    let bounded = {
+        let bytes = diagnostic.as_bytes();
+        let cap = bytes.len().min(1024);
+        let cap = bytes[..cap]
+            .iter()
+            .rposition(|b| (*b as i8) >= -0x40)
+            .unwrap_or(0);
+        std::str::from_utf8(&bytes[..cap]).unwrap_or("non-utf8 diagnostic")
+    };
+    let body = bounded.as_bytes().to_vec();
+    let len = body.len();
+
+    use http_body_util::{BodyExt, Full};
+    use std::convert::Infallible;
+    let body_wrapped =
+        Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
+
+    HyperResponse::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_LENGTH, len)
+        .body(HyperOutgoingBody::new(body_wrapped))
+        .expect("synthetic 413: builder with explicit content-length never fails")
 }
