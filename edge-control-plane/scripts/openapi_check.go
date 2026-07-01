@@ -31,7 +31,7 @@ func main() {
 
 func run() error {
 	// Parse routes from both main.go and internal/app/app.go
-	routes, err := parseRoutes("cmd/api/main.go", "internal/app/app.go")
+	routes, err := parseRoutes("internal/app/app.go")
 	if err != nil {
 		return fmt.Errorf("parse routes: %w", err)
 	}

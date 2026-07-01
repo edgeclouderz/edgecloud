@@ -813,6 +813,7 @@ components:
         ip:
           type: string
           description: Worker public IP. Omitted when not reported.
+          example: 203.0.113.42
         last_seen:
           type: string
           format: date-time
@@ -826,6 +827,17 @@ components:
           description: Worker-allocated memory budget.
           example: 4096
 
+    AppStatus:
+      type: object
+      properties:
+        app_name:
+          type: string
+          example: web-app
+        request_count:
+          type: integer
+          format: int64
+          description: Total requests handled by this app on this worker.
+
     AutoscaleEvent:
       type: object
       description: One row in the autoscale_events table.
@@ -838,7 +850,6 @@ components:
           format: date-time
         region:
           type: string
-          example: fra
         action:
           type: string
           enum: [scale_up, scale_down, noop]
@@ -850,7 +861,6 @@ components:
           type: string
         provider_kind:
           type: string
-          example: noop
         succeeded:
           type: boolean
         error_message:
@@ -2194,8 +2204,7 @@ paths:
     get:
       operationId: listAutoscaleEvents
       summary: List recent cluster autoscaler events (admin only)
-      description: |
-        Returns the most-recent autoscale_events rows, newest first.
+      description: Returns the most-recent autoscale_events rows, newest first.
       security:
         - ApiKeyAuth: []
       parameters:
@@ -2213,7 +2222,7 @@ paths:
             minimum: 1
             maximum: 500
             default: 50
-          description: Maximum rows to return. Server clamps to [1, 500].
+          description: Maximum rows to return. Clamped to [1, 500].
       responses:
         '200':
           description: Event list, newest first.
@@ -2227,6 +2236,24 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /api/v1/internal/traffic/{tenantID}/{appName}:
+    get:
+      summary: Internal traffic split lookup
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: appName
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Traffic split data
 
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)

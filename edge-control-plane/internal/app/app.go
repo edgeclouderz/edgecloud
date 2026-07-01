@@ -319,10 +319,9 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 
 	// Service-to-service read endpoint that the edge-ingress polls to
 	// apply Caddy weights for canary/blue-green traffic splits.
-	mux.Handle(
-		"GET /api/v1/internal/traffic/{tenantID}/{appName}",
-		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)),
-	)
+	mux.HandleFunc("GET /api/v1/internal/traffic/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
+	})
 
 	// Internal endpoints (worker-facing, JWT auth).
 	internalMux := http.NewServeMux()
