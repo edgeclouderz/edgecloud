@@ -98,6 +98,37 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 	}
 }
 
+// BuildAppConfig is the single source of truth for constructing an
+// AppConfig. The previous implementation had this literal duplicated at
+// 7 sites across internal/service/{deployment,reconcile,traffic}.go
+// — exactly how the TaskUpdate / FullSync wire shape drifted apart
+// before PR #166. Use this everywhere; new fields on AppConfig get
+// the default for free.
+//
+// `routes` is variadic for ergonomics: omit it for single-deployment
+// publishes; pass a non-empty slice to activate canary splits. The
+// `omitempty` JSON tag on AppConfig.Routes means nil and missing
+// produce identical wire output.
+func BuildAppConfig(
+	deploymentID, deploymentHash string,
+	env map[string]string,
+	allowlist []string,
+	maxMemoryMB int,
+	routes ...DeploymentRoute,
+) AppConfig {
+	cfg := AppConfig{
+		DeploymentID:   deploymentID,
+		DeploymentHash: deploymentHash,
+		Env:            env,
+		Allowlist:      allowlist,
+		MaxMemoryMB:    maxMemoryMB,
+	}
+	if len(routes) > 0 {
+		cfg.Routes = routes
+	}
+	return cfg
+}
+
 // MockPublisher is a no-op publisher for development.
 type MockPublisher struct{}
 

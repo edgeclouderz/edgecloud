@@ -502,13 +502,13 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
-			appName: {
-				DeploymentID:   deploymentID,
-				DeploymentHash: deployment.Hash,
-				Env:            envMap,
-				Allowlist:      tenant.AllowlistedDestinations,
-				MaxMemoryMB:    maxMemoryMB,
-			},
+			appName: nats.BuildAppConfig(
+				deploymentID,
+				deployment.Hash,
+				envMap,
+				tenant.AllowlistedDestinations,
+				maxMemoryMB,
+			),
 		},
 	}
 
@@ -788,13 +788,13 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
-			appName: {
-				DeploymentID:   rolledBackID,
-				DeploymentHash: deploymentHash,
-				Env:            envMap,
-				Allowlist:      tenant.AllowlistedDestinations,
-				MaxMemoryMB:    maxMemoryMB,
-			},
+			appName: nats.BuildAppConfig(
+				rolledBackID,
+				deploymentHash,
+				envMap,
+				tenant.AllowlistedDestinations,
+				maxMemoryMB,
+			),
 		},
 	}
 	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
@@ -857,13 +857,13 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 			Timestamp: time.Now().UTC(),
 			TenantID:  tenantID,
 			Apps: map[string]nats.AppConfig{
-				ad.AppName: {
-					DeploymentID:   ad.DeploymentID,
-					DeploymentHash: deployment.Hash,
-					Env:            envMap,
-					Allowlist:      tenant.AllowlistedDestinations,
-					MaxMemoryMB:    maxMemoryMB,
-				},
+				ad.AppName: nats.BuildAppConfig(
+					ad.DeploymentID,
+					deployment.Hash,
+					envMap,
+					tenant.AllowlistedDestinations,
+					maxMemoryMB,
+				),
 			},
 		}
 

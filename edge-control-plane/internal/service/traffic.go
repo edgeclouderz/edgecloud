@@ -187,14 +187,14 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 		Timestamp: time.Now(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
-			appName: {
-				DeploymentID:   dep.ID,
-				DeploymentHash: dep.Hash,
-				Routes:         nil, // legacy single-deployment shape
-				Env:            envMap,
-				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
-				MaxMemoryMB:    maxMemoryMB,
-			},
+			appName: nats.BuildAppConfig(
+				dep.ID,
+				dep.Hash,
+				envMap,
+				tenant.AllowlistedDestinations,
+				maxMemoryMB,
+				// no routes — legacy single-deployment shape
+			),
 		},
 	}
 
@@ -297,14 +297,14 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 		Timestamp: time.Now(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
-			appName: {
-				DeploymentID:   splits[0].DeploymentID, // primary; Routes drives worker behavior
-				DeploymentHash: primaryHash,
-				Routes:         routes,
-				Env:            envMap,
-				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
-				MaxMemoryMB:    maxMemoryMB,
-			},
+			appName: nats.BuildAppConfig(
+				splits[0].DeploymentID, // primary; Routes drives worker behavior
+				primaryHash,
+				envMap,
+				tenant.AllowlistedDestinations,
+				maxMemoryMB,
+				routes...,
+			),
 		},
 	}
 
