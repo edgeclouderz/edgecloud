@@ -1,4 +1,5 @@
 //! Phase E — L1–L10 integration tests.
+#![allow(clippy::needless_borrows_for_generic_args)]
 //!
 //! These tests exercise the end-to-end FaaS dispatch path:
 //!
@@ -521,9 +522,8 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
     // Wait for the TCP listener to be ready.
     let addr = format!("127.0.0.1:{port}");
     for _ in 0..20 {
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(_) => return (port, shutdown_tx),
-            Err(_) => {}
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            return (port, shutdown_tx);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -979,12 +979,12 @@ async fn l17_kv_store_exists() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
-    let resp = cl.get(&b("/kv/exists?key=a")).send().await.unwrap();
+    cl.get(b("/kv/set?key=a&val=1")).send().await.unwrap();
+    let resp = cl.get(b("/kv/exists?key=a")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "true");
 
-    let resp = cl.get(&b("/kv/exists?key=none")).send().await.unwrap();
+    let resp = cl.get(b("/kv/exists?key=none")).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "false");
 }
 
@@ -997,18 +997,18 @@ async fn l18_kv_store_list_keys() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
-    cl.get(&b("/kv/set?key=b&val=2")).send().await.unwrap();
-    cl.get(&b("/kv/set?key=ab&val=3")).send().await.unwrap();
+    cl.get(b("/kv/set?key=a&val=1")).send().await.unwrap();
+    cl.get(b("/kv/set?key=b&val=2")).send().await.unwrap();
+    cl.get(b("/kv/set?key=ab&val=3")).send().await.unwrap();
 
-    let resp = cl.get(&b("/kv/list?prefix=")).send().await.unwrap();
+    let resp = cl.get(b("/kv/list?prefix=")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert!(keys.contains(&"a".to_string()));
     assert!(keys.contains(&"b".to_string()));
     assert!(keys.contains(&"ab".to_string()));
 
-    let resp = cl.get(&b("/kv/list?prefix=a")).send().await.unwrap();
+    let resp = cl.get(b("/kv/list?prefix=a")).send().await.unwrap();
     let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(keys.len(), 2, "prefix 'a' should match 'a' and 'ab'");
     assert!(keys.contains(&"a".to_string()));
@@ -1024,12 +1024,12 @@ async fn l19_kv_store_clear() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
-    cl.get(&b("/kv/set?key=b&val=2")).send().await.unwrap();
-    cl.get(&b("/kv/clear")).send().await.unwrap();
-    let resp = cl.get(&b("/kv/get?key=a")).send().await.unwrap();
+    cl.get(b("/kv/set?key=a&val=1")).send().await.unwrap();
+    cl.get(b("/kv/set?key=b&val=2")).send().await.unwrap();
+    cl.get(b("/kv/clear")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=a")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let resp = cl.get(&b("/kv/get?key=b")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=b")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1051,7 +1051,7 @@ async fn l20_kv_store_batch_ops() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // get-many
-    let resp = cl.get(&b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
     let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(
         vals,
@@ -1059,8 +1059,8 @@ async fn l20_kv_store_batch_ops() {
     );
 
     // Delete two, get-many again
-    cl.get(&b("/kv/del-many?keys=x,y")).send().await.unwrap();
-    let resp = cl.get(&b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
+    cl.get(b("/kv/del-many?keys=x,y")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get-many?keys=x,y,z")).send().await.unwrap();
     let vals: Vec<Option<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(vals, vec![None, None, Some("3".into())]);
 }
@@ -1077,13 +1077,13 @@ async fn l21_cache_size() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/cache/size")).send().await.unwrap();
+    let resp = cl.get(b("/cache/size")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap().parse::<u32>().unwrap(), 0);
 
-    cl.get(&b("/cache/set?key=a&val=1")).send().await.unwrap();
-    cl.get(&b("/cache/set?key=b&val=2")).send().await.unwrap();
-    let resp = cl.get(&b("/cache/size")).send().await.unwrap();
+    cl.get(b("/cache/set?key=a&val=1")).send().await.unwrap();
+    cl.get(b("/cache/set?key=b&val=2")).send().await.unwrap();
+    let resp = cl.get(b("/cache/size")).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap().parse::<u32>().unwrap(), 2);
 }
 
@@ -1096,19 +1096,19 @@ async fn l22_cache_exists_and_list() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/cache/set?key=a&val=1")).send().await.unwrap();
+    cl.get(b("/cache/set?key=a&val=1")).send().await.unwrap();
 
-    let resp = cl.get(&b("/cache/exists?key=a")).send().await.unwrap();
+    let resp = cl.get(b("/cache/exists?key=a")).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "true");
-    let resp = cl.get(&b("/cache/exists?key=none")).send().await.unwrap();
+    let resp = cl.get(b("/cache/exists?key=none")).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "false");
 
-    let resp = cl.get(&b("/cache/list?prefix=a")).send().await.unwrap();
+    let resp = cl.get(b("/cache/list?prefix=a")).send().await.unwrap();
     let keys: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(keys, vec!["a"]);
 
-    cl.get(&b("/cache/clear")).send().await.unwrap();
-    let resp = cl.get(&b("/cache/exists?key=a")).send().await.unwrap();
+    cl.get(b("/cache/clear")).send().await.unwrap();
+    let resp = cl.get(b("/cache/exists?key=a")).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "false");
 }
 
@@ -1121,7 +1121,7 @@ async fn l23_cache_batch_ops() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/cache/set-many?keys=a,b,c&vals=x,y,z"))
+    cl.get(b("/cache/set-many?keys=a,b,c&vals=x,y,z"))
         .send()
         .await
         .unwrap();
@@ -1137,7 +1137,7 @@ async fn l23_cache_batch_ops() {
         vec![Some("x".into()), Some("y".into()), Some("z".into())]
     );
 
-    cl.get(&b("/cache/del-many?keys=a,b")).send().await.unwrap();
+    cl.get(b("/cache/del-many?keys=a,b")).send().await.unwrap();
     let resp = cl
         .get(&b("/cache/get-many?keys=a,b,c"))
         .send()
@@ -1195,7 +1195,7 @@ async fn l25_time_resolution() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/time/resolution")).send().await.unwrap();
+    let resp = cl.get(b("/time/resolution")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let r: u64 = resp.text().await.unwrap().trim().parse().expect("u64");
     assert!(r > 0, "resolution should be > 0");
@@ -1212,7 +1212,7 @@ async fn l26_scheduling_repeat_and_cancel() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/sched/repeat?ms=60000")).send().await.unwrap();
+    let resp = cl.get(b("/sched/repeat?ms=60000")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let id = resp.text().await.unwrap();
     assert_eq!(id.len(), 36, "repeat should return UUID");
@@ -1252,7 +1252,7 @@ async fn l27_process_get_all_env() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/env")).send().await.unwrap();
+    let resp = cl.get(b("/env")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let envs: Vec<Vec<String>> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     let pairs: std::collections::HashMap<String, String> = envs
@@ -1272,7 +1272,7 @@ async fn l29_process_get_args() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/args")).send().await.unwrap();
+    let resp = cl.get(b("/args")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let args: Vec<String> = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert!(
@@ -1290,7 +1290,7 @@ async fn l30_process_get_cwd() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/cwd")).send().await.unwrap();
+    let resp = cl.get(b("/cwd")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let cwd = resp.text().await.unwrap();
     assert!(!cwd.is_empty(), "cwd should not be empty");
@@ -1502,20 +1502,20 @@ async fn l37_kv_store_ttl_expiry() {
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
     // Set with 2s TTL
-    cl.get(&b("/kv/set?key=ttl-key&val=ephemeral&ttl=2"))
+    cl.get(b("/kv/set?key=ttl-key&val=ephemeral&ttl=2"))
         .send()
         .await
         .unwrap();
 
     // Immediately exists
-    let resp = cl.get(&b("/kv/get?key=ttl-key")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=ttl-key")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Wait for expiry
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Should be gone
-    let resp = cl.get(&b("/kv/get?key=ttl-key")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=ttl-key")).send().await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::NOT_FOUND,
@@ -1533,17 +1533,17 @@ async fn l38_cache_ttl_expiry() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    cl.get(&b("/cache/set?key=ttl-cache&val=ephemeral&ttl=2"))
+    cl.get(b("/cache/set?key=ttl-cache&val=ephemeral&ttl=2"))
         .send()
         .await
         .unwrap();
 
-    let resp = cl.get(&b("/cache/get?key=ttl-cache")).send().await.unwrap();
+    let resp = cl.get(b("/cache/get?key=ttl-cache")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let resp = cl.get(&b("/cache/get?key=ttl-cache")).send().await.unwrap();
+    let resp = cl.get(b("/cache/get?key=ttl-cache")).send().await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::NOT_FOUND,
@@ -1582,7 +1582,7 @@ async fn l40_process_get_env_missing() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/env/DOES_NOT_EXIST_XYZ")).send().await.unwrap();
+    let resp = cl.get(b("/env/DOES_NOT_EXIST_XYZ")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1598,14 +1598,14 @@ async fn l41_kv_and_log_together() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/kv/set?key=a&val=1")).send().await.unwrap();
+    let resp = cl.get(b("/kv/set?key=a&val=1")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = cl.get(&b("/log?msg=set-a=1")).send().await.unwrap();
+    let resp = cl.get(b("/log?msg=set-a=1")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify the kv-store value is still there
-    let resp = cl.get(&b("/kv/get?key=a")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=a")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "1");
 }
@@ -1620,17 +1620,17 @@ async fn l42_schedule_kv_log_sequence() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/sched/once?ms=60000")).send().await.unwrap();
+    let resp = cl.get(b("/sched/once?ms=60000")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let task_id = resp.text().await.unwrap();
 
-    let resp = cl.get(&b("/kv/set?key=task&val=ok")).send().await.unwrap();
+    let resp = cl.get(b("/kv/set?key=task&val=ok")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = cl.get(&b("/log?msg=scheduled")).send().await.unwrap();
+    let resp = cl.get(b("/log?msg=scheduled")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = cl.get(&b("/kv/get?key=task")).send().await.unwrap();
+    let resp = cl.get(b("/kv/get?key=task")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "ok");
 
@@ -1650,12 +1650,12 @@ async fn l43_time_now_monotonic() {
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-    let resp = cl.get(&b("/time/now")).send().await.unwrap();
+    let resp = cl.get(b("/time/now")).send().await.unwrap();
     let t1: u64 = resp.text().await.unwrap().trim().parse().unwrap();
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let resp = cl.get(&b("/time/now")).send().await.unwrap();
+    let resp = cl.get(b("/time/now")).send().await.unwrap();
     let t2: u64 = resp.text().await.unwrap().trim().parse().unwrap();
 
     assert!(t2 > t1, "time.now() should be monotonic: t1={t1}, t2={t2}");
