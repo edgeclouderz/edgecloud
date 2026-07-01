@@ -104,6 +104,7 @@ fn test_config(
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     }
 }
 
@@ -378,6 +379,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
@@ -545,6 +547,7 @@ async fn build_supervisor(
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
 
     let engine = edge_runtime::create_engine()?;
