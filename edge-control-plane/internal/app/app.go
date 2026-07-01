@@ -120,6 +120,13 @@ func New(
 	// ── Middleware ─────────────────────────────────────────────────
 	authMiddleware := middleware.NewAuthMiddleware(apiKeySvc)
 
+	// ── Rate Limiters ─────────────────────────────────────────────
+	// Tenant rate limiter: applied after auth on all /api/v1/* routes.
+	// Zero-value configs use defaults set in config.Load().
+	tenantLimiter := middleware.NewRateLimiter(cfg.RateLimit.TenantRate, cfg.RateLimit.TenantBurst)
+	// IP rate limiter: applied on unauthenticated public endpoints.
+	ipLimiter := middleware.NewRateLimiter(cfg.RateLimit.IPRate, cfg.RateLimit.IPBurst)
+
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
 
@@ -174,9 +181,9 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		}
 	})
 
-	// Public endpoints (no auth required)
-	mux.HandleFunc("POST /api/v1/tenants", tenantHandler.Bootstrap)
-	mux.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
+	// Public endpoints (no auth required) — IP rate limited
+	mux.Handle("POST /api/v1/tenants", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(tenantHandler.Bootstrap)))
+	mux.Handle("POST /api/v1/keys", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(apiKeyHandler.Create)))
 
 	// Deprecated: redirect old /api/... paths to /api/v1/... for clients still
 	// on the old contract. Workers use /api/internal/... (unversioned).
@@ -275,8 +282,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	apiWithOwner := authMiddleware.Authenticate(
 		middleware.RequireRole("owner")(admin),
 	)
-	mux.Handle("/api/v1/", apiWithAuth)
-	mux.Handle("/api/v1/admin/", apiWithOwner)
+
+	// Apply tenant rate limiter after auth on all authenticated routes.
+	tenantRateLimit := tenantLimiter.Middleware(func(r *http.Request) string {
+		return middleware.GetTenantID(r.Context())
+	})
+	mux.Handle("/api/v1/", tenantRateLimit(apiWithAuth))
+	mux.Handle("/api/v1/admin/", tenantRateLimit(apiWithOwner))
 
 	// Service-to-service read endpoint that the edge-ingress polls to
 	// apply Caddy weights for canary/blue-green traffic splits.
