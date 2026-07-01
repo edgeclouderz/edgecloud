@@ -343,6 +343,67 @@ func TestNewCloudProvider_RejectsUnknown(t *testing.T) {
 	}
 }
 
+// TestExecute_NoopDoesNotOverwriteLastEvent pins the cooldown-gate
+// invariant: a noop event recorded by execute (whether from "within
+// target" or from a prior cooldown suppression) must NOT overwrite
+// lastEventByRegion[region]. If it did, a sequence like
+//
+//	tick 1: scale_up → lastEvent=Up   (CreatedAt=T0)
+//	tick 2: noop     → lastEvent=Noop (CreatedAt=T1)  <-- BUG would overwrite here
+//	tick 3: scale_up → applyCooldown sees Noop vs Up → "different
+//	                       action class" → scale_up proceeds → Provision fires again
+//
+// would re-fire Provision inside the cooldown window. The
+// regression test TestRegression_CooldownSuppressesSecondScaleUp
+// exercises the same scenario end-to-end with NATS; this test pins
+// the in-memory contract directly so the failure mode is caught by
+// a unit test that doesn't need Docker.
+func TestExecute_NoopDoesNotOverwriteLastEvent(t *testing.T) {
+	cloud := &MockCloudProvider{
+		ProvisionFunc: func(_ context.Context, _ string) (string, error) { return "", nil },
+	}
+	repo := &mockEventRepo{}
+	s := NewService(Deps{
+		Cfg:       Config{ScaleUpCooldownS: 60},
+		Cloud:     cloud,
+		EventRepo: repo,
+		Log:       discardLogger(),
+	})
+	workers := []WorkerHeadroom{{WorkerID: "w1", Region: "fra"}}
+
+	// Tick 1: real scale_up — must update lastEventByRegion.
+	s.execute(context.Background(), "fra", workers,
+		Decision{Action: domain.AutoscaleUp, FromCount: 1, ToCount: 2, Reason: "free_slots=0"})
+	if got := s.lastEventByRegion["fra"]; got == nil || got.Action != domain.AutoscaleUp {
+		t.Fatalf("after scale_up, lastEventByRegion[fra] = %+v, want scale_up", got)
+	}
+
+	// Tick 2: noop (cooldown suppressed) — must NOT overwrite.
+	s.execute(context.Background(), "fra", workers,
+		Decision{Action: domain.AutoscaleNoop, FromCount: 1, ToCount: 1, Reason: "scale_up cooldown"})
+	got := s.lastEventByRegion["fra"]
+	if got == nil {
+		t.Fatalf("after noop, lastEventByRegion[fra] = nil, want the prior scale_up to remain")
+	}
+	if got.Action != domain.AutoscaleUp {
+		t.Errorf("after noop, lastEventByRegion[fra].Action = %q, want scale_up (cooldown gate depends on this)", got.Action)
+	}
+	if got.Reason != "free_slots=0" {
+		t.Errorf("after noop, lastEventByRegion[fra].Reason = %q, want 'free_slots=0' (no-op must not overwrite the scale event)", got.Reason)
+	}
+
+	// Tick 3: applyCooldown against the now-stable lastEvent must
+	// still suppress (it sees scale_up, not noop).
+	now := time.Now()
+	last := s.lastEventByRegion["fra"]
+	// Force the elapsed to 1s to land squarely inside the 60s cooldown.
+	last.CreatedAt = now.Add(-1 * time.Second)
+	d := Decision{Action: domain.AutoscaleUp, FromCount: 1, ToCount: 2, Reason: "free_slots=0"}
+	if got := s.applyCooldown(d, last, now); got.Action != domain.AutoscaleNoop {
+		t.Errorf("tick-3 applyCooldown.Action = %q, want noop (cooldown gate must survive across noop tick)", got.Action)
+	}
+}
+
 // TestNewCloudProvider_AcceptsKnown pins the happy paths: empty
 // (defaults to noop) and "noop" must succeed. "mock" is rejected
 // here — tests construct MockCloudProvider directly rather than

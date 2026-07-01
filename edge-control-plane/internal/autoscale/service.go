@@ -258,8 +258,9 @@ func (s *Service) applyCooldown(d Decision, lastEvent *domain.AutoscaleEvent, no
 
 // execute calls the CloudProvider and records the result as an
 // autoscale_events row. Always logs at info (or warn on failure).
-// Mutates lastEventByRegion[region] so the next tick's cooldown
-// check (per-region) sees this row.
+// Mutates lastEventByRegion[region] (only for scale_up / scale_down —
+// see below) so the next tick's cooldown check (per-region) sees
+// this row.
 func (s *Service) execute(ctx context.Context, region string, workers []WorkerHeadroom, d Decision) {
 	// CreatedAt is set here (in addition to the DB default) so that
 	// lastEventByRegion carries the wall-clock time the decision was
@@ -301,9 +302,20 @@ func (s *Service) execute(ctx context.Context, region string, workers []WorkerHe
 	if _, err := s.eventRepo.Insert(ctx, ev); err != nil {
 		s.log.Error("autoscale: insert event", "region", region, "err", err)
 	}
-	s.mu.Lock()
-	s.lastEventByRegion[region] = ev
-	s.mu.Unlock()
+	// Only update lastEventByRegion for actual scale events. If we
+	// overwrote it on noop events too, a sequence of cooldown-
+	// suppressed ticks would reset the cooldown clock to time.Now()
+	// each tick — and the NEXT tick would see "different action
+	// class" (Noop vs Up) in applyCooldown, let the scale_up
+	// through, and re-fire Provision. Pinning lastEventByRegion to
+	// the most recent *scale* event preserves the cooldown gate
+	// across the noop ticks that exist between two valid scale
+	// windows. (Regression test: TestRegression_CooldownSuppressesSecondScaleUp.)
+	if d.Action != domain.AutoscaleNoop {
+		s.mu.Lock()
+		s.lastEventByRegion[region] = ev
+		s.mu.Unlock()
+	}
 
 	if ev.Succeeded {
 		s.log.Info("autoscale: decision executed",
