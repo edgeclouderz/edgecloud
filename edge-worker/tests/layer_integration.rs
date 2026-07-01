@@ -139,6 +139,7 @@ impl LayerHarness {
                 "l7-deployment".to_string(),
             )),
             env: HashMap::new(),
+            max_request_body_bytes: 10 * 1024 * 1024,
         };
 
         let dispatch = Arc::new(
@@ -295,6 +296,7 @@ async fn l7_per_request_timeout_returns_500() {
             "l7-deployment".to_string(),
         )),
         env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
     };
 
     let dispatch = Arc::new(

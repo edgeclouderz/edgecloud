@@ -72,6 +72,15 @@ pub struct Config {
     /// `handler_request_budget_ms / epoch_tick_ms` ticks before each
     /// request is dispatched to the guest. Tune via `HANDLER_REQUEST_BUDGET_MS`.
     pub handler_request_budget_ms: u64,
+    /// Per-request body-size cap for FaaS (Handler) components, in
+    /// bytes. The FaaS dispatcher rejects requests whose
+    /// `Content-Length` exceeds this with a 413 before invoking the
+    /// guest. Default 10 MiB (matches the v0.1 `edge:http-server`
+    /// `DEFAULT_MAX_BODY_SIZE`). Tune via
+    /// `HANDLER_MAX_REQUEST_BODY_BYTES`. `0` means "no cap" (NOT
+    /// RECOMMENDED in production — a misbehaving tenant can exhaust
+    /// worker memory with one POST).
+    pub handler_max_request_body_bytes: u64,
 }
 
 impl Config {
@@ -153,6 +162,10 @@ impl Config {
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
             handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
+            handler_max_request_body_bytes: parse_env_u64(
+                "HANDLER_MAX_REQUEST_BODY_BYTES",
+                10 * 1024 * 1024,
+            )?,
         })
     }
 
