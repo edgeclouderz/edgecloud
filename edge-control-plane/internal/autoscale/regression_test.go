@@ -81,7 +81,12 @@ func newTestNATS(t *testing.T) *natsio.Conn {
 	if err != nil {
 		t.Fatalf("nats connection string: %v", err)
 	}
-	nc, err := natsio.Connect(url, natsio.Name("autoscale-regression-test"))
+	nc, err := natsio.Connect(url,
+		natsio.Name("autoscale-regression-test"),
+		natsio.RetryOnFailedConnect(true),
+		natsio.MaxReconnects(-1),
+		natsio.ReconnectWait(250*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("nats connect: %v", err)
 	}
