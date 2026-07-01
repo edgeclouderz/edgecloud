@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	natsio "github.com/nats-io/nats.go"
 )
 
@@ -645,6 +646,74 @@ func TestEvaluateAll_NoopOnTarget(t *testing.T) {
 	}
 	if events.events[0].Action != domain.AutoscaleNoop {
 		t.Errorf("Action = %q, want noop", events.events[0].Action)
+	}
+}
+
+// TestEvaluateAll_EvictsStaleWorker pins the staleness eviction
+// contract: a worker whose LastSeen is older than StaleAfter must be
+// removed from the fleet map before the decision snapshot.
+//
+// When the last worker in a region is evicted, the region is removed
+// from the fleet map entirely and no decision tick fires for it —
+// the autoscaler only evaluates regions that have at least one active
+// worker. A new heartbeat will re-add the worker.
+func TestEvaluateAll_EvictsStaleWorker(t *testing.T) {
+	events := &mockEventRepo{}
+	s := NewService(Deps{
+		Cfg: Config{
+			Enabled: true, MinWorkers: 1, MaxWorkers: 10,
+			TargetHeadroomPct: 20, StaleAfter: 5 * time.Minute,
+		},
+		DeployRepo: &mockDeployRepo{
+			countFunc: func(_ context.Context) (int, error) { return 0, nil },
+		},
+		EventRepo: events,
+		Cloud:     &MockCloudProvider{},
+		Log:       discardLogger(),
+	})
+
+	// Inject a stale worker directly into the fleet map.
+	s.mu.Lock()
+	s.fleets["fra"] = map[string]WorkerHeadroom{
+		"w_stale": {
+			WorkerID: "w_stale", Region: "fra",
+			Headroom: &nats.ClusterHeadroom{AppSlots: 50},
+			LastSeen: time.Now().Add(-10 * time.Minute),
+		},
+	}
+	s.mu.Unlock()
+
+	s.evaluateAll(context.Background())
+
+	// Stale worker must be evicted from the fleet map and the region
+	// removed (no active workers in that region).
+	s.mu.Lock()
+	_, exists := s.fleets["fra"]
+	s.mu.Unlock()
+	if exists {
+		t.Error("stale worker was not evicted from fleets")
+	}
+
+	// No events — the region was empty after eviction, so no decision
+	// tick fired for it. (When a region has 0 workers, evaluateAll
+	// has nothing to snapshot and skips it.)
+	if len(events.events) != 0 {
+		t.Errorf("events = %d, want 0 (no decision fires for an empty region)", len(events.events))
+	}
+
+	// A fresh heartbeat must re-add the worker (not blocked by
+	// staleness — eviction happens in evaluateAll, not in
+	// handleHeartbeat).
+	body, _ := json.Marshal(map[string]any{
+		"worker_id": "w_fra_new", "region": "fra",
+		"cluster_headroom": map[string]any{"app_slots": 50},
+	})
+	s.handleHeartbeat(natsMsg(body))
+	s.mu.Lock()
+	fleet, ok := s.fleets["fra"]
+	s.mu.Unlock()
+	if !ok || len(fleet) != 1 {
+		t.Error("fresh heartbeat must re-add worker after eviction")
 	}
 }
 

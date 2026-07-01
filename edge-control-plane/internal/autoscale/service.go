@@ -26,6 +26,11 @@ type Config struct {
 	ScaleUpCooldownS   int
 	ScaleDownCooldownS int
 	DecisionIntervalS  int
+	// StaleAfter is the duration after which a worker that hasn't
+	// heartbeated is evicted from the fleet view. Zero means no
+	// staleness eviction (backward compatible). A reasonable value
+	// is 3× the heartbeat interval (default 90s).
+	StaleAfter time.Duration
 }
 
 // deployRepoInterface exposes only Count, which the autoscaler uses
@@ -174,6 +179,29 @@ func (s *Service) run(ctx context.Context, sub *natsio.Subscription, ch <-chan *
 // this, a cooldown-suppressed tick would be invisible to operators.
 func (s *Service) evaluateAll(ctx context.Context) {
 	s.mu.Lock()
+
+	// Evict stale workers whose last heartbeat exceeds StaleAfter.
+	// Must happen before the snapshot so stale capacity doesn't
+	// pollute the decision input. A worker that was evicted will be
+	// re-added on its next heartbeat (handleHeartbeat), which is
+	// correct — the worker isn't gone, just unresponsive.
+	if s.cfg.StaleAfter > 0 {
+		now := time.Now()
+		for region, workers := range s.fleets {
+			for wid, w := range workers {
+				if now.Sub(w.LastSeen) > s.cfg.StaleAfter {
+					delete(s.fleets[region], wid)
+					s.log.Info("autoscale: evicted stale worker",
+						"worker_id", wid, "region", region,
+						"last_seen", w.LastSeen, "age", now.Sub(w.LastSeen).Round(time.Second))
+				}
+			}
+			if len(s.fleets[region]) == 0 {
+				delete(s.fleets, region)
+			}
+		}
+	}
+
 	snapshot := make(map[string][]WorkerHeadroom, len(s.fleets))
 	for region, workers := range s.fleets {
 		list := make([]WorkerHeadroom, 0, len(workers))
