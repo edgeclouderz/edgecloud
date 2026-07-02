@@ -74,3 +74,18 @@ observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
+
+# v0.2 PR #196 ships a backwards-incompatible rewrite of the runtime
+# public API: the v0.1 custom HTTP server + networking + DNS layer is
+# replaced with `wasi:http/incoming-handler` (FaaS) and `wasi:sockets`
+# (long-running). cargo-semver-checks flags the dropped structs/traits/
+# fields as breaking changes when comparing the PR against origin/main
+# (which still has the v0.1 API). These lints allow the v0.1 → v0.2
+# transition; tracked in #211.
+[package.metadata.cargo-semver-checks.lints]
+struct_missing = "allow"
+trait_missing = "allow"
+struct_pub_field_missing = "allow"
+enum_variant_missing = "allow"
+function_missing = "allow"
+method_missing = "allow"
