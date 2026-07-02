@@ -26,7 +26,7 @@
 //! `starting_port`, `cache_dir`, and `worker_tenant_id`).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use testcontainers::core::WaitFor;
@@ -45,22 +45,42 @@ use edge_worker::port_pool::PortPool;
 use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
 
-/// Returns `true` if integration tests should be skipped. We skip when:
+/// Returns `true` if integration tests should be skipped.
 ///
-///   - `SKIP_INTEGRATION_TESTS` is set in the environment (for local
-///     runs when Docker is unavailable).
-///   - `CI` is set (mirrors the convention in `.gitlab-ci.yml` —
-///     integration tests run locally on a developer machine, but the
-///     shared CI runner doesn't have docker-in-docker for these
-///     crates' test step).
-///   - `/var/run/docker.sock` is absent (we hard-require Docker on the
-///     host for `testcontainers`; touching that socket from inside a
-///     container needs `--privileged` or a DinD setup the team doesn't
-///     run in CI).
+/// Tests are skipped when:
+///   - `SKIP_INTEGRATION_TESTS` is set (manual override), or
+///   - `/var/run/docker.sock` is absent (Docker unavailable).
+///
+/// The `CI` env var is **not** checked — GitHub Actions runners have
+/// Docker available, so removing that gate lets integration tests run
+/// in CI.
 pub fn should_skip_integration_tests() -> bool {
     std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
         || !std::path::Path::new("/var/run/docker.sock").exists()
+}
+
+// Lazily-initialized NATS URL shared across all tests in the same
+// binary. The container handle is leaked so it lives for the process
+// lifetime. Prevents each test from starting its own container.
+static GLOBAL_NATS_URL: OnceLock<String> = OnceLock::new();
+
+/// Returns a shared NATS URL, starting a NATS container on first call.
+///
+/// Subsequent calls return the same URL — the container is started once
+/// per test-binary invocation and leaked for the process lifetime.
+/// This avoids starting a separate NATS container per test (the worker
+/// suite has ~18 tests that previously each started their own container).
+pub async fn shared_nats_url() -> &'static str {
+    if let Some(url) = GLOBAL_NATS_URL.get() {
+        return url;
+    }
+    let (container, url) = start_nats().await;
+    // Leak the container handle so it lives for the entire test-binary
+    // lifetime. The handle is !Sync but once leaked it's never
+    // dereferenced again — only the URL string is used by callers.
+    Box::leak(Box::new(container));
+    GLOBAL_NATS_URL.set(url).unwrap_or_else(|_| unreachable!());
+    GLOBAL_NATS_URL.get().unwrap()
 }
 
 /// Spawn a NATS container via `testcontainers`. Returns the live

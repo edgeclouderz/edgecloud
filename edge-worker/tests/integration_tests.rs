@@ -38,8 +38,8 @@ use edge_worker::supervisor::Supervisor;
 //     single-worker supervisor builders; the only knob the test
 //     actually customises per case is `Config` fields + cache_dir.
 use edge_test_helpers::{
-    build_supervisor_from_url, build_supervisor_with, default_cache_dir,
-    should_skip_integration_tests, start_nats, SupervisorGuard,
+    build_supervisor_from_url, build_supervisor_with, default_cache_dir, shared_nats_url,
+    should_skip_integration_tests, SupervisorGuard,
 };
 
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
@@ -333,8 +333,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     // this test doesn't bind the container to the supervisor struct; it
     // forgets it explicitly so it stays alive for the test's duration,
     // matching the pre-PR-#166-followup-#4 behavior).
-    let (container, nats_url) = start_nats().await;
-    std::mem::forget(container); // keep alive for test; dropped when test fn returns
+    let nats_url = shared_nats_url().await;
 
     let config = Config {
         worker_id: "test-worker".to_string(),
@@ -357,7 +356,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
     };
-    let supervisor = build_supervisor_from_url(&nats_url, config).await?;
+    let supervisor = build_supervisor_from_url(nats_url, config).await?;
 
     // Build and publish a heartbeat manually
     let heartbeat = supervisor.build_heartbeat().await;
@@ -370,7 +369,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     // Subscribe and receive it
     let received = timeout(
         Duration::from_secs(5),
-        subscribe_heartbeats(&nats_url, "test-region"),
+        subscribe_heartbeats(nats_url, "test-region"),
     )
     .await
     .context("heartbeat subscription timed out")?
@@ -782,7 +781,7 @@ async fn test_queue_group_pinning() {
 
 async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     // Single NATS container, shared by both workers and the publisher.
-    let (nats_container, nats_url) = start_nats().await;
+    let nats_url = shared_nats_url().await;
 
     let region = "test-region";
     let queue_group = "test-pinning-group";
@@ -811,7 +810,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
     };
-    let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
+    let sup_a = build_supervisor_from_url(nats_url, config_a).await?;
 
     let config_b = Config {
         worker_id: "w_pinning_b".to_string(),
@@ -834,7 +833,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
     };
-    let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
+    let sup_b = build_supervisor_from_url(nats_url, config_b).await?;
 
     // Each supervisor gets its own shutdown channel — the test triggers
     // shutdown at the end and waits for both loops to exit.
@@ -858,7 +857,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
 
     // Publish a single TaskMessage via plain NATS — JetStream's stream
     // (subjects = `edgecloud.tasks.>`) captures it.
-    let publisher = async_nats::connect(&nats_url).await?;
+    let publisher = async_nats::connect(nats_url).await?;
     let payload = serde_json::json!({
         "type": "task_update",
         "timestamp": "2026-06-15T00:00:00Z",
@@ -903,7 +902,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle_a).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle_b).await;
 
-    drop(nats_container);
+    // NATS container is shared and leaked — no explicit drop needed.
     Ok(())
 }
 
