@@ -267,9 +267,18 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 // round trip instead of an N+1 (one active-list + M deployment
 // lookups + M env lists). See ReconcileService.reconcileTenant /
 // BuildFullSync.
+//
+// Hash is sql.NullString (not plain string) because the LEFT JOIN
+// passes SQL NULL through for orphan rows — an active row whose
+// deployment_id no longer exists in the deployments table. The
+// service layer uses Hash.Valid (or equivalently, the absence of a
+// non-empty Hash.String) to detect orphans and skip them, logging
+// the count so operator-actionable broken-state is visible instead
+// of being silently dropped (which is what the previous INNER JOIN
+// did).
 type JoinedActiveDeployment struct {
 	domain.ActiveDeployment
-	Hash    string        `db:"hash"`
+	Hash    sql.NullString `db:"hash"`
 	Regions pq.StringArray `db:"regions"`
 }
 
@@ -278,17 +287,18 @@ type JoinedActiveDeployment struct {
 //
 //	SELECT ad.*, d.hash, d.regions
 //	FROM active_deployments ad
-//	JOIN deployments d ON d.id = ad.deployment_id
+//	LEFT JOIN deployments d ON d.id = ad.deployment_id
 //	WHERE ad.tenant_id = $1
 //
-// INNER JOIN semantics: an active row whose referenced deployment_id
-// no longer exists is dropped silently. The periodic reconcile loop
-// used to log-and-continue on this case; if a deployment row is
-// missing, the active row is in a broken state that the operator must
-// resolve (re-activate or delete the active row). The previous
-// log-and-continue hid this from the operator; a future improvement
-// is to surface the broken (ad, missing-deployment) pair to a
-// metric/dashboard. Tracked separately.
+// LEFT JOIN semantics (was INNER JOIN in the earlier draft): an
+// active row whose referenced deployment_id no longer exists is
+// returned with Hash="" and Regions=nil. Calling code skips the
+// publish step for those rows and surfaces the count to the operator
+// so the broken (active, missing-deployment) pair isn't silently
+// dropped — the operator must resolve it (re-activate or delete the
+// active row). The previous log-and-continue on this case in the
+// pre-N+1 reconcile loop is preserved here, just centralised at the
+// service layer.
 func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Context, tenantID string) ([]JoinedActiveDeployment, error) {
 	var rows []JoinedActiveDeployment
 	query := `
@@ -297,7 +307,7 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 		       ad.regions_failed, ad.last_publish_at, ad.last_publish_attempt_id,
 		       d.hash, d.regions
 		FROM active_deployments ad
-		JOIN deployments d ON d.id = ad.deployment_id
+		LEFT JOIN deployments d ON d.id = ad.deployment_id
 		WHERE ad.tenant_id = $1
 	`
 	err := r.db.SelectContext(ctx, &rows, query, tenantID)

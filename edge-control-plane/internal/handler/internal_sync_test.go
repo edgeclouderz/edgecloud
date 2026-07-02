@@ -161,6 +161,56 @@ func TestSync_JWTWithoutWorkerID_Returns404(t *testing.T) {
 	}
 }
 
+// TestSync_JWTWithoutTenantID_Returns404 covers the malformed-JWT
+// defense for the tenant_id claim: if the JWT carries a valid
+// worker_id (matches the URL) but is missing tenant_id, the handler
+// must 404 with the same body as a URL mismatch — preventing the
+// asymmetric outcome where one missing claim yields 404 and another
+// yields 500 (info-leak about which claims were parsed by the JWT
+// middleware vs which are read from the request).
+func TestSync_JWTWithoutTenantID_Returns404(t *testing.T) {
+	h := syncHandler(nil, nil, &fakeSyncBuilder{err: errors.New("builder reached")})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
+	req.SetPathValue("workerID", "w_1")
+	// worker_id matches URL, but tenant_id is empty.
+	req = withSyncJWT(req, "w_1", "", "global")
+	rr := httptest.NewRecorder()
+
+	h.Sync(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want 404 (no tenant_id claim)", rr.Code)
+	}
+	expected := `{"error": "worker not found"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != expected {
+		t.Errorf("body=%q, want %q", got, expected)
+	}
+}
+
+// TestSync_JWTWithoutRegion_Returns404: same shape as the
+// tenant_id case — a JWT with a valid worker_id + tenant_id but no
+// region claim must 404 with the same body, not reach BuildFullSync
+// with region="".
+func TestSync_JWTWithoutRegion_Returns404(t *testing.T) {
+	h := syncHandler(nil, nil, &fakeSyncBuilder{err: errors.New("builder reached")})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/workers/w_1/sync", nil)
+	req.SetPathValue("workerID", "w_1")
+	req = withSyncJWT(req, "w_1", "t_1", "")
+	rr := httptest.NewRecorder()
+
+	h.Sync(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want 404 (no region claim)", rr.Code)
+	}
+	expected := `{"error": "worker not found"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != expected {
+		t.Errorf("body=%q, want %q", got, expected)
+	}
+}
+
 // TestSync_JWTWorkerIDMatchesURL_SkipsWorkerSvcGet pins the new
 // positive path: when jwt.worker_id == url.workerID, the handler must
 // derive (tenant, region) from the JWT and call BuildFullSync WITHOUT

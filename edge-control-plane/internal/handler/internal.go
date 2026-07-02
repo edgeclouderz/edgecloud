@@ -401,6 +401,19 @@ func (h *InternalHandler) Sync(w http.ResponseWriter, r *http.Request) {
 
 	jwtTenantID := middleware.GetWorkerTenantID(r.Context())
 	jwtRegion := middleware.GetWorkerRegion(r.Context())
+	// Guard every JWT-derived identity claim symmetrically. A JWT
+	// that carries a valid worker_id but no tenant_id/region should
+	// not reach BuildFullSync — the DB query keyed on "" would
+	// either return an empty payload (silently under-syncing) or
+	// surface a 500 from the repo layer (information-leak about
+	// the table shape). Returning 404 keeps the failure mode
+	// identical to a URL mismatch and prevents either outcome.
+	if jwtTenantID == "" || jwtRegion == "" {
+		log.Printf("Sync(%s): jwt missing tenant_id=%q or region=%q; denying",
+			workerID, jwtTenantID, jwtRegion)
+		http.Error(w, `{"error": "worker not found"}`, http.StatusNotFound)
+		return
+	}
 
 	apps, err := h.syncBuilder.BuildFullSync(r.Context(), jwtTenantID, jwtRegion)
 	if err != nil {

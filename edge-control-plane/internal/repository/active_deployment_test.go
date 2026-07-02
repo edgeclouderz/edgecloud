@@ -374,12 +374,13 @@ func TestSet_ResetsPublishStateOnReactivation(t *testing.T) {
 	}
 }
 
-// TestListByTenantWithDeployment_HappyPath pins the new JOIN query
+// TestListByTenantWithDeployment_HappyPath pins the JOIN query
 // (PR #166 follow-up #1): one round trip returns each active row
-// enriched with its deployment's hash and regions. The query uses
-// INNER JOIN semantics — an active row whose deployment_id has no
-// match is dropped silently (matches the previous log-and-continue
-// behavior on the same case).
+// enriched with its deployment's hash and regions. Uses LEFT JOIN
+// semantics — an active row whose deployment_id has no match is
+// returned with Hash="" / Regions=nil so the service layer can
+// detect and log orphans rather than silently dropping them
+// (operator-actionable state, not a silent failure).
 func TestListByTenantWithDeployment_HappyPath(t *testing.T) {
 	db, mock, cleanup := newActiveDeploymentMockDB(t)
 	defer cleanup()
@@ -405,11 +406,64 @@ func TestListByTenantWithDeployment_HappyPath(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2", len(got))
 	}
-	if got[0].Hash != "hash1" || got[0].AppName != "app1" {
+	if !got[0].Hash.Valid || got[0].Hash.String != "hash1" || got[0].AppName != "app1" {
 		t.Errorf("got[0]=%+v", got[0])
 	}
 	if len(got[1].Regions) != 2 {
 		t.Errorf("got[1].Regions=%v, want 2", got[1].Regions)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestListByTenantWithDeployment_OrphanPassesThrough pins the LEFT
+// JOIN contract: an active row whose deployment_id has no match in
+// the deployments table is returned with Hash.Valid=false so the
+// service layer can detect and log orphans (Hash is sql.NullString,
+// not plain string, so the LEFT JOIN's SQL NULL passes through as
+// Valid=false rather than crashing the scanner). Switching to an
+// INNER JOIN here would silently drop the row — the len==2
+// assertion catches that regression.
+func TestListByTenantWithDeployment_OrphanPassesThrough(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
+		"auto_rollback_enabled", "stable_since", "regions_published",
+		"regions_failed", "last_publish_at", "last_publish_attempt_id",
+		"hash", "regions",
+	}).
+		// happy app
+		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, "hash1", pq.StringArray{"global"}).
+		// orphan: d_2 has no match in deployments, so the LEFT JOIN
+		// returns SQL NULL for hash and regions. The NULL is fed in
+		// as a typed nil so the sql driver reports IsNull=true on
+		// the column — otherwise the scan would attempt string
+		// conversion on an untyped nil and fail before our check.
+		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, nil, nil)
+
+	mock.ExpectQuery(`SELECT.*active_deployments ad.*JOIN deployments d`).
+		WithArgs("t_a").
+		WillReturnRows(rows)
+
+	got, err := repo.ListByTenantWithDeployment(context.Background(), "t_a")
+	if err != nil {
+		t.Fatalf("ListByTenantWithDeployment: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 (orphan must pass through with Hash.Valid=false)", len(got))
+	}
+	if !got[0].Hash.Valid || got[0].Hash.String != "hash1" {
+		t.Errorf("got[0].Hash = %+v, want Valid=true String=hash1", got[0].Hash)
+	}
+	if got[1].Hash.Valid {
+		t.Errorf("got[1].Hash = %+v, want Valid=false (orphan)", got[1].Hash)
+	}
+	if len(got[1].Regions) != 0 {
+		t.Errorf("got[1].Regions = %v, want empty (orphan)", got[1].Regions)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)

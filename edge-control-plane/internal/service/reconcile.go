@@ -215,9 +215,35 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		return
 	}
 
-	// Bulk-fetch env vars for every active app in one round trip.
-	appNames := make([]string, len(joined))
-	for i, j := range joined {
+	// Surface broken (active, missing-deployment) pairs to the
+	// operator. ListByTenantWithDeployment uses LEFT JOIN semantics
+	// so orphan rows survive the join with Hash="" / Regions=nil;
+	// we skip them here and log the count so the broken state is
+	// visible (the pre-N+1 reconcile loop did the same on a per-row
+	// path). Subsequent sweeps will keep reporting until the
+	// operator fixes the underlying row.
+	publishable := joined[:0]
+	orphanCount := 0
+	for _, j := range joined {
+		if !j.Hash.Valid {
+			orphanCount++
+			log.Printf("reconcile: tenant=%s app=%s has active row referencing missing deployment %q; skipping publish",
+				tenantID, j.AppName, j.DeploymentID)
+			continue
+		}
+		publishable = append(publishable, j)
+	}
+	if orphanCount > 0 {
+		log.Printf("reconcile: tenant=%s: %d active row(s) reference a missing deployment; operator action required to re-activate or delete",
+			tenantID, orphanCount)
+	}
+	if len(publishable) == 0 {
+		return
+	}
+
+	// Bulk-fetch env vars for every publishable active app in one round trip.
+	appNames := make([]string, len(publishable))
+	for i, j := range publishable {
 		appNames[i] = j.AppName
 	}
 	allEnvs, err := s.appEnvRepo.ListByApps(ctx, tenantID, appNames)
@@ -225,7 +251,7 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		log.Printf("reconcile: tenant=%s: list envs (bulk): %v; publishing without env", tenantID, err)
 		allEnvs = nil
 	}
-	envByApp := make(map[string]map[string]string, len(joined))
+	envByApp := make(map[string]map[string]string, len(publishable))
 	for _, e := range allEnvs {
 		if envByApp[e.AppName] == nil {
 			envByApp[e.AppName] = make(map[string]string)
@@ -240,7 +266,7 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 
 	// region -> { app_name: AppConfig }
 	byRegion := map[string]map[string]nats.AppConfig{}
-	for _, j := range joined {
+	for _, j := range publishable {
 		envMap := envByApp[j.AppName] // nil if the bulk fetch errored
 		if envMap == nil {
 			envMap = map[string]string{}
@@ -248,7 +274,9 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 
 		cfg := nats.BuildAppConfig(
 			j.DeploymentID,
-			j.Hash,
+			// j.Hash was confirmed Valid by the orphan filter above;
+			// Hash.String is the non-NULL hash from the joined deployments row.
+			j.Hash.String,
 			envMap,
 			allowlist,
 			maxMemoryMB,
@@ -322,9 +350,33 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 		return map[string]nats.AppConfig{}, nil
 	}
 
-	// Bulk-fetch env vars for every active app in one round trip.
-	appNames := make([]string, 0, len(joined))
+	// Drop broken (active, missing-deployment) rows. LEFT JOIN brings
+	// them through with Hash="" — they have no deployment to publish,
+	// and the operator must fix the underlying state (re-activate or
+	// delete the active row). The reconcileTenant periodic loop logs
+	// these for visibility; here we just skip them, since /sync is a
+	// worker-facing read endpoint and shouldn't pollute the worker's
+	// view with 500s for an operator-actionable state.
+	publishable := joined[:0]
+	orphanCount := 0
 	for _, j := range joined {
+		if !j.Hash.Valid {
+			orphanCount++
+			continue
+		}
+		publishable = append(publishable, j)
+	}
+	if orphanCount > 0 {
+		log.Printf("reconcile: BuildFullSync tenant=%s region=%s: skipped %d active row(s) referencing missing deployment",
+			tenantID, region, orphanCount)
+	}
+	if len(publishable) == 0 {
+		return map[string]nats.AppConfig{}, nil
+	}
+
+	// Bulk-fetch env vars for every active app in one round trip.
+	appNames := make([]string, 0, len(publishable))
+	for _, j := range publishable {
 		regions := []string(j.Regions)
 		if len(regions) == 0 {
 			regions = []string{s.defaultRegion}
@@ -366,7 +418,7 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 	}
 
 	out := map[string]nats.AppConfig{}
-	for _, j := range joined {
+	for _, j := range publishable {
 		regions := []string(j.Regions)
 		if len(regions) == 0 {
 			regions = []string{s.defaultRegion}
@@ -389,7 +441,11 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 
 		out[j.AppName] = nats.BuildAppConfig(
 			j.DeploymentID,
-			j.Hash,
+			// Same Valid-guaranteed pattern as reconcileTenant: the
+			// orphan filter at the top of BuildFullSync excludes rows
+			// where Hash is SQL NULL, so by construction Hash.String
+			// is the populated hash.
+			j.Hash.String,
 			envMap,
 			allowlist,
 			maxMemoryMB,

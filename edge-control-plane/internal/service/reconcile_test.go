@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -65,19 +66,27 @@ func (f *fakeActiveRepo) ListByTenant(_ context.Context, tenantID string) ([]dom
 }
 
 // ListByTenantWithDeployment synthesizes the JOIN from the same
-// underlying maps. An active row whose deployment_id is missing from
-// `byDeploymentID` is dropped (mirrors the production INNER JOIN).
+// underlying maps. Mirrors the production LEFT JOIN: an active row
+// whose deployment_id is missing from `byDeploymentID` is returned
+// with Hash="" / nil Regions so the service layer can detect and
+// log the orphan instead of silently dropping it (the previous
+// INNER JOIN fake hid the broken-state behavior from tests).
 func (f *fakeActiveRepo) ListByTenantWithDeployment(_ context.Context, tenantID string) ([]repository.JoinedActiveDeployment, error) {
 	ads := f.byTenant[tenantID]
 	out := make([]repository.JoinedActiveDeployment, 0, len(ads))
 	for _, ad := range ads {
 		d, ok := f.byDeploymentID[ad.DeploymentID]
 		if !ok {
+			out = append(out, repository.JoinedActiveDeployment{
+				ActiveDeployment: ad,
+				Hash:             sql.NullString{Valid: false},
+				Regions:          nil,
+			})
 			continue
 		}
 		out = append(out, repository.JoinedActiveDeployment{
 			ActiveDeployment: ad,
-			Hash:             d.Hash,
+			Hash:             sql.NullString{String: d.Hash, Valid: true},
 			Regions:          d.Regions,
 		})
 	}
@@ -737,4 +746,89 @@ func TestBuildFullSync_BulkEnvFetch_OneCallNotN(t *testing.T) {
 	if len(got) != 1 || got[0] != "in_region" {
 		t.Errorf("ListByApps appNames=%v, want [in_region] (region filter must run before bulk fetch)", got)
 	}
+}
+
+// TestBuildFullSync_OrphanSkipped: an active row whose deployment_id
+// has no match (Hash="" from the LEFT JOIN) must NOT appear in the
+// returned payload, and the bulk-envs call must exclude it. The
+// orphan is operator-actionable state — the row is broken and must
+// be re-activated or deleted — not a reason to 500 the /sync fallback
+// or send a half-built AppConfig to a worker.
+func TestBuildFullSync_OrphanSkipped(t *testing.T) {
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a"}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {
+				{TenantID: "t_a", AppName: "happy", DeploymentID: "d_happy"},
+				{TenantID: "t_a", AppName: "orphan", DeploymentID: "d_missing"},
+			},
+		},
+		// d_missing is intentionally absent — the fake's LEFT JOIN
+		// simulates an orphan by returning the row with Hash="".
+		map[string]*domain.Deployment{
+			"d_happy": {ID: "d_happy", Hash: "h_happy", Regions: []string{"global"}},
+		},
+		nil, nil, nil)
+
+	got, err := svc.BuildFullSync(context.Background(), "t_a", "global")
+	if err != nil {
+		t.Fatalf("BuildFullSync: %v", err)
+	}
+	if _, ok := got["orphan"]; ok {
+		t.Errorf("orphan row must not appear in published AppConfig; got=%+v", got)
+	}
+	if _, ok := got["happy"]; !ok {
+		t.Errorf("happy app must appear; got=%+v", got)
+	}
+
+	envRepo := svc.appEnvRepo.(*fakeAppEnvRepo)
+	if len(envRepo.listByAppsCalls) != 1 {
+		t.Fatalf("ListByApps calls=%d, want 1", len(envRepo.listByAppsCalls))
+	}
+	appNames := envRepo.listByAppsCalls[0].appNames
+	if len(appNames) != 1 || appNames[0] != "happy" {
+		t.Errorf("ListByApps appNames=%v, want [happy] (orphan must not be in the bulk fetch)", appNames)
+	}
+}
+
+// TestReconcileTenant_OrphanSkipped mirrors TestBuildFullSync_OrphanSkipped
+// for the periodic publish path: an active row with Hash="" from the
+// LEFT JOIN is dropped from the publish call. The reconciler logs
+// the orphan so the operator can resolve the broken state.
+func TestReconcileTenant_OrphanSkipped(t *testing.T) {
+	pub := &capturingPublisher{}
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a"}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {
+				{TenantID: "t_a", AppName: "happy", DeploymentID: "d_happy"},
+				{TenantID: "t_a", AppName: "orphan", DeploymentID: "d_missing"},
+			},
+		},
+		map[string]*domain.Deployment{
+			"d_happy": {ID: "d_happy", Hash: "h_happy", Regions: []string{"global"}},
+		},
+		nil, nil, pub)
+
+	svc.reconcileTenant(context.Background(), "t_a", nil, "")
+
+	calls := pub.callsByRegion()
+	msg, ok := calls["global"]
+	if !ok {
+		t.Fatalf("expected a PublishFullSync call for region=global, got regions=%v", keys(calls))
+	}
+	if _, exists := msg.Apps["orphan"]; exists {
+		t.Errorf("orphan must not appear in published AppConfig; apps=%+v", msg.Apps)
+	}
+	if _, exists := msg.Apps["happy"]; !exists {
+		t.Errorf("happy must appear in published AppConfig; apps=%+v", msg.Apps)
+	}
+}
+
+func keys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
