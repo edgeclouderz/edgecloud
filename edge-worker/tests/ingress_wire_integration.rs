@@ -65,6 +65,8 @@ fn wire_test_config(
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     }
 }
 

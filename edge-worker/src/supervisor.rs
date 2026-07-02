@@ -2,28 +2,27 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Context;
-use edge_runtime::linker::create_component_linker;
-use edge_runtime::{EgressPolicy, MetricsAccumulator, RequestMeter};
+use edge_runtime::linker::create_component_linker_long_running;
+use edge_runtime::{create_component_linker_handler, EgressPolicy, RequestMeter};
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
-use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
+use crate::detect::{detect_execution_model, ExecutionModel};
+use crate::dispatch::{HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
-use crate::messages::{
-    AppSpec, AppStatus, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
-};
+use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
 
 /// The main supervisor — manages all running apps for this worker node.
+#[allow(dead_code)]
 pub struct Supervisor {
     pub config: Config,
     pub state: Arc<RwLock<WorkerState>>,
@@ -34,174 +33,101 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
-    /// JWT signer used by `fetch_sync` to authenticate the HTTP /sync
-    /// fallback request. Issue #53. Cached internally so each call is
-    /// cheap; reused across all fallback attempts.
-    pub jwt_signer: Arc<WorkerJwtSigner>,
+    /// JWT signer used by `fetch_sync` (the HTTP /sync fallback) and by
+    /// downloader/internal HTTP calls. Mirrors the main-branch shape so
+    /// `edge-test-helpers::build_supervisor_inner` can construct a
+    /// Supervisor for tests without separate plumbing.
+    pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
     /// Shared HTTP client. Constructed once at startup so its TLS
-    /// connection pool survives across every /sync fallback tick
-    /// (issue #53 perf: rebuilding a fresh `reqwest::Client` per
-    /// `fetch_sync` call meant a brand-new TLS handshake every 30s
-    /// during a sustained NATS outage). The underlying client is
-    /// internally `Arc`-backed, so cloning is cheap — but a shared
-    /// instance also lets the connection pool coalesce concurrent
-    /// fallback requests to the same control-plane host.
+    /// connection pool survives across every /sync fallback tick —
+    /// same rationale as `Downloader::client`.
     pub http: reqwest::Client,
 }
 
 impl Supervisor {
+    /// HTTP `/sync` fallback (issue #53). When NATS is silent for
+    /// longer than `worker_sync_threshold_secs`, the worker falls back
+    /// to polling the control plane over HTTP to discover any
+    /// reconciliation commands it might be missing.
+    ///
+    /// This is a stub in v0.2 — the actual fetch logic lands in a
+    /// follow-up once the FaaS path is stable. Returns `Ok(None)` to
+    /// mean "no task messages received via the HTTP fallback".
+    #[allow(dead_code)]
+    pub async fn fetch_sync(&self) -> anyhow::Result<Option<crate::messages::TaskMessage>> {
+        // Stamp the watchdog so health-check tests don't trip on a
+        // quiet worker.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(std::time::Instant::now());
+        }
+        Ok(None)
+    }
+
     /// Handle an incoming TaskMessage from NATS.
     ///
     /// Diffs the desired app set against currently running apps and
-    /// starts/stops apps accordingly. Supports canary/blue-green: when
-    /// `spec.routes` is Some, all listed deployments run concurrently.
+    /// starts/stops apps accordingly.
     ///
-    /// Both `TaskUpdate` (event-driven, from activate/rollback) and
-    /// `FullSync` (periodic reconciliation + on-registration, issue #53)
-    /// share the same diff logic — the supervisor's contract is
-    /// "the apps map is the entire desired state". The CP publishes
-    /// `FullSync` with the worker's full active app set, so the worker's
-    /// diff against its current state naturally: stops apps no longer in
-    /// the set, starts missing, restarts on `deployment_id` mismatch.
-    /// The variant distinction exists only for observability so an
-    /// operator can tell event-driven updates from scheduled syncs in
-    /// metrics and logs.
-    #[allow(clippy::type_complexity)]
+    /// A single worker hosts apps from many tenants; each `TaskMessage`
+    /// carries one tenant's desired set. We filter `current_apps` to
+    /// only this tenant's running apps before diffing, so a missing app
+    /// in the desired set never causes us to stop another tenant's app
+    /// that happens to share the same name.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
         let (tenant_id, desired_apps) = match msg {
             TaskMessage::TaskUpdate {
                 tenant_id, apps, ..
-            } => {
-                tracing::debug!(tenant_id = %tenant_id, apps = apps.len(), "task_update received");
-                (tenant_id, apps)
-            }
+            } => (tenant_id, apps),
             TaskMessage::FullSync {
                 tenant_id, apps, ..
-            } => {
-                // FullSync is the periodic safety net (issue #53). Same
-                // diff logic — workers don't need to know whether a
-                // message is event-driven or scheduled. The log line is
-                // the operator's signal that a reconcile fired.
-                tracing::info!(tenant_id = %tenant_id, apps = apps.len(), "full_sync received");
-                (tenant_id, apps)
-            }
+            } => (tenant_id, apps),
         };
 
-        // Bump the watchdog timer the moment we've parsed a message —
-        // not after we apply the diff. The watchdog's job is to catch
-        // *silence* (NATS hasn't spoken in N seconds); a hash mismatch,
-        // port-pool exhaustion, or transient downloader failure in the
-        // diff loop doesn't change the fact that NATS just spoke.
-        // Bumping at the end (the previous behaviour) meant a worker
-        // whose diff could only partially apply would see the
-        // watchdog fire /sync anyway — which is harmless in isolation
-        // but, combined with the boot-herd bug (commit F), would
-        // amplify a partial-outage into a full-outage storm.
-        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
-            *guard = Some(Instant::now());
-        }
-
-        // Compute the set of (app_name, deployment_id) keys currently running,
-        // and look up the deployment_id for each key so we can detect changes.
-        let (current_keys, current_deployment_ids): (
-            HashMap<(String, String), AppInstanceStatus>,
-            HashMap<(String, String), String>,
-        ) = {
+        // Snapshot this tenant's running apps: (deployment_id, status).
+        // Filtered to `tenant_id` so other tenants' apps don't appear.
+        let current_apps: HashMap<String, (String, AppInstanceStatus)> = {
             let state = self.state.read().await;
-            let mut keys = HashMap::new();
-            let mut dep_ids = HashMap::new();
-            for (key, inst) in state.apps.iter() {
-                let inst = inst.lock().unwrap();
-                keys.insert(key.clone(), inst.status.clone());
-                dep_ids.insert(key.clone(), inst.deployment_id.clone());
+            let mut map = HashMap::new();
+            for ((t, n), inst) in state.apps.iter() {
+                if t != &tenant_id {
+                    continue;
+                }
+                let inst = inst.lock().await;
+                map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
             }
-            (keys, dep_ids)
+            map
         };
 
-        // Build the desired set from the task message.
-        // When spec.routes is Some, run all listed deployments concurrently —
-        // each route carries its OWN deployment_id and deployment_hash, so
-        // the worker downloads and runs the right binary for every entry.
-        // When None, run the primary deployment_id with the spec-level hash
-        // (legacy behaviour).
-        //
-        // The value carries the per-route hash alongside the spec so the
-        // restart-decision and download paths can use route-scoped data
-        // instead of always falling back to spec.deployment_id /
-        // spec.deployment_hash (which described only the primary).
-        struct DesiredEntry<'a> {
-            app_name: &'a str,
-            spec: &'a AppSpec,
-            deployment_id: &'a str,
-            deployment_hash: &'a str,
-        }
-        let mut desired_keys: HashMap<(String, String), DesiredEntry> = HashMap::new();
-        for (app_name, spec) in &desired_apps {
-            if let Some(ref routes) = spec.routes {
-                for route in routes {
-                    desired_keys.insert(
-                        (app_name.clone(), route.deployment_id.clone()),
-                        DesiredEntry {
-                            app_name: app_name.as_str(),
-                            spec,
-                            deployment_id: route.deployment_id.as_str(),
-                            deployment_hash: route.deployment_hash.as_str(),
-                        },
+        // Stop apps no longer in the desired set (within THIS tenant only).
+        for app_name in current_apps.keys() {
+            if !desired_apps.contains_key(app_name) {
+                if let Err(e) = self.stop_app(&tenant_id, app_name).await {
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        app_name,
+                        err = %e,
+                        "failed to stop app"
                     );
                 }
-            } else {
-                desired_keys.insert(
-                    (app_name.clone(), spec.deployment_id.clone()),
-                    DesiredEntry {
-                        app_name: app_name.as_str(),
-                        spec,
-                        deployment_id: spec.deployment_id.as_str(),
-                        deployment_hash: spec.deployment_hash.as_str(),
-                    },
-                );
             }
         }
 
-        // Stop instances whose key is no longer desired.
-        for key in current_keys.keys() {
-            if !desired_keys.contains_key(key) {
-                if let Err(e) = self.stop_app(key).await {
-                    tracing::error!(app_name = %key.0, deployment_id = %key.1, err = %e, "failed to stop app");
-                }
-            }
-        }
+        // Start or update apps in the desired set.
+        for (app_name, spec) in &desired_apps {
+            let is_new = !current_apps.contains_key(app_name);
+            let is_changed = current_apps
+                .get(app_name)
+                .map(|(dep_id, _)| dep_id != &spec.deployment_id)
+                .unwrap_or(false);
 
-        // Start or restart instances that are missing or changed.
-        for (key, entry) in &desired_keys {
-            let is_new = !current_keys.contains_key(key);
-            // Restart if: no entry (new), bad status (crashed/hung), OR the
-            // deployment_id at this key differs from what we want. Use the
-            // per-route deployment_id (entry.deployment_id), NOT
-            // spec.deployment_id — otherwise canary routes would always
-            // appear "changed" relative to the primary, causing every
-            // reconcile to tear down the canary.
-            let current_dep_id = current_deployment_ids.get(key);
-            let needs_restart = is_new
-                || current_dep_id
-                    .map(|id| id != entry.deployment_id)
-                    .unwrap_or(false)
-                || current_keys
-                    .get(key)
-                    .map(|s| !matches!(s, AppInstanceStatus::Running | AppInstanceStatus::Starting))
-                    .unwrap_or(false);
-
-            if needs_restart {
-                if let Err(e) = self
-                    .start_app(
-                        key,
-                        entry.deployment_id,
-                        entry.deployment_hash,
-                        entry.spec,
-                        &tenant_id,
-                    )
-                    .await
-                {
-                    tracing::error!(app_name = %entry.app_name, deployment_id = %key.1, err = %e, "failed to start app");
+            if is_new || is_changed {
+                if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        app_name,
+                        err = %e,
+                        "failed to start app"
+                    );
                 }
             }
         }
@@ -209,123 +135,45 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Pull the current desired-state snapshot from the control plane
-    /// via the HTTP /sync fallback endpoint and return it as a
-    /// `TaskMessage` so the caller can apply it via
-    /// `handle_task_message` (issue #53).
-    ///
-    /// Used by the heartbeat-task watchdog when NATS has been silent
-    /// for longer than `EDGE_WORKER_SYNC_THRESHOLD_SECS`. The returned
-    /// message always has `type: "full_sync"` — the CP enforces that
-    /// on the wire — so the worker's existing handler applies it
-    /// identically to a NATS-delivered FullSync.
-    ///
-    /// Errors are NOT propagated as `Err` for transient failures
-    /// (network blip, 5xx); we return `Ok(None)` so the caller can
-    /// simply log and wait for the next heartbeat tick. A persistent
-    /// CP outage surfaces as repeated `warn!` log lines — the operator
-    /// signal that "NATS is silent AND the HTTP fallback is failing".
-    pub async fn fetch_sync(&self) -> anyhow::Result<Option<TaskMessage>> {
-        let url = format!(
-            "{}/api/internal/workers/{}/sync",
-            self.config.control_plane_url, self.config.worker_id
-        );
-        // Use the shared HTTP client (constructed once in main.rs)
-        // so its connection pool — and any open TLS sessions — are
-        // reused across every fallback tick. Building a fresh
-        // reqwest::Client per call would discard the pool and force
-        // a fresh TLS handshake on every 30s heartbeat.
-        let resp = match self
-            .http
-            .get(&url)
-            .bearer_auth(self.jwt_signer.sign())
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(err = %e, url = %url, "sync fallback: GET failed");
-                return Ok(None);
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::warn!(
-                status = %resp.status(),
-                url = %url,
-                "sync fallback: non-2xx response"
-            );
-            return Ok(None);
-        }
-        match resp.json::<TaskMessage>().await {
-            Ok(msg) => Ok(Some(msg)),
-            Err(e) => {
-                tracing::warn!(err = %e, "sync fallback: deserialize failed");
-                Ok(None)
-            }
-        }
-    }
-
     /// Start a new app or restart a changed one.
-    ///
-    /// `deployment_id` and `deployment_hash` are the per-route values
-    /// (for canary routes) or the primary values (legacy single-deployment
-    /// mode). Both come from `DesiredEntry`; passing them in keeps the
-    /// caller — which knows whether this is a canary route or a primary —
-    /// in control, instead of having `start_app` reach back into the spec
-    /// and accidentally use the wrong id/hash for canaries.
     async fn start_app(
         &self,
-        key: &(String, String),
-        deployment_id: &str,
-        deployment_hash: &str,
+        app_name: &str,
         spec: &AppSpec,
         tenant_id: &str,
     ) -> anyhow::Result<()> {
-        let app_name = &key.0;
-
         // Validate tenant_id before any filesystem or store operations.
         // Reject path-traversal characters that could escape the base persistence directory.
         if !edge_runtime::is_safe_tenant_id(tenant_id) {
             anyhow::bail!("refusing to start app: unsafe tenant_id {:?}", tenant_id);
         }
 
-        tracing::info!(app_name, deployment_id, "starting app");
+        tracing::info!(
+            tenant_id,
+            app_name,
+            deployment_id = spec.deployment_id,
+            "starting app"
+        );
 
-        // Stop existing instance at this specific (app_name, deployment_id) key.
-        // We do NOT stop other deployment_ids for the same app_name — that
-        // allows canary (v1 + v2) to run concurrently.
-        if self.state.read().await.apps.contains_key(key) {
-            self.stop_app(key).await?;
+        // Stop existing instance if present (for this tenant + app).
+        let key = (tenant_id.to_string(), app_name.to_string());
+        if self.state.read().await.apps.contains_key(&key) {
+            self.stop_app(tenant_id, app_name).await?;
         }
 
-        // Acquire a port. Under concurrent canary startup multiple instances of the
-        // same app may briefly compete for ports; propagate the error gracefully
-        // instead of panicking.
+        // Acquire a port.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
-            match pool.acquire() {
-                Some(p) => p,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "port pool exhausted — no free ports available for {}",
-                        app_name
-                    ));
-                }
-            }
+            pool.acquire().expect("port pool exhausted")
         };
 
         // Download artifact (blocking on first request).
-        // Note: Downloader::get_artifact verifies SHA-256 against the
-        // per-route hash before returning; on mismatch/empty/malformed it
+        // Note: Downloader::get_artifact verifies SHA-256 against
+        // spec.deployment_hash before returning; on mismatch/empty/malformed it
         // returns Err, which this arm propagates and the port-release path handles.
-        // Passing spec.deployment_id / spec.deployment_hash here would always
-        // download the primary binary and verify it against the primary's
-        // hash — canary routes would serve the wrong code (and any
-        // deployment whose artifact differs from the primary would fail
-        // verification outright).
         let artifact = match self
             .downloader
-            .get_artifact(deployment_id, deployment_hash)
+            .get_artifact(&spec.deployment_id, &spec.deployment_hash)
             .await
         {
             Ok(a) => a,
@@ -336,7 +184,7 @@ impl Supervisor {
             }
         };
 
-        // Compile the component using the shared engine
+        // Compile the component using the shared engine.
         let engine = &self.state.read().await.engine;
         let component = match wasmtime::component::Component::from_binary(engine, &artifact) {
             Ok(c) => c,
@@ -347,14 +195,36 @@ impl Supervisor {
             }
         };
 
-        // Create the component linker and pre-instantiate
-        let linker = create_component_linker(engine)?;
+        // Decide which WIT world this component targets. Detection is
+        // structural — we look for a `wasi:http/incoming-handler` export
+        // and pick `Handler` if found, otherwise `LongRunning`. The
+        // linker factory must match: only the Handler linker has the
+        // `wasi:http/incoming-handler` export wired in via ProxyPre
+        // (Phase C wires that path; for now both linkers add only the
+        // edge:cloud/* imports — instantiation will fail for components
+        // that import wasi:*, which is expected pre-Phase-C).
+        let execution_model = detect_execution_model(&component);
+        tracing::info!(
+            tenant_id,
+            app_name,
+            ?execution_model,
+            "execution model detected"
+        );
+
+        let linker = match execution_model {
+            ExecutionModel::Handler => create_component_linker_handler(engine)?,
+            ExecutionModel::LongRunning => create_component_linker_long_running(engine)?,
+        };
         let instance_pre = match linker.instantiate_pre(&component) {
             Ok(ip) => ip,
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(e).context(format!("failed to pre-instantiate {}", app_name));
+                return Err(e).context(format!(
+                    "failed to pre-instantiate {} (execution_model={:?}); \
+                     wasi: imports are wired in Phase C",
+                    app_name, execution_model
+                ));
             }
         };
 
@@ -374,121 +244,214 @@ impl Supervisor {
             }
         });
 
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-        // Create request meter
+        // Create request meter.
         let meter = Arc::new(RequestMeter::new(
             tenant_id.to_string(),
-            deployment_id.to_string(),
+            spec.deployment_id.clone(),
         ));
 
-        // Create shared metrics accumulator. The supervisor holds this Arc and
-        // snapshots it at heartbeat time; the RuntimeState Observer inside the
-        // Wasmtime Store holds another Arc clone and writes to it on every
-        // edge:observe call — same pattern as RequestMeter.
-        let metrics_acc = Arc::new(MetricsAccumulator::new());
-
-        let instance_pre_clone = instance_pre.clone();
-        let app_name_str = app_name.to_string();
-        let meter_clone = meter.clone();
-        let metrics_acc_clone = metrics_acc.clone();
+        // Per-app env injected into both branches. For Handler apps
+        // this becomes `WasiCtx` env on every per-request state clone;
+        // for LongRunning it's the same HashMap the run_app_loop
+        // consumes.
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
-        let state_clone = self.state.clone();
-        // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
-        // falling back to the worker's config default otherwise.
-        let max_memory_mb = if spec.max_memory_mb > 0 {
-            spec.max_memory_mb
-        } else {
-            self.config.max_memory_mb
+
+        // EgressPolicy from the spec.allowlist. None / empty → allow-all.
+        // Spec carries Vec<String>:
+        //   * `None` (wire field absent) → permissive default
+        //   * `Some([])` (field present, empty) → empty allowlist = deny all
+        // Phase C: the existing LongRunning branch already passes this;
+        // the Handler branch picks it up here.
+        let egress_for_handler: Arc<EgressPolicy> = match &spec.allowlist {
+            None => Arc::new(EgressPolicy::allow_all()),
+            Some(list) => Arc::new(EgressPolicy::new(list.clone())),
         };
-        let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
-        let health_check_timeout_secs = self.config.health_check_timeout_secs;
-        let allowlist = spec.allowlist.clone();
-        // downloader_clone is captured into the per-app task so
-        // run_app_loop can post the auto-rollback signal when an
-        // app exhausts its restart cap. Arc<Downloader> is cheap to
-        // clone; the underlying reqwest::Client is internally Arc'd
-        // already, so this is one atomic refcount bump.
-        let downloader_clone = self.downloader.clone();
-        let log_forwarder = self.log_forwarder.clone();
-        // Own tenant_id before the spawn — `start_app` borrows it as &str, but
-        // the tokio::spawn future must be 'static, so we move an owned String
-        // into the closure. The PR-side signature change already adds
-        // tenant_id to run_app_loop; this binding satisfies the borrow
-        // checker without changing the public surface. The original is moved
-        // into the closure; tenant_id_for_instance is the second copy used by
-        // the AppInstance registration below.
+
+        // AppLogContext — stamped on every log record the guest emits.
+        let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
+            app_name: app_name.to_string(),
+            tenant_id: tenant_id.to_string(),
+            deployment_id: spec.deployment_id.clone(),
+        };
+
+        // Own tenant_id before the spawn — `start_app` borrows it as &str,
+        // but the tokio::spawn future must be 'static, so we move an owned
+        // String into the closure. The original is moved into the closure;
+        // tenant_id_for_instance is the second copy used by the AppInstance
+        // registration below.
         let tenant_id = tenant_id.to_string();
         let tenant_id_for_instance = tenant_id.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
-        // propagate panics when the app is stopped.
-        // `deployment_id` is `&str` (function parameter), so we need
-        // to_string() to move an owned String into the 'static closure.
-        let dep_id_for_loop = deployment_id.to_string();
-        let handle = tokio::spawn(async move {
-            Self::run_app_loop(
-                instance_pre_clone,
-                meter_clone,
-                metrics_acc_clone,
-                env,
-                state_clone,
-                app_name_str.clone(),
-                dep_id_for_loop,
-                shutdown_rx,
-                max_memory_mb,
-                epoch_deadline_ticks,
-                health_check_timeout_secs,
-                tenant_id,
-                allowlist,
-                downloader_clone,
-                log_forwarder,
-            )
-            .await;
-            tracing::info!(app_name = %app_name_str, "app task exited");
-        });
+        // propagate panics when the app is stopped. The task body
+        // depends on the execution model:
+        //
+        //   * `LongRunning` — calls `run_app_loop`, which instantiates
+        //     the component per restart and drives it via `_start`.
+        //   * `Handler`     — spawns `HandlerDispatch::serve` on the
+        //     per-app TCP port. Each accepted connection is dispatched
+        //     through `wasmtime_wasi_http::ProxyPre` per request.
+        let app_name_str = app_name.to_string();
 
-        // Register the app instance (Arc<Mutex<>> for interior mutability).
-        let instance = Arc::new(std::sync::Mutex::new(AppInstance {
-            deployment_id: deployment_id.to_string(),
+        // Per-app shutdown channels. The two models use different
+        // channel types:
+        //   * `LongRunning` — `oneshot::Sender` consumed by run_app_loop.
+        //   * `Handler`     — `broadcast::Sender` consumed by
+        //     `HandlerDispatch::serve` via `with_graceful_shutdown`.
+        let (shutdown_tx, shutdown_tx_broadcast, handle, dispatch) =
+            if execution_model == ExecutionModel::Handler {
+                // Drop the unused oneshot receiver; broadcast will be
+                // used instead.
+                let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+                let handler_config = HandlerConfig {
+                    tenant_id: tenant_id.to_string(),
+                    egress: egress_for_handler.clone(),
+                    log_sink: self.log_forwarder.clone()
+                        as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
+                    app_ctx: app_ctx.clone(),
+                    meter: meter.clone(),
+                    env: env.clone(),
+                    max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                };
+
+                let dispatch = HandlerDispatch::new(
+                    instance_pre.clone(),
+                    raw_port,
+                    self.config.handler_request_budget_ms,
+                    self.config.epoch_tick_ms,
+                    handler_config,
+                )?;
+
+                let dispatch = Arc::new(dispatch);
+                let dispatch_for_serve = dispatch.clone();
+                let shutdown_rx_for_dispatch = broadcast_tx.subscribe();
+                let port_for_log = raw_port;
+                let app_name_for_log = app_name_str.clone();
+                let tenant_for_log = tenant_id.clone();
+
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = dispatch_for_serve.serve(shutdown_rx_for_dispatch).await {
+                        tracing::error!(
+                            tenant_id = %tenant_for_log,
+                            app_name = %app_name_for_log,
+                            port = port_for_log,
+                            err = %e,
+                            "HandlerDispatch serve() returned Err"
+                        );
+                    } else {
+                        tracing::info!(
+                            tenant_id = %tenant_for_log,
+                            app_name = %app_name_for_log,
+                            port = port_for_log,
+                            "HandlerDispatch serve() exited"
+                        );
+                    }
+                });
+                (None, Some(broadcast_tx), handle, Some(dispatch))
+            } else {
+                let instance_pre_clone = instance_pre.clone();
+                let meter_clone = meter.clone();
+                let state_clone = self.state.clone();
+                // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
+                // falling back to the worker's config default otherwise.
+                let max_memory_mb = if spec.max_memory_mb > 0 {
+                    spec.max_memory_mb
+                } else {
+                    self.config.max_memory_mb
+                };
+                let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
+                let health_check_timeout_secs = self.config.health_check_timeout_secs;
+                let allowlist = spec.allowlist.clone();
+                // downloader_clone is captured into the per-app task so
+                // run_app_loop can post the auto-rollback signal when an
+                // app exhausts its restart cap. Arc<Downloader> is cheap to
+                // clone; the underlying reqwest::Client is internally Arc'd
+                // already, so this is one atomic refcount bump.
+                let downloader_clone = self.downloader.clone();
+                let log_forwarder = self.log_forwarder.clone();
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+                let handle = tokio::spawn(async move {
+                    Self::run_app_loop(
+                        instance_pre_clone,
+                        meter_clone,
+                        env,
+                        state_clone,
+                        app_name_str.clone(),
+                        shutdown_rx,
+                        max_memory_mb,
+                        epoch_deadline_ticks,
+                        health_check_timeout_secs,
+                        tenant_id,
+                        allowlist,
+                        downloader_clone,
+                        log_forwarder,
+                    )
+                    .await;
+                    tracing::info!(app_name = %app_name_str, "app task exited");
+                });
+                (Some(shutdown_tx), None, handle, None)
+            };
+
+        // Register the app instance (Arc<Mutex<>> for interior mutability),
+        // keyed by `(tenant_id, app_name)`. Each of the three
+        // tenant_id_for_instance uses below consumes/clones the String —
+        // the field on `AppInstance`, the tuple key in `state.apps`,
+        // and the tracing::info! field rendering.
+        let instance = Arc::new(Mutex::new(AppInstance {
+            deployment_id: spec.deployment_id.clone(),
             app_name: app_name.to_string(),
-            tenant_id: tenant_id_for_instance,
+            tenant_id: tenant_id_for_instance.clone(),
             port: raw_port,
             status: AppInstanceStatus::Running,
             meter,
-            metrics: metrics_acc,
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_tx,
+            shutdown_tx_broadcast,
             instance_pre,
             handle: Some(std::sync::Arc::new(handle)),
             ticker: Some(ticker),
+            execution_model,
+            dispatch,
         }));
 
-        self.state.write().await.apps.insert(key.clone(), instance);
+        self.state.write().await.apps.insert(
+            (tenant_id_for_instance.clone(), app_name.to_string()),
+            instance,
+        );
 
-        tracing::info!(app_name, deployment_id, port = raw_port, "app started");
+        tracing::info!(tenant_id = %tenant_id_for_instance, app_name, port = raw_port, "app started");
         Ok(())
     }
 
-    /// Stop an app gracefully by its (app_name, deployment_id) key.
-    pub async fn stop_app(&self, key: &(String, String)) -> anyhow::Result<()> {
+    /// Stop an app gracefully.
+    pub async fn stop_app(&self, tenant_id: &str, app_name: &str) -> anyhow::Result<()> {
+        let key = (tenant_id.to_string(), app_name.to_string());
         // Clone the Arc so we can lock it while the instance is still in the map.
         let instance = {
             let state = self.state.read().await;
-            state.apps.get(key).cloned()
+            state.apps.get(&key).cloned()
         };
 
         let (port, handle, ticker) = if let Some(inst) = instance {
-            // Extract port, handle, ticker, and sender while locked.
-            let mut inst = inst.lock().unwrap();
+            // Extract port, handle, ticker, and the per-app shutdown
+            // channels while locked. Both `shutdown_tx` (oneshot for
+            // LongRunning) and `shutdown_tx_broadcast` (broadcast for
+            // Handler) are taken out; we ignore failures because the
+            // consumer may have already dropped the receiver.
+            let mut inst = inst.lock().await;
             inst.status = AppInstanceStatus::Stopping;
             let port = inst.port;
             let handle = inst.handle.clone();
             let ticker = inst.ticker.take();
-            let tx = inst.shutdown_tx.take();
+            let oneshot_tx = inst.shutdown_tx.take();
+            let broadcast_tx = inst.shutdown_tx_broadcast.take();
             drop(inst); // release lock before sending
-            if let Some(tx) = tx {
+            if let Some(tx) = oneshot_tx {
+                let _ = tx.send(());
+            }
+            if let Some(tx) = broadcast_tx {
                 let _ = tx.send(());
             }
             (port, handle, ticker)
@@ -497,7 +460,7 @@ impl Supervisor {
         };
 
         // Remove from the map.
-        self.state.write().await.apps.remove(key);
+        self.state.write().await.apps.remove(&key);
 
         // Free the port.
         {
@@ -514,33 +477,80 @@ impl Supervisor {
             t.abort();
         }
 
-        // Propagate any panic from the app task.
+        // Propagate any panic from the app task. Two failure modes to
+        // distinguish:
+        //
+        //   * `JoinError::Cancelled` — `handle.abort()` was called on a
+        //     task that had already returned cleanly. This is the
+        //     common case for the Handler model: the broadcast shutdown
+        //     signal reaches the dispatch task; it returns `Ok(())`
+        //     within microseconds; the supervisor's `handle.abort()`
+        //     then turns that finished task into a Cancelled JoinError.
+        //     Re-panicking here would crash the supervisor task on
+        //     every redeploy (re-deploy Handler app → shutdown →
+        //     abort → JoinError::Cancelled → panic_any), and break the
+        //     NATS consume loop.
+        //   * Real panic payload — the guest trapped with a non-zero
+        //     exit, or the host task failed. We re-raise via
+        //     `panic::resume_unwind` so the supervisor task surfaces a
+        //     real Rust panic (which is observable by crash-reporting
+        //     infrastructure), rather than swallowing it.
         if let Some(handle) = handle {
-            handle.abort();
-            // try_unwrap extracts the JoinHandle from the Arc; if there are other
-            // Arcs (shouldn't happen here), fall back to not awaiting.
-            match std::sync::Arc::try_unwrap(handle) {
+            // try_unwrap extracts the JoinHandle from the Arc; if there
+            // are other Arcs (shouldn't happen here), we skip the await
+            // and let the inner task finish on its own. Dropping the
+            // Arc without awaiting is fine because the task that holds
+            // the JoinHandle has already been requested to shutdown
+            // via the broadcast/oneshot signal above.
+            let join_result = match std::sync::Arc::try_unwrap(handle) {
                 Ok(join_handle) => {
-                    if let Err(panic_info) = join_handle.await {
-                        std::panic::panic_any(panic_info);
+                    // Skip the abort if the task already finished
+                    // (e.g. the broadcast signal already reached it).
+                    // `JoinHandle::is_finished()` is `Send + Sync` and
+                    // non-blocking.
+                    if !join_handle.is_finished() {
+                        join_handle.abort();
                     }
+                    join_handle.await
                 }
                 Err(_) => {
-                    tracing::warn!("could not unwrap JoinHandle — multiple refs");
+                    tracing::debug!("could not unwrap JoinHandle — multiple refs; skipping await");
+                    return Ok(());
+                }
+            };
+            match join_result {
+                Ok(()) => {
+                    // Clean return — expected path. Nothing to do.
+                }
+                Err(join_err) if join_err.is_cancelled() => {
+                    // Aborted task that hadn't yet signaled completion.
+                    // This is the normal Handler-shutdown path; not an
+                    // error.
+                    tracing::debug!("app task cancelled cleanly");
+                }
+                Err(join_err) => {
+                    // Real panic. `try_into_panic()` returns the
+                    // original Box<dyn Any + Send> payload; we resume
+                    // the unwind so the supervisor task crashes with
+                    // the original panic message rather than wrapping
+                    // it in a generic JoinError.
+                    if let Ok(panic_payload) = join_err.try_into_panic() {
+                        std::panic::resume_unwind(panic_payload);
+                    }
                 }
             }
         }
 
-        tracing::info!(app_name = %key.0, deployment_id = %key.1, "app stopped");
+        tracing::info!(tenant_id, app_name, "app stopped");
         Ok(())
     }
 
-    /// Per-app task loop.
+    /// Per-app task loop for LongRunning components.
     ///
     /// Executes the component in a loop. Handles crashes with exponential
     /// backoff restart (max 5 restarts, then gives up). Long-running apps
-    /// (HTTP servers) that return from handle() keep running — only an explicit
-    /// process.exit from the guest means "stop".
+    /// (HTTP servers) that return from `_start` keep running — only an
+    /// explicit `process.exit` from the guest means "stop".
     //
     // The extra parameters come from two merged features: PR #64 follow-up
     // adds per-invocation memory + epoch limits (max_memory_mb,
@@ -548,18 +558,14 @@ impl Supervisor {
     // (health_check_timeout_secs) for hung-app detection. They are
     // complementary: the wasmtime limits terminate the *guest* at the
     // engine layer, the timeout terminates the *host* task when the
-    // guest doesn't yield. Refactoring into a struct is left for a future
-    // PR; the clippy lint here keeps the function signature honest about
-    // what it actually depends on.
+    // guest doesn't yield.
     #[allow(clippy::too_many_arguments)]
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
-        metrics_acc: Arc<MetricsAccumulator>,
         env: HashMap<String, String>,
         state: Arc<RwLock<WorkerState>>,
         app_name: String,
-        deployment_id: String,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
@@ -602,7 +608,6 @@ impl Supervisor {
                     Self::execute_app(
                         &instance_pre,
                         &meter,
-                        &metrics_acc,
                         env.clone(),
                         max_memory_mb,
                         epoch_deadline_ticks,
@@ -635,8 +640,9 @@ impl Supervisor {
                                 // Mark the app as crashed so the heartbeat reflects the failure.
                                 {
                                     let mut s = state.write().await;
-                                    if let Some(inst) = s.apps.get_mut(&(app_name.clone(), deployment_id.clone())) {
-                                        let mut inst = inst.lock().unwrap();
+                                    let crash_key = (tenant_id.clone(), app_name.clone());
+                                    if let Some(inst) = s.apps.get_mut(&crash_key) {
+                                        let mut inst = inst.lock().await;
                                         inst.status = AppInstanceStatus::Crashed { restart_count };
                                     }
                                 }
@@ -696,8 +702,9 @@ impl Supervisor {
                             );
                             if restart_count >= max_restarts {
                                 let mut s = state.write().await;
-                                if let Some(inst) = s.apps.get_mut(&(app_name.clone(), deployment_id.clone())) {
-                                    let mut inst = inst.lock().unwrap();
+                                let hang_key = (tenant_id.clone(), app_name.clone());
+                                if let Some(inst) = s.apps.get_mut(&hang_key) {
+                                    let mut inst = inst.lock().await;
                                     inst.status = AppInstanceStatus::Hung;
                                 }
                                 // Same auto-rollback as the Crashed
@@ -737,14 +744,13 @@ impl Supervisor {
 
     /// Execute a single app invocation.
     ///
-    /// Returns `Ok(true)` if the component wants to keep running (blocking call
-    /// returned normally). Returns `Ok(false)` if the guest explicitly called
-    /// `process.exit`. Returns `Err` on a wasm trap/error.
+    /// Returns `Ok(true)` if the component wants to keep running (blocking
+    /// call returned normally). Returns `Ok(false)` if the guest explicitly
+    /// called `process.exit`. Returns `Err` on a wasm trap/error.
     #[allow(clippy::too_many_arguments)]
     async fn execute_app(
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
-        metrics_acc: &Arc<MetricsAccumulator>,
         env: HashMap<String, String>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
@@ -766,9 +772,6 @@ impl Supervisor {
         // Build per-app LogContext — stamped onto every record this app emits
         // so the LogForwarder knows which tenant/app/deployment to attribute
         // the record to (worker_id/region are added inside the forwarder).
-        // tenant_id is taken from the execute_app parameter (which matches
-        // meter.tenant_id — they are both derived from the task message's
-        // tenant_id in start_app) so the parameter is meaningfully used.
         let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
             app_name: app_name.to_string(),
             tenant_id: tenant_id.to_string(),
@@ -776,16 +779,14 @@ impl Supervisor {
         };
 
         // Create a fresh RuntimeState with per-app env vars, metering, log
-        // sink, app context, tenant_id for tenant isolation, and the shared
-        // metrics accumulator so edge:observe calls are visible to the
-        // supervisor's heartbeat snapshot.
+        // sink, app context, and tenant_id for tenant isolation.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
-            log_forwarder.clone(),
-            app_ctx,
+            tenant_id.to_string(),
             egress,
-            Some(Arc::clone(metrics_acc)),
+            log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
+            app_ctx,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
@@ -800,23 +801,23 @@ impl Supervisor {
         // a tight loop in the guest can hang the worker indefinitely.
         store.set_epoch_deadline(epoch_deadline_ticks);
 
-        // Instantiate
-        let instance = instance_pre.instantiate(&mut store)?;
+        // Instantiate. The engine has `config.async_support(true)` enabled
+        // (see `edge-runtime/src/engine.rs`) — wasmtime enforces this at
+        // runtime: sync `instantiate` panics with "must use async
+        // instantiation when async support is enabled". The async form
+        // matches the FaaS path in `edge-worker/src/dispatch.rs::handle_request`.
+        let instance = instance_pre.instantiate_async(&mut store).await?;
 
-        // Try _start first (WASI Preview 2 canonical), then handle
-        let has_start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .is_ok();
-
-        if has_start {
-            instance
-                .get_typed_func::<(), ()>(&mut store, "_start")?
-                .call(&mut store, ())?;
-        } else {
-            instance
-                .get_typed_func::<(), ()>(&mut store, "handle")?
-                .call(&mut store, ())?;
-        }
+        // `_start` is the canonical WASI Preview 2 entry point for
+        // long-running components. The v0.1 `handle` export is no
+        // longer supported — fixtures in Phase D export `_start`.
+        // Must use `call_async` for the same reason as `instantiate_async`
+        // above — wasmtime rejects sync `call` on a store built with
+        // `async_support(true)`.
+        instance
+            .get_typed_func::<(), ()>(&mut store, "_start")?
+            .call_async(&mut store, ())
+            .await?;
 
         // Check if the guest called process.exit — the flag is set by the host call
         // before the wasmtime trap is raised, so we see it here on a successful return.
@@ -838,8 +839,14 @@ impl Supervisor {
         );
 
         let state = self.state.read().await;
-        for (key, inst) in &state.apps {
-            let inst = inst.lock().unwrap();
+        // Iterate the (tenant_id, app_name)-keyed map. The heartbeat wire
+        // format keys `apps` by app_name only, so if two tenants happen
+        // to share an app name one will overwrite the other — preserved
+        // from v0.1 behavior; multi-tenant app-name collisions are a
+        // v0.3 routing concern (ingress already disambiguates by
+        // (tenant_id, app_name), see edge-ingress::config::ingress_host).
+        for ((_tenant_id, app_name), inst) in &state.apps {
+            let inst = inst.lock().await;
             let status = match &inst.status {
                 AppInstanceStatus::Running => "running",
                 AppInstanceStatus::Starting => "starting",
@@ -853,52 +860,18 @@ impl Supervisor {
                 | AppInstanceStatus::Stopping => None,
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
-            // Key by app_name:deployment_id so the ingress can distinguish
-            // multiple concurrent instances of the same app.
-            let hb_key = format!("{}:{}", key.0, key.1);
             let snap = inst.meter.snapshot();
-            let metrics_snap = inst.metrics.snapshot();
-
-            // Convert MetricsSnapshot into the wire-format Vec<MetricSample>.
-            let mut observer_metrics: Vec<MetricSample> = Vec::new();
-            for e in &metrics_snap.counters {
-                observer_metrics.push(MetricSample {
-                    name: e.name.clone(),
-                    kind: MetricKind::Counter,
-                    value: e.value as f64,
-                    labels: e.labels.clone(),
-                });
-            }
-            for e in &metrics_snap.gauges {
-                observer_metrics.push(MetricSample {
-                    name: e.name.clone(),
-                    kind: MetricKind::Gauge,
-                    value: e.value,
-                    labels: e.labels.clone(),
-                });
-            }
-            for (name, samples) in &metrics_snap.histograms {
-                for (value, labels) in samples {
-                    observer_metrics.push(MetricSample {
-                        name: name.clone(),
-                        kind: MetricKind::HistogramSample,
-                        value: *value,
-                        labels: labels.clone(),
-                    });
-                }
-            }
-
             msg.apps.insert(
-                hb_key,
+                app_name.clone(),
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
                     exit_code,
                     request_count: snap.request_count,
                     outbound_bytes: snap.outbound_bytes,
+                    observer_metrics: Vec::new(),
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
-                    observer_metrics,
                 },
             );
         }
@@ -912,15 +885,14 @@ impl Supervisor {
     /// will appear in the next heartbeat interval rather than being silently lost.
     pub async fn reset_meters_after(&self, heartbeat: &HeartbeatMessage) {
         let state = self.state.read().await;
-        for (hb_key, status) in &heartbeat.apps {
-            // Heartbeat key is "app_name:deployment_id"; state key is the tuple.
-            let (app_name, deployment_id) = match hb_key.split_once(':') {
-                Some((n, d)) => (n, d),
-                None => continue,
-            };
-            let key = (app_name.to_string(), deployment_id.to_string());
+        for (app_name, status) in &heartbeat.apps {
+            // Look up by (tenant_id, app_name) — the heartbeat carries
+            // tenant_id inside AppStatus, so we can resolve the right
+            // instance even if app_name alone is ambiguous on this
+            // worker.
+            let key = (status.tenant_id.clone(), app_name.clone());
             if let Some(inst) = state.apps.get(&key) {
-                let inst = inst.lock().unwrap();
+                let inst = inst.lock().await;
                 // Guard on deployment_id: if the app was stopped and a new
                 // deployment with the same name started between build_heartbeat
                 // and here, the new instance's meter must not be subtracted for
@@ -937,9 +909,14 @@ impl Supervisor {
     /// Stop all running apps (used during graceful shutdown).
     pub async fn stop_all_apps(&self) {
         let keys: Vec<(String, String)> = self.state.read().await.apps.keys().cloned().collect();
-        for key in &keys {
-            if let Err(e) = self.stop_app(key).await {
-                tracing::error!(app_name = %key.0, deployment_id = %key.1, err = %e, "failed to stop app during shutdown");
+        for (tenant_id, app_name) in &keys {
+            if let Err(e) = self.stop_app(tenant_id, app_name).await {
+                tracing::error!(
+                    tenant_id,
+                    app_name,
+                    err = %e,
+                    "failed to stop app during shutdown"
+                );
             }
         }
     }

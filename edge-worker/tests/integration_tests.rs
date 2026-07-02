@@ -80,7 +80,6 @@ fn test_config(
         control_plane_url,
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
         heartbeat_interval_secs: 30,
-        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
@@ -93,6 +92,9 @@ fn test_config(
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
+        worker_sync_threshold_secs: 60,
     }
 }
 
@@ -165,6 +167,8 @@ impl TestHarness {
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
             worker_jwt_issuer: "edgecloud".to_string(),
             worker_tenant_id: "t_test".to_string(),
+            handler_request_budget_ms: 1000,
+            handler_max_request_body_bytes: 10 * 1024 * 1024,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -200,12 +204,15 @@ async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<He
 }
 
 /// Helper: wait for an app to appear in state with Running status.
+///
+/// `state.apps` is keyed by `(tenant_id, app_name)` since Phase B; the
+/// helpers need both to construct the lookup key.
 async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
         for inst in state.apps.values() {
-            let inst = inst.lock().unwrap();
+            let inst = inst.lock().await;
             if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
                 return true;
             }
@@ -216,15 +223,17 @@ async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_s
 }
 
 /// Helper: wait for an app to disappear from state.
-async fn wait_for_app_gone(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
+async fn wait_for_app_gone(
+    supervisor: &Supervisor,
+    tenant_id: &str,
+    app_name: &str,
+    timeout_secs: u64,
+) -> bool {
+    let key = (tenant_id.to_string(), app_name.to_string());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
-        let gone = !state.apps.values().any(|inst| {
-            let inst = inst.lock().unwrap();
-            inst.app_name == app_name
-        });
-        if gone {
+        if !state.apps.contains_key(&key) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -281,14 +290,13 @@ async fn test_app_lifecycle() {
         "app should be Running within 10s (check NATS connectivity and component compilation)"
     );
 
-    // Step 3: heartbeat should include the app (keyed by app_name:deployment_id)
+    // Step 3: heartbeat should include the app
     let heartbeat = harness.supervisor.build_heartbeat().await;
-    let hb_key = "test-app:d_deploy_001";
     assert!(
-        heartbeat.apps.contains_key(hb_key),
-        "heartbeat should contain {hb_key}"
+        heartbeat.apps.contains_key("test-app"),
+        "heartbeat should contain test-app"
     );
-    let app_status = heartbeat.apps.get(hb_key).unwrap();
+    let app_status = heartbeat.apps.get("test-app").unwrap();
     assert_eq!(
         app_status.status, "running",
         "app status should be 'running'"
@@ -311,7 +319,7 @@ async fn test_app_lifecycle() {
         .expect("handle_task_message");
 
     // Step 5: app should be removed from state
-    let gone = wait_for_app_gone(&harness.supervisor, "test-app", 10).await;
+    let gone = wait_for_app_gone(&harness.supervisor, "t_test", "test-app", 10).await;
     assert!(gone, "app should be removed from state after stop");
 }
 
@@ -344,7 +352,6 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: default_cache_dir(),
         heartbeat_interval_secs: 30,
-        worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
@@ -356,6 +363,9 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
+        worker_sync_threshold_secs: 60,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -536,7 +546,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         assert!(
             !state
                 .apps
-                .contains_key(&("bad-hash-app".to_string(), "d_hash_bad".to_string())),
+                .contains_key(&("t_test".to_string(), "bad-hash-app".to_string())),
             "tampered-hash app must NOT be registered"
         );
     }
@@ -693,10 +703,9 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state.apps.contains_key(&(
-            "cache-dbl-bad-app".to_string(),
-            "d_cache_dbl_bad".to_string()
-        )),
+        !state
+            .apps
+            .contains_key(&("t_test".to_string(), "cache-dbl-bad-app".to_string())),
         "app must NOT be registered when both cache and fresh download fail verification"
     );
     drop(state);
@@ -747,7 +756,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     assert!(
         !state
             .apps
-            .contains_key(&("download-500-app".to_string(), "d_download_500".to_string())),
+            .contains_key(&("t_test".to_string(), "download-500-app".to_string())),
         "app must NOT be registered when the control plane returns 500"
     );
     drop(state);
@@ -810,6 +819,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -833,6 +844,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -879,7 +892,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
 
     // Wait for the message to be processed by exactly one worker.
     let started =
-        wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "pinned-app", 15).await;
+        wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "t_test", "pinned-app", 15)
+            .await;
     assert!(
         started.is_some(),
         "exactly one worker should have started pinned-app"
@@ -912,16 +926,18 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
 /// timeout.
 async fn wait_for_either_app_running(
     supervisors: &[Arc<Supervisor>],
+    tenant_id: &str,
     app_name: &str,
     timeout_secs: u64,
 ) -> Option<usize> {
+    let key = (tenant_id.to_string(), app_name.to_string());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         for (i, sup) in supervisors.iter().enumerate() {
             let state = sup.state.read().await;
-            for inst in state.apps.values() {
-                let inst = inst.lock().unwrap();
-                if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
+            if let Some(inst) = state.apps.get(&key) {
+                let inst = inst.lock().await;
+                if matches!(inst.status, AppInstanceStatus::Running) {
                     return Some(i);
                 }
             }
@@ -1011,10 +1027,10 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     let spec = AppSpec {
         deployment_id: "d_log_emit".to_string(),
         deployment_hash: test_component_hash(),
-        routes: None,
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-18T00:00:00Z".to_string(),
@@ -1622,6 +1638,8 @@ async fn build_supervisor_only_with_cp(
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: tenant_id.to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
 
     let guard = build_supervisor_with(config).await;

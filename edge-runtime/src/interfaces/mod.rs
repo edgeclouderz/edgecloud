@@ -41,23 +41,13 @@ pub fn is_safe_tenant_id(id: &str) -> bool {
     true
 }
 
-#[cfg(feature = "cache")]
+// The http_client / http_server / networking / dns modules were dropped in
+// v0.2 — components needing HTTP go through `wasi:http`, sockets through
+// `wasi:sockets`, and DNS through `wasi:sockets/ip-name-lookup`.
+// The async, host-provided `edge:cloud/*` interfaces retained here.
 pub mod cache;
-#[cfg(feature = "networking")]
-pub mod dns;
-#[cfg(feature = "http-client")]
-pub mod http_client;
-#[cfg(feature = "http-server")]
-pub mod http_server;
-#[cfg(feature = "kv-store")]
 pub mod kv_store;
-#[cfg(feature = "networking")]
-pub mod networking;
-#[cfg(feature = "observe")]
 pub mod observe;
-#[cfg(feature = "process")]
 pub mod process;
-#[cfg(feature = "scheduling")]
 pub mod scheduling;
-#[cfg(feature = "time")]
 pub mod time;

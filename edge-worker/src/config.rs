@@ -37,6 +37,7 @@ pub struct Config {
     /// the periodic CP-side reconcile (5min default) usually catches
     /// up first on a healthy cluster; short enough that an isolated
     /// worker doesn't sit stale for the full NATS retention window.
+    #[allow(dead_code)]
     pub worker_sync_threshold_secs: u64,
     pub port_cooldown_secs: u64,
     pub starting_port: u16,
@@ -75,6 +76,20 @@ pub struct Config {
     /// a worker is per-tenant in this design (whitepaper §9.3 calls for
     /// tenant-agnostic workers — file a follow-up to revisit).
     pub worker_tenant_id: String,
+    /// Per-request CPU budget for FaaS (Handler) components, in ms.
+    /// Default 1000ms (1s). The store's epoch deadline is set to
+    /// `handler_request_budget_ms / epoch_tick_ms` ticks before each
+    /// request is dispatched to the guest. Tune via `HANDLER_REQUEST_BUDGET_MS`.
+    pub handler_request_budget_ms: u64,
+    /// Per-request body-size cap for FaaS (Handler) components, in
+    /// bytes. The FaaS dispatcher rejects requests whose
+    /// `Content-Length` exceeds this with a 413 before invoking the
+    /// guest. Default 10 MiB (matches the v0.1 `edge:http-server`
+    /// `DEFAULT_MAX_BODY_SIZE`). Tune via
+    /// `HANDLER_MAX_REQUEST_BODY_BYTES`. `0` means "no cap" (NOT
+    /// RECOMMENDED in production — a misbehaving tenant can exhaust
+    /// worker memory with one POST).
+    pub handler_max_request_body_bytes: u64,
 }
 
 impl Config {
@@ -159,6 +174,11 @@ impl Config {
                 .unwrap_or_else(|_| "edgecloud".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
+            handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
+            handler_max_request_body_bytes: parse_env_u64(
+                "HANDLER_MAX_REQUEST_BODY_BYTES",
+                10 * 1024 * 1024,
+            )?,
         })
     }
 

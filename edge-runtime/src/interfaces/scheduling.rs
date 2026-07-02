@@ -513,4 +513,94 @@ mod tests {
         let drift = instant.saturating_duration_since(recovered);
         assert!(drift.as_secs() < 2);
     }
+
+    // ── Persistence ─────────────────────────────────────────────────────
+    //
+    // The scheduler's `flush_if_persistent` needs a tokio runtime handle
+    // on the current thread. In `#[test]` there is none, so we create a
+    // runtime and enter its context.
+
+    #[test]
+    fn test_scheduling_persistence_survives_drop() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("sched.json");
+
+        let id;
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let s = Scheduler::with_persistence(&path).expect("create");
+            id = s.schedule_once(60_000, b"payload".to_vec()).unwrap();
+        } // s drops, scheduler thread exits
+
+        // Rebuild — task should still be cancellable.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let s = Scheduler::with_persistence(&path).expect("reload");
+            s.cancel(&id)
+                .expect("persisted task should be cancellable after reload");
+        }
+    }
+
+    #[test]
+    fn test_scheduling_persistence_repeating_survives_drop() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("sched-repeating.json");
+
+        let id;
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let s = Scheduler::with_persistence(&path).expect("create");
+            id = s.schedule_repeating(10_000, b"payload".to_vec()).unwrap();
+        }
+
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let s = Scheduler::with_persistence(&path).expect("reload");
+            s.cancel(&id)
+                .expect("persisted repeating task should be cancellable");
+        }
+    }
+
+    #[test]
+    fn test_scheduling_persistence_empty_round_trips() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("sched-empty.json");
+
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let _s = Scheduler::with_persistence(&path).expect("create");
+        }
+
+        // Rebuild — should not crash and should accept new tasks.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let _guard = rt.enter();
+            let s = Scheduler::with_persistence(&path).expect("reload");
+            let id = s.schedule_once(60_000, b"new".to_vec()).unwrap();
+            s.cancel(&id).unwrap();
+        }
+    }
 }

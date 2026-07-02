@@ -25,9 +25,28 @@ futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
+# `ProxyPre<RuntimeState>` for Handler (FaaS) components — see
+# `src/dispatch.rs`. Pairs with `wasmtime-wasi-http` in edge-runtime.
+wasmtime-wasi-http = "25.0"
 sha2 = "0.10"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
+
+# HTTP server for Handler dispatch (C6). axum hosts the public listener;
+# each request drives one `ProxyPre` instance through the guest's
+# `wasi:http/incoming-handler` impl. tower-http supplies the body-cap
+# middleware (10 MB RequestBodyLimitLayer). http-body-util bridges
+# axum's Body and wasmtime-wasi-http's HyperOutgoingBody.
+axum = { version = "0.7", features = ["http1"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit"] }
+http-body-util = "0.1"
+# hyper is the underlying HTTP/1 server the wasmtime-wasi-http docs use.
+# wasmtime-wasi-http re-exports HyperOutgoingBody but the Request/Response
+# types come from hyper directly, so we need a direct dep. Pulled with
+# `client` because wasmtime-wasi-http's default_send_request depends on the
+# hyper client internals.
+hyper = { version = "1", features = ["server", "client", "http1"] }
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
@@ -76,3 +95,10 @@ edge-ingress = { path = "../edge-ingress" }
 [package.metadata.cargo-semver-checks.lints]
 constructible_struct_adds_field = "allow"
 enum_variant_added = "allow"
+
+# `cargo-udeps` flags `axum` as unused because the only call site
+# (`l8_long_running_self_host`) is a deferred fixture whose test
+# module is gated off the default `cargo test` build. It IS used
+# in the long-running fixtures, see the PR description.
+[package.metadata.cargo-udeps.ignore]
+normal = ["axum"]
