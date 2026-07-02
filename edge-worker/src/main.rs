@@ -139,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Create the supervisor
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
     let supervisor = Arc::new(Supervisor {
         config: config.clone(),
         state,
@@ -146,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
         port_pool,
         nats: nats.clone(),
         log_forwarder: log_forwarder.clone(),
+        jwt_signer: jwt_signer.clone(),
+        http,
     });
 
     let heartbeat_supervisor = supervisor.clone();

@@ -74,6 +74,10 @@ pub struct AppInstance {
 /// Shared worker state — protected by a tokio RwLock.
 /// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
 /// (e.g., status update to Crashed) without replacing the Arc entry.
+/// Shared worker state — protected by a tokio RwLock.
+/// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
+/// (e.g., status update to Crashed) without replacing the Arc entry.
+#[allow(dead_code)]
 pub struct WorkerState {
     /// Currently running app instances, keyed by `(tenant_id, app_name)`.
     ///
@@ -85,6 +89,12 @@ pub struct WorkerState {
     pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
+    /// Last time the worker's main loop observed a TaskMessage from
+    /// NATS. Used by the `/sync` HTTP fallback (issue #53) and by
+    /// health-check tests to distinguish "NATS is silent because
+    /// nothing has changed" from "NATS is silent because the worker
+    /// is wedged". Stamped on every `handle_task_message` entry.
+    pub last_task_received_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl WorkerState {
@@ -92,6 +102,7 @@ impl WorkerState {
         Self {
             apps: HashMap::new(),
             engine,
+            last_task_received_at: std::sync::Mutex::new(None),
         }
     }
 }

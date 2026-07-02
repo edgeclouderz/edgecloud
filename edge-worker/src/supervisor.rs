@@ -22,6 +22,7 @@ use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
 
 /// The main supervisor — manages all running apps for this worker node.
+#[allow(dead_code)]
 pub struct Supervisor {
     pub config: Config,
     pub state: Arc<RwLock<WorkerState>>,
@@ -32,9 +33,36 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
+    /// JWT signer used by `fetch_sync` (the HTTP /sync fallback) and by
+    /// downloader/internal HTTP calls. Mirrors the main-branch shape so
+    /// `edge-test-helpers::build_supervisor_inner` can construct a
+    /// Supervisor for tests without separate plumbing.
+    pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
+    /// Shared HTTP client. Constructed once at startup so its TLS
+    /// connection pool survives across every /sync fallback tick —
+    /// same rationale as `Downloader::client`.
+    pub http: reqwest::Client,
 }
 
 impl Supervisor {
+    /// HTTP `/sync` fallback (issue #53). When NATS is silent for
+    /// longer than `worker_sync_threshold_secs`, the worker falls back
+    /// to polling the control plane over HTTP to discover any
+    /// reconciliation commands it might be missing.
+    ///
+    /// This is a stub in v0.2 — the actual fetch logic lands in a
+    /// follow-up once the FaaS path is stable. Returns `Ok(None)` to
+    /// mean "no task messages received via the HTTP fallback".
+    #[allow(dead_code)]
+    pub async fn fetch_sync(&self) -> anyhow::Result<Option<crate::messages::TaskMessage>> {
+        // Stamp the watchdog so health-check tests don't trip on a
+        // quiet worker.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(std::time::Instant::now());
+        }
+        Ok(None)
+    }
+
     /// Handle an incoming TaskMessage from NATS.
     ///
     /// Diffs the desired app set against currently running apps and

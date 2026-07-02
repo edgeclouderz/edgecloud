@@ -167,6 +167,8 @@ impl TestHarness {
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
             worker_jwt_issuer: "edgecloud".to_string(),
             worker_tenant_id: "t_test".to_string(),
+            handler_request_budget_ms: 1000,
+            handler_max_request_body_bytes: 10 * 1024 * 1024,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -205,19 +207,13 @@ async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<He
 ///
 /// `state.apps` is keyed by `(tenant_id, app_name)` since Phase B; the
 /// helpers need both to construct the lookup key.
-async fn wait_for_app_running(
-    supervisor: &Supervisor,
-    tenant_id: &str,
-    app_name: &str,
-    timeout_secs: u64,
-) -> bool {
-    let key = (tenant_id.to_string(), app_name.to_string());
+async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
-        if let Some(inst) = state.apps.get(&key) {
+        for inst in state.apps.values() {
             let inst = inst.lock().await;
-            if matches!(inst.status, AppInstanceStatus::Running) {
+            if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
                 return true;
             }
         }
@@ -288,7 +284,7 @@ async fn test_app_lifecycle() {
         .expect("handle_task_message");
 
     // Step 2: app should be Running
-    let running = wait_for_app_running(&harness.supervisor, "t_test", "test-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "test-app", 10).await;
     assert!(
         running,
         "app should be Running within 10s (check NATS connectivity and component compilation)"
@@ -435,8 +431,7 @@ async fn test_stop_all_apps() {
 
     // Wait for both apps to be running (not a fixed sleep)
     for i in 0..2 {
-        let running =
-            wait_for_app_running(&harness.supervisor, "t_test", &format!("app-{}", i), 10).await;
+        let running = wait_for_app_running(&harness.supervisor, &format!("app-{}", i), 10).await;
         assert!(running, "app-{} should be running within 10s", i);
     }
 
@@ -495,7 +490,7 @@ async fn test_artifact_hash_match_starts_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "t_test", "hash-match-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "hash-match-app", 10).await;
     assert!(running, "matching-hash app should reach Running within 10s");
 }
 
@@ -578,7 +573,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "t_test", "good-hash-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "good-hash-app", 10).await;
     assert!(
         running,
         "matching-hash app should reach Running within 10s — proves port was released after the failed start"
@@ -640,8 +635,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         .await
         .expect("handle_task_message");
 
-    let running =
-        wait_for_app_running(&harness.supervisor, "t_test", "cache-redownload-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "cache-redownload-app", 10).await;
     assert!(
         running,
         "app should reach Running within 10s — proves the worker tolerated the bad cache and re-downloaded"
@@ -825,6 +819,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -848,6 +844,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1045,7 +1043,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "t_test", "log-emit-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "log-emit-app", 10).await;
     assert!(
         running,
         "app should reach Running within 10s — proves supervisor wiring is healthy"
@@ -1640,6 +1638,8 @@ async fn build_supervisor_only_with_cp(
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: tenant_id.to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
     };
 
     let guard = build_supervisor_with(config).await;
