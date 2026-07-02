@@ -1,5 +1,4 @@
 //! Phase E — L1–L10 integration tests.
-#![allow(clippy::needless_borrows_for_generic_args)]
 //!
 //! These tests exercise the end-to-end FaaS dispatch path:
 //!
@@ -1044,7 +1043,7 @@ async fn l20_kv_store_batch_ops() {
 
     // set-many
     let resp = cl
-        .get(&b("/kv/set-many?keys=x,y,z&vals=1,2,3"))
+        .get(b("/kv/set-many?keys=x,y,z&vals=1,2,3"))
         .send()
         .await
         .unwrap();
@@ -1127,7 +1126,7 @@ async fn l23_cache_batch_ops() {
         .unwrap();
 
     let resp = cl
-        .get(&b("/cache/get-many?keys=a,b,c"))
+        .get(b("/cache/get-many?keys=a,b,c"))
         .send()
         .await
         .unwrap();
@@ -1139,7 +1138,7 @@ async fn l23_cache_batch_ops() {
 
     cl.get(b("/cache/del-many?keys=a,b")).send().await.unwrap();
     let resp = cl
-        .get(&b("/cache/get-many?keys=a,b,c"))
+        .get(b("/cache/get-many?keys=a,b,c"))
         .send()
         .await
         .unwrap();
@@ -1161,21 +1160,21 @@ async fn l24_observe_counter_gauge_histogram() {
 
     // These are fire-and-forget — we just assert they don't error.
     let resp = cl
-        .get(&b("/observe/counter?name=hits&val=3"))
+        .get(b("/observe/counter?name=hits&val=3"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = cl
-        .get(&b("/observe/gauge?name=temp&val=36.5"))
+        .get(b("/observe/gauge?name=temp&val=36.5"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = cl
-        .get(&b("/observe/histogram?name=latency&val=42.0"))
+        .get(b("/observe/histogram?name=latency&val=42.0"))
         .send()
         .await
         .unwrap();
@@ -1217,11 +1216,8 @@ async fn l26_scheduling_repeat_and_cancel() {
     let id = resp.text().await.unwrap();
     assert_eq!(id.len(), 36, "repeat should return UUID");
 
-    let resp = cl
-        .get(&b(&format!("/sched/cancel?id={id}")))
-        .send()
-        .await
-        .unwrap();
+    let cancel_url = format!("/sched/cancel?id={id}");
+    let resp = cl.get(b(&cancel_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -1439,7 +1435,7 @@ async fn l35_tenant_isolation_kv_store() {
     let cl = make_client();
 
     // Tenant A writes a secret
-    cl.get(&format!(
+    cl.get(format!(
         "http://127.0.0.1:{port_a}/kv/set?key=secret&val=a-data"
     ))
     .send()
@@ -1448,7 +1444,7 @@ async fn l35_tenant_isolation_kv_store() {
 
     // Tenant B should NOT see it
     let resp = cl
-        .get(&format!("http://127.0.0.1:{port_b}/kv/get?key=secret"))
+        .get(format!("http://127.0.0.1:{port_b}/kv/get?key=secret"))
         .send()
         .await
         .unwrap();
@@ -1470,7 +1466,7 @@ async fn l36_tenant_isolation_cache() {
     let (port_b, _tx_b) = spawn_handler_with_config(test_config("tenant-cache-b")).await;
     let cl = make_client();
 
-    cl.get(&format!(
+    cl.get(format!(
         "http://127.0.0.1:{port_a}/cache/set?key=token&val=a-token"
     ))
     .send()
@@ -1478,7 +1474,7 @@ async fn l36_tenant_isolation_cache() {
     .unwrap();
 
     let resp = cl
-        .get(&format!("http://127.0.0.1:{port_b}/cache/get?key=token"))
+        .get(format!("http://127.0.0.1:{port_b}/cache/get?key=token"))
         .send()
         .await
         .unwrap();
@@ -1564,7 +1560,7 @@ async fn l39_scheduling_cancel_unknown() {
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
     let resp = cl
-        .get(&b("/sched/cancel?id=00000000-0000-0000-0000-000000000000"))
+        .get(b("/sched/cancel?id=00000000-0000-0000-0000-000000000000"))
         .send()
         .await
         .unwrap();

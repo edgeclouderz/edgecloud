@@ -454,93 +454,62 @@ impl HandlerDispatch {
     }
 }
 
-/// Build a synthetic 500 HTTP response carrying `diagnostic` in the
-/// body. Used when the guest traps (epoch interrupt, oom) or returns
-/// an `ErrorCode` from `response-outparam::set`. hyper 1.x will close
-/// the connection mid-message if a service returns `Err` to
-/// `serve_connection` for `http1` — so the dispatcher MUST respond
-/// with `Ok(response)` rather than propagating `Err`.
-///
-/// Body shape is `text/plain; charset=utf-8` so curl -v / browsers
-/// render it. Length is bounded to 1 KiB so a runaway guest with a
-/// 100 MB error message doesn't blow up the dispatch.
-fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
-    use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
-    use hyper::StatusCode;
-
-    // Truncate the diagnostic to a UTF-8-safe boundary at 1024 bytes
-    // (so a 100 MB error string doesn't blow up the dispatch). Only
-    // truncate when above the cap — inputs already under 1024 pass
-    // through unchanged.
-    let bounded = {
-        let bytes = diagnostic.as_bytes();
-        if bytes.len() <= 1024 {
-            diagnostic
-        } else {
-            let cut = bytes[..1024]
-                .iter()
-                .rposition(|b| (*b as i8) >= -0x40)
-                .unwrap_or(0);
-            std::str::from_utf8(&bytes[..cut]).unwrap_or("non-utf8 diagnostic")
-        }
-    };
-    let body = bounded.as_bytes().to_vec();
-    let len = body.len();
-
-    // `HyperOutgoingBody::new` expects a `Body<Data=Bytes, Error=ErrorCode>
-    // + Send + 'static`. `HyperOutgoingBody` is itself a
-    // `BoxBody<Bytes, ErrorCode>` from `http_body_util`, so we wrap a
-    // single-shot `Full<Bytes>` (Error = Infallible) via `MapErr` that
-    // converts any error into `ErrorCode::InternalError(None)`.
-    use http_body_util::{BodyExt, Full};
-    use std::convert::Infallible;
-    let body_wrapped =
-        Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
-
-    HyperResponse::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(CONTENT_LENGTH, len)
-        .body(HyperOutgoingBody::new(body_wrapped))
-        .expect("synthetic 500: builder with explicit content-length never fails")
+/// Shared body of every synthetic error response. Truncates the
+/// diagnostic to a UTF-8-safe boundary at 1024 bytes (so a 100 MB
+/// error string doesn't blow up the dispatch). Inputs under 1024
+/// bytes pass through unchanged.
+fn truncate_diagnostic(diagnostic: &str) -> &str {
+    let bytes = diagnostic.as_bytes();
+    if bytes.len() <= 1024 {
+        return diagnostic;
+    }
+    let cut = bytes[..1024]
+        .iter()
+        .rposition(|b| (*b as i8) >= -0x40)
+        .unwrap_or(0);
+    std::str::from_utf8(&bytes[..cut]).unwrap_or("non-utf8 diagnostic")
 }
 
-/// Build a synthetic 413 Payload Too Large response. Used by the body
-/// cap in `handle_request`. Body shape mirrors `synthetic_500` so curl
-/// -v / browsers render it identically — the only difference is the
-/// status code and the diagnostic prefix.
-fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBody> {
+/// Build a synthetic HTTP response with `status`, `body` (from
+/// `diagnostic`, truncated to 1 KiB), and `Content-Type: text/plain`.
+/// Used when the guest traps or returns an error — hyper 1.x closes
+/// the connection mid-message if the service returns `Err`, so every
+/// error path MUST return `Ok(synthetic_response(...))` rather than
+/// propagating `Err`.
+fn synthetic_response(
+    status: hyper::StatusCode,
+    diagnostic: &str,
+) -> HyperResponse<HyperOutgoingBody> {
     use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
-    use hyper::StatusCode;
+    use http_body_util::{BodyExt, Full};
+    use std::convert::Infallible;
 
-    let diagnostic =
-        format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
-    let bounded = {
-        let bytes = diagnostic.as_bytes();
-        if bytes.len() <= 1024 {
-            &diagnostic[..]
-        } else {
-            let cut = bytes[..1024]
-                .iter()
-                .rposition(|b| (*b as i8) >= -0x40)
-                .unwrap_or(0);
-            std::str::from_utf8(&bytes[..cut]).unwrap_or("non-utf8 diagnostic")
-        }
-    };
+    let bounded = truncate_diagnostic(diagnostic);
     let body = bounded.as_bytes().to_vec();
     let len = body.len();
 
-    use http_body_util::{BodyExt, Full};
-    use std::convert::Infallible;
     let body_wrapped =
         Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
 
     HyperResponse::builder()
-        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, len)
         .body(HyperOutgoingBody::new(body_wrapped))
-        .expect("synthetic 413: builder with explicit content-length never fails")
+        .expect("synthetic response: builder with explicit content-length never fails")
+}
+
+/// Build a synthetic 500. See `synthetic_response`.
+fn synthetic_500(diagnostic: &str) -> HyperResponse<HyperOutgoingBody> {
+    synthetic_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, diagnostic)
+}
+
+/// Build a synthetic 413 Payload Too Large with a diagnostic that
+/// describes the over-cap request. See `synthetic_response`.
+fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBody> {
+    let diagnostic =
+        format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
+    synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic)
 }
 
 #[cfg(test)]
