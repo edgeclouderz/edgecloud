@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces for edge computing"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Core wasmtime runtime
