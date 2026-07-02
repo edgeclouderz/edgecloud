@@ -12,13 +12,12 @@
 
 use std::time::Duration;
 
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
 use edge_runtime::streams::{
     self, IncomingEntry, IncomingProducer, OutgoingEntry, OutgoingStreamAdapter, StreamError,
 };
-/// Skip the test when in CI or when the operator sets the skip env var.
-fn skip_in_ci() -> bool {
-    std::env::var("CI").is_ok() || std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-}
 
 // ---- Streams primitives ----------------------------------------------------
 
@@ -83,14 +82,6 @@ async fn test_outgoing_entry_new_yields_paired_writer_and_adapter() {
 #[tokio::test]
 async fn test_fetch_streaming_response_round_trip_via_wiremock() {
     use futures::StreamExt;
-
-    if skip_in_ci() {
-        eprintln!("skipping streaming integration test (CI or SKIP_INTEGRATION_TESTS set)");
-        return;
-    }
-
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))

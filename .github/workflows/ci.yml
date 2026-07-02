@@ -70,8 +70,11 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cargo-nextest
 
-      - name: Run tests (nextest)
-        run: cargo nextest run --workspace
+      - name: Run unit tests
+        run: cargo nextest run --workspace -E 'not binary(integration_tests) and not binary(ingress_wire_integration) and not binary(integration)'
+
+      - name: Run integration tests (Docker-dependent)
+        run: cargo nextest run --workspace -E 'binary(integration_tests) or binary(ingress_wire_integration) or binary(integration)'
 
       - name: Install Rust Nightly
         uses: dtolnay/rust-toolchain@nightly

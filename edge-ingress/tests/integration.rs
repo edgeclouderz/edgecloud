@@ -28,7 +28,7 @@ use edge_ingress::routing::RoutingTable;
 // same helpers in `edge-worker/tests/integration_tests.rs` and
 // `edge-worker/tests/ingress_wire_integration.rs` — see PR #166
 // follow-up #4 for the rationale.
-use edge_test_helpers::{should_skip_integration_tests, start_nats};
+use edge_test_helpers::{shared_nats_url, should_skip_integration_tests};
 
 fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
     Config {
@@ -59,7 +59,7 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
         return;
     }
 
-    let (_nats, nats_url) = start_nats().await;
+    let nats_url = shared_nats_url().await;
 
     // Stand up a wiremock that responds 200 to every POST /load. The
     // body shape is asserted by unit tests; here we just need to see
@@ -72,7 +72,7 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
         .mount(&mock_server)
         .await;
 
-    let cfg = test_config(nats_url.clone(), mock_server.uri());
+    let cfg = test_config(nats_url.to_string(), mock_server.uri());
     let table = std::sync::Arc::new(RoutingTable::new());
     let caddy = std::sync::Arc::new(
         CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
@@ -159,7 +159,7 @@ async fn heartbeat_without_worker_addr_is_ignored() {
         return;
     }
 
-    let (_nats, nats_url) = start_nats().await;
+    let nats_url = shared_nats_url().await;
 
     let mock_server = MockServer::start().await;
     // The renderer also pushes an initial empty config at boot. So we set
@@ -172,7 +172,7 @@ async fn heartbeat_without_worker_addr_is_ignored() {
         .mount(&mock_server)
         .await;
 
-    let cfg = test_config(nats_url.clone(), mock_server.uri());
+    let cfg = test_config(nats_url.to_string(), mock_server.uri());
     let table = std::sync::Arc::new(RoutingTable::new());
     let caddy = std::sync::Arc::new(
         CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
