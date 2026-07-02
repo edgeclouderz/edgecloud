@@ -625,6 +625,19 @@ fn make_scheduler_for_tenant(tenant_id: &str) -> scheduling::Scheduler {
     }
 }
 
+/// Resolved once per process from `EDGE_FS_PATH`. Reading env vars on
+/// the FaaS hot path (one read per accepted HTTP request) was costing
+/// ~1k syscalls/sec at 1k RPS in the v0.2 review. The var is process-
+/// static by design (operators don't reload it without a restart), so
+/// a `OnceLock` is the right tool.
+static EDGE_FS_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
+    EDGE_FS_PATH
+        .get_or_init(|| std::env::var_os("EDGE_FS_PATH").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
 /// Build a `WasiCtx` for a tenant from the supplied env `HashMap`.
 ///
 /// Per-tenant preopens (Phase C-5): if `EDGE_FS_PATH` is set, the
@@ -654,8 +667,8 @@ fn build_wasi_ctx_for_tenant(env: &Arc<HashMap<String, String>>, tenant_id: &str
     let mut builder = WasiCtxBuilder::new();
     builder.envs(&env_strings);
 
-    if let Some(base) = std::env::var_os("EDGE_FS_PATH") {
-        let tenant_dir = std::path::Path::new(&base).join(tenant_id);
+    if let Some(base) = resolve_edge_fs_path() {
+        let tenant_dir = base.join(tenant_id);
         match std::fs::create_dir_all(&tenant_dir) {
             Ok(()) => {
                 // wasmtime-wasi 25 requires explicit DirPerms/FilePerms

@@ -365,6 +365,14 @@ impl HandlerDispatch {
             self.config.app_ctx.clone(),
         );
 
+        // Clone the shared exit-code flag BEFORE moving `request_state`
+        // into the store. CLAUDE.md: "Always check RuntimeState::exit_requested()
+        // after a guest call returns Err — a clean process.exit looks like
+        // a trap to wasmtime." The store owns the RuntimeState for the
+        // duration of the guest call, so the flag is only reachable via
+        // this Arc clone once we drop the request_state into create_store.
+        let exit_code_arc = Arc::clone(&request_state.exit_code);
+
         // 256 MiB memory cap per request — generous for FaaS
         // workloads but bounds memory-bomb guests. Matches the
         // LongRunning branch's hardcoded cap from the v0.1 era.
@@ -430,12 +438,34 @@ impl HandlerDispatch {
             }
             Err(_dropped) => {
                 // Sender dropped without invoking `set` — guest
-                // either trapped (e.g. epoch deadline exceeded) or
-                // never replied. `dispatch_outcome` has already
-                // resolved (above) with the underlying error; surface
-                // it as a synthetic 500 so hyper sends a real response
-                // to the client instead of closing the connection
-                // mid-message.
+                // either trapped (e.g. epoch deadline exceeded), called
+                // `process.exit(code)` (looks identical to a trap to
+                // wasmtime — the wasmtime trap is raised right after
+                // the host-side flag is set), or never replied.
+                //
+                // Distinguish process.exit from a real trap via the
+                // exit_code_arc we cloned before the store was built
+                // (mirrors the supervisor's LongRunning pattern at
+                // edge-worker/src/supervisor.rs:785 — see the `if let
+                // Some(code) = store.data().exit_requested()` check).
+                // A non-zero code is a clean guest exit; surface it as
+                // a controlled 500 instead of leaking the trap message
+                // to the client.
+                let exit_code = exit_code_arc.load(std::sync::atomic::Ordering::SeqCst);
+                if exit_code != 0 {
+                    tracing::info!(
+                        tenant_id = %tenant_for_log,
+                        app_name = %app_name_for_log,
+                        code = exit_code,
+                        "guest called process.exit during handler dispatch"
+                    );
+                    return Ok(synthetic_500("guest cleanly exited"));
+                }
+
+                // Real trap. `dispatch_outcome` has already resolved
+                // (above) with the underlying error; surface it as a
+                // synthetic 500 so hyper sends a real response to the
+                // client instead of closing the connection mid-message.
                 let e = match dispatch_outcome {
                     Ok(()) => {
                         anyhow::anyhow!("guest never invoked `response-outparam::set` method")

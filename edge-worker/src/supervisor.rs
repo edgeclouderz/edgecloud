@@ -773,15 +773,23 @@ impl Supervisor {
         // a tight loop in the guest can hang the worker indefinitely.
         store.set_epoch_deadline(epoch_deadline_ticks);
 
-        // Instantiate
-        let instance = instance_pre.instantiate(&mut store)?;
+        // Instantiate. The engine has `config.async_support(true)` enabled
+        // (see `edge-runtime/src/engine.rs`) — wasmtime enforces this at
+        // runtime: sync `instantiate` panics with "must use async
+        // instantiation when async support is enabled". The async form
+        // matches the FaaS path in `edge-worker/src/dispatch.rs::handle_request`.
+        let instance = instance_pre.instantiate_async(&mut store).await?;
 
         // `_start` is the canonical WASI Preview 2 entry point for
         // long-running components. The v0.1 `handle` export is no
         // longer supported — fixtures in Phase D export `_start`.
+        // Must use `call_async` for the same reason as `instantiate_async`
+        // above — wasmtime rejects sync `call` on a store built with
+        // `async_support(true)`.
         instance
             .get_typed_func::<(), ()>(&mut store, "_start")?
-            .call(&mut store, ())?;
+            .call_async(&mut store, ())
+            .await?;
 
         // Check if the guest called process.exit — the flag is set by the host call
         // before the wasmtime trap is raised, so we see it here on a successful return.
