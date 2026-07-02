@@ -95,10 +95,9 @@ func New(
 		db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo,
 		appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region,
 	)
-	// PR #195 / commit 5d4ba5a (eliminate N+1 in ReconcileService via
-	// single JOIN) dropped the deploymentRepo arg — the reconcile now
+	// PR #195 dropped the deploymentRepo arg — the reconcile now
 	// pulls deployment hash + regions via ListByTenantWithDeployment
-	// in a single round trip.
+	// in a single round trip (N+1 elimination).
 	reconcileSvc := service.NewReconcileService(
 		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
