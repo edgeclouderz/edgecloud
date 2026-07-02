@@ -95,8 +95,12 @@ func New(
 		db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo,
 		appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region,
 	)
+	// PR #195 / commit 5d4ba5a (eliminate N+1 in ReconcileService via
+	// single JOIN) dropped the deploymentRepo arg — the reconcile now
+	// pulls deployment hash + regions via ListByTenantWithDeployment
+	// in a single round trip.
 	reconcileSvc := service.NewReconcileService(
-		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
@@ -130,8 +134,11 @@ func New(
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc)
-	internalHandler.SetSyncBuilder(reconcileSvc)
+	// PR #195 / commit 2d61f94 (fold SetSyncBuilder into NewInternalHandler)
+	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
+	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
+	// both interfaces.
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)

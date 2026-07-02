@@ -730,7 +730,7 @@ func TestBuildFullSync_BulkEnvFetch_OneCallNotN(t *testing.T) {
 			},
 		},
 		map[string]*domain.Deployment{
-			"d_in":   {ID: "d_in", Hash: "h_in", Regions: []string{"global"}},
+			"d_in":    {ID: "d_in", Hash: "h_in", Regions: []string{"global"}},
 			"d_other": {ID: "d_other", Hash: "h_other", Regions: []string{"asia"}},
 		},
 		nil, nil, nil)
